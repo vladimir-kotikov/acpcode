@@ -14,7 +14,10 @@ export interface AgentKind {
   checkInstalled?: () => InstallCheck;
 }
 
-function checkBridgeInstalled(kind: AgentConfig["kind"], displayName: string): InstallCheck {
+function checkBridgeInstalled(
+  kind: AgentConfig["kind"],
+  displayName: string,
+): InstallCheck {
   try {
     resolveAgentEntryPoint(kind);
     return { ok: true };
@@ -31,12 +34,20 @@ export const AGENT_KINDS: readonly AgentKind[] = [
     id: "claude",
     label: "Claude",
     description: "Spawns @agentclientprotocol/claude-agent-acp",
-    checkInstalled: () => checkBridgeInstalled("claude", "Claude bridge (@agentclientprotocol/claude-agent-acp)"),
+    checkInstalled: () =>
+      checkBridgeInstalled(
+        "claude",
+        "Claude bridge (@agentclientprotocol/claude-agent-acp)",
+      ),
   },
   {
     id: "codex",
     label: "Codex",
     description: "Spawns @agentclientprotocol/codex-acp",
-    checkInstalled: () => checkBridgeInstalled("codex", "Codex bridge (@agentclientprotocol/codex-acp)"),
+    checkInstalled: () =>
+      checkBridgeInstalled(
+        "codex",
+        "Codex bridge (@agentclientprotocol/codex-acp)",
+      ),
   },
 ];

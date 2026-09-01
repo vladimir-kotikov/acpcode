@@ -1,43 +1,108 @@
-import type { HostToSessionViewMessage, SessionViewToHostMessage } from "../shared/sessionViewProtocol.ts";
-import { el, TranscriptRenderer } from "./transcript.ts";
+import { html, render } from "htm/preact";
+import { useEffect, useReducer, useRef } from "preact/hooks";
+import type {
+  HostToSessionViewMessage,
+  SessionViewToHostMessage,
+} from "../shared/sessionViewProtocol.ts";
+import { initialState, reduce, Transcript, type Action } from "./transcript.ts";
 
 declare function acquireVsCodeApi(): {
-	postMessage(message: SessionViewToHostMessage): void;
+  postMessage(message: SessionViewToHostMessage): void;
 };
 
 const vscode = acquireVsCodeApi();
 
-const root = document.getElementById("root")!;
-const header = el("div", "session-header session-header-placeholder", "No session selected");
-const log = el("div", "chat-log session-log");
-root.append(header, log);
+function Root() {
+  const [state, dispatch] = useReducer(reduce, initialState);
+  // window's "message" listener is wired once (empty deps below); it needs
+  // the current dispatch through a ref rather than a stale closure.
+  const dispatchRef = useRef(dispatch);
+  dispatchRef.current = dispatch;
 
-const renderer = new TranscriptRenderer(log);
-let currentSessionId: string | undefined;
+  useEffect(() => {
+    const listener = (event: MessageEvent<HostToSessionViewMessage>) => {
+      const message = event.data;
+      let action: Action;
+      switch (message.type) {
+        case "loading":
+          action = { type: "loading", meta: message.meta };
+          break;
+        case "update":
+          action = {
+            type: "sessionUpdate",
+            sessionId: message.sessionId,
+            update: message.update,
+          };
+          break;
+        case "replayBatch":
+          action = {
+            type: "replayBatch",
+            sessionId: message.sessionId,
+            updates: message.updates,
+            busy: message.busy,
+          };
+          break;
+        case "error":
+          action = {
+            type: "error",
+            text: message.message,
+            forkable: message.forkable,
+          };
+          break;
+        case "promptStopped":
+          action = {
+            type: "promptStopped",
+            sessionId: message.sessionId,
+            stopReason: message.stopReason,
+          };
+          break;
+        case "permissionRequest":
+          action = {
+            type: "permissionRequest",
+            requestId: message.requestId,
+            sessionId: message.sessionId,
+            toolCall: message.toolCall,
+            options: message.options,
+          };
+          break;
+        case "permissionResolved":
+          action = { type: "permissionResolved", requestId: message.requestId };
+          break;
+      }
+      dispatchRef.current(action);
+    };
+    window.addEventListener("message", listener);
+    vscode.postMessage({ type: "ready" });
+    return () => window.removeEventListener("message", listener);
+  }, []);
 
-window.addEventListener("message", (event: MessageEvent<HostToSessionViewMessage>) => {
-	const message = event.data;
-	switch (message.type) {
-		case "loading": {
-			currentSessionId = message.meta.sessionId;
-			header.classList.remove("session-header-placeholder");
-				header.textContent = `${message.meta.agentName} — ${message.meta.title ?? message.meta.sessionId}`;
-			renderer.clear();
-			renderer.appendLoadingNote("Loading…");
-			break;
-		}
-		case "update": {
-			if (message.sessionId !== currentSessionId) {
-				break;
-			}
-			renderer.applyUpdate(message.update);
-			break;
-		}
-		case "error": {
-			renderer.appendErrorNote(message.message);
-			break;
-		}
-	}
-});
+  function onSend(text: string): void {
+    dispatch({ type: "localUserMessage", text });
+    dispatch({ type: "sendStart" });
+    vscode.postMessage({ type: "sendPrompt", text });
+  }
+  function onCancel(): void {
+    vscode.postMessage({ type: "cancelPrompt" });
+  }
+  function onRespond(requestId: string, optionId: string): void {
+    dispatch({ type: "localPermissionResponse", requestId, optionId });
+    vscode.postMessage({ type: "permissionResponse", requestId, optionId });
+  }
+  function onFork(): void {
+    vscode.postMessage({ type: "forkSession" });
+  }
+  function onDraftChange(text: string): void {
+    dispatch({ type: "draftChanged", text });
+  }
 
-vscode.postMessage({ type: "ready" });
+  return html`<${Transcript}
+    state=${state}
+    onSend=${onSend}
+    onCancel=${onCancel}
+    onRespond=${onRespond}
+    onFork=${onFork}
+    onDraftChange=${onDraftChange}
+  />`;
+}
+
+render(html`<${Root} />`, document.getElementById("root")!);

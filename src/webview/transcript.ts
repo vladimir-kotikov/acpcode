@@ -1,34 +1,29 @@
-// DOM rendering shared by the interactive chat webview (src/webview/main.ts,
-// currently dormant) and the read-only session viewer (src/webview/sessionView.ts).
-// Browser-side only — no vscode-specific imports.
+// Session transcript rendering: a pure reducer (ACP updates -> immutable
+// block list) plus Preact/htm components that render that list. Everything
+// the agent produces (text, tool calls, reasoning, permission requests)
+// between two user messages is one "turn" — matches VS Code's own chat view,
+// only the most recent item of a turn stays visible at the top level; every
+// earlier item is folded into a collapsible "Completed N steps in Ys"
+// wrapper. Browser-side only — no vscode (extension host) imports.
 
 import type {
   ContentBlock,
+  PermissionOption,
+  SessionId,
   SessionUpdate,
+  StopReason,
   ToolCallUpdate,
   ToolKind,
 } from "@agentclientprotocol/sdk";
 import hljs from "highlight.js";
+import { html } from "htm/preact";
 import { marked } from "marked";
+import { useEffect, useRef, useState } from "preact/hooks";
+import type { SessionViewMeta } from "../shared/sessionViewProtocol.ts";
 
 marked.setOptions({ breaks: true });
 
-export function el<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  className?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  if (className) {
-    node.className = className;
-  }
-  if (text !== undefined) {
-    node.textContent = text;
-  }
-  return node;
-}
-
-export function textOf(block: ContentBlock): string {
+function textOf(block: ContentBlock): string {
   if (block.type === "text") {
     return block.text;
   }
@@ -51,16 +46,445 @@ const TOOL_KIND_LABELS: Record<ToolKind, string> = {
   other: "Tool",
 };
 
+// ---------------------------------------------------------------------------
+// State
+
+interface TextItem {
+  type: "text";
+  id: string;
+  role: "agent" | "thought";
+  text: string;
+}
+
+interface ToolItem {
+  type: "tool";
+  id: string;
+  toolCallId: string;
+  title: string;
+  kind: ToolKind;
+  status: string;
+  content: ToolCallUpdate["content"];
+}
+
+interface PermissionItem {
+  type: "permission";
+  id: string;
+  requestId: string;
+  title: string;
+  options: PermissionOption[];
+  // undefined = pending, null = resolved without knowing which option (e.g.
+  // the request was aborted host-side), string = the clicked option's id.
+  resolvedOptionId: string | null | undefined;
+}
+
+type TurnItem = TextItem | ToolItem | PermissionItem;
+
+interface TurnBlock {
+  type: "turn";
+  id: string;
+  items: TurnItem[];
+}
+
+interface NoteBlock {
+  type: "note";
+  id: string;
+  kind: "info" | "error";
+  text: string;
+  // Offers a "Fork session" button — set when this error was the session
+  // being currently owned by a live background-agent process elsewhere.
+  forkable?: boolean;
+}
+
+interface UserBlock {
+  type: "user";
+  id: string;
+  text: string;
+}
+
+type Block = NoteBlock | UserBlock | TurnBlock;
+
+export interface ViewState {
+  meta: SessionViewMeta | undefined;
+  blocks: Block[];
+  busy: boolean;
+  loading: boolean;
+  // Text currently typed in the composer, plus every other session's typed
+  // text this webview has seen — swapped in/out on session switch so a draft
+  // never lingers to be sent to the wrong session, and isn't lost either.
+  draftText: string;
+  drafts: Map<SessionId, string>;
+  // Replaces the plain "Working…" note while set — e.g. "Retrying Claude,
+  // attempt 2 of 10." from the AIR session-failure extension. Cleared once
+  // real content resumes (it's stale by then) or the turn ends.
+  statusText: string | undefined;
+}
+
+export const initialState: ViewState = {
+  meta: undefined,
+  blocks: [],
+  busy: false,
+  loading: false,
+  draftText: "",
+  drafts: new Map(),
+  statusText: undefined,
+};
+
+export type Action =
+  | { type: "loading"; meta: SessionViewMeta }
+  | { type: "sessionUpdate"; sessionId: SessionId; update: SessionUpdate }
+  | {
+      type: "replayBatch";
+      sessionId: SessionId;
+      updates: SessionUpdate[];
+      busy: boolean;
+    }
+  | { type: "error"; text: string; forkable?: boolean }
+  | { type: "sendStart" }
+  | { type: "promptStopped"; sessionId: SessionId; stopReason: StopReason }
+  | { type: "localUserMessage"; text: string }
+  | {
+      type: "permissionRequest";
+      requestId: string;
+      sessionId: SessionId;
+      toolCall: ToolCallUpdate;
+      options: PermissionOption[];
+    }
+  | { type: "localPermissionResponse"; requestId: string; optionId: string }
+  | { type: "permissionResolved"; requestId: string }
+  | { type: "draftChanged"; text: string };
+
+let idCounter = 0;
+function genId(): string {
+  idCounter += 1;
+  return `b${idCounter}`;
+}
+
+function lastBlock(blocks: Block[]): Block | undefined {
+  return blocks[blocks.length - 1];
+}
+
+function pushToTurn(blocks: Block[], item: TurnItem): Block[] {
+  const last = lastBlock(blocks);
+  if (last?.type === "turn") {
+    const turn: TurnBlock = { ...last, items: [...last.items, item] };
+    return [...blocks.slice(0, -1), turn];
+  }
+  return [...blocks, { type: "turn", id: genId(), items: [item] }];
+}
+
+function replaceLastTurnItem(
+  blocks: Block[],
+  updater: (item: TurnItem) => TurnItem,
+): Block[] {
+  const last = lastBlock(blocks);
+  if (last?.type !== "turn") {
+    return blocks;
+  }
+  const items = last.items.slice();
+  items[items.length - 1] = updater(items[items.length - 1]);
+  return [...blocks.slice(0, -1), { ...last, items }];
+}
+
+function updateTurnItem(
+  blocks: Block[],
+  predicate: (item: TurnItem) => boolean,
+  updater: (item: TurnItem) => TurnItem,
+): Block[] {
+  return blocks.map(block => {
+    if (block.type !== "turn") {
+      return block;
+    }
+    let changed = false;
+    const items = block.items.map(item => {
+      if (predicate(item)) {
+        changed = true;
+        return updater(item);
+      }
+      return item;
+    });
+    return changed ? { ...block, items } : block;
+  });
+}
+
+function appendUserChunk(blocks: Block[], text: string): Block[] {
+  const last = lastBlock(blocks);
+  if (last?.type === "user") {
+    return [...blocks.slice(0, -1), { ...last, text: last.text + text }];
+  }
+  return [...blocks, { type: "user", id: genId(), text }];
+}
+
+function appendText(
+  blocks: Block[],
+  role: "agent" | "thought",
+  text: string,
+): Block[] {
+  const last = lastBlock(blocks);
+  if (last?.type === "turn") {
+    const lastItem = last.items[last.items.length - 1];
+    if (lastItem?.type === "text" && lastItem.role === role) {
+      return replaceLastTurnItem(blocks, item => ({
+        ...(item as TextItem),
+        text: (item as TextItem).text + text,
+      }));
+    }
+  }
+  return pushToTurn(blocks, { type: "text", id: genId(), role, text });
+}
+
+function upsertToolCall(
+  blocks: Block[],
+  update: {
+    toolCallId: string;
+    title?: string | null;
+    kind?: ToolKind | null;
+    status?: string | null;
+    content?: ToolCallUpdate["content"];
+  },
+): Block[] {
+  const exists = blocks.some(
+    block =>
+      block.type === "turn" &&
+      block.items.some(
+        item => item.type === "tool" && item.toolCallId === update.toolCallId,
+      ),
+  );
+  if (exists) {
+    return updateTurnItem(
+      blocks,
+      item => item.type === "tool" && item.toolCallId === update.toolCallId,
+      item => {
+        const tool = item as ToolItem;
+        return {
+          ...tool,
+          title: update.title ?? tool.title,
+          kind: update.kind ?? tool.kind,
+          status: update.status ?? tool.status,
+          content: update.content ?? tool.content,
+        };
+      },
+    );
+  }
+  return pushToTurn(blocks, {
+    type: "tool",
+    id: genId(),
+    toolCallId: update.toolCallId,
+    title: update.title ?? "Tool call",
+    kind: update.kind ?? "other",
+    status: update.status ?? "pending",
+    content: update.content,
+  });
+}
+
+function applySessionUpdate(blocks: Block[], update: SessionUpdate): Block[] {
+  switch (update.sessionUpdate) {
+    case "user_message_chunk":
+      return appendUserChunk(blocks, textOf(update.content));
+    case "agent_message_chunk":
+      return appendText(blocks, "agent", textOf(update.content));
+    case "agent_thought_chunk":
+      return appendText(blocks, "thought", textOf(update.content));
+    case "tool_call":
+    case "tool_call_update":
+      return upsertToolCall(blocks, update);
+    default:
+      // plan/plan_update/available_commands_update/current_mode_update/
+      // config_option_update/usage_update/session_info_update — not
+      // rendered yet, no-op.
+      return blocks;
+  }
+}
+
+function readNested(value: unknown, ...keys: string[]): unknown {
+  let current = value;
+  for (const key of keys) {
+    if (!current || typeof current !== "object") {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
+}
+
+/** `session_info_update` is also (unrelatedly) how the bridge announces a
+ *  session's auto-generated title — only pull out the AIR extension's
+ *  connection/retry status, which lives under a specific `_meta` path (see
+ *  `sessionFailureMeta` in the bridge's `session-failure-extension.js`). Only
+ *  surfaced at all because AgentClient declares the `jetbrains.air` client
+ *  capability at `initialize` — without it the bridge never sends these. */
+function extractSessionFailureTitle(update: SessionUpdate): string | undefined {
+  if (update.sessionUpdate !== "session_info_update") {
+    return undefined;
+  }
+  const title = readNested(
+    update._meta,
+    "jetbrains",
+    "air",
+    "sessionFailure",
+    "title",
+  );
+  return typeof title === "string" ? title : undefined;
+}
+
+export function reduce(state: ViewState, action: Action): ViewState {
+  switch (action.type) {
+    case "loading": {
+      const drafts = new Map(state.drafts);
+      if (state.meta) {
+        if (state.draftText) {
+          drafts.set(state.meta.sessionId, state.draftText);
+        } else {
+          drafts.delete(state.meta.sessionId);
+        }
+      }
+      return {
+        meta: action.meta,
+        blocks: [],
+        busy: false,
+        loading: true,
+        draftText: drafts.get(action.meta.sessionId) ?? "",
+        drafts,
+        statusText: undefined,
+      };
+    }
+    case "error":
+      return {
+        ...state,
+        blocks: [
+          ...state.blocks,
+          {
+            type: "note",
+            id: genId(),
+            kind: "error",
+            text: action.text,
+            forkable: action.forkable,
+          },
+        ],
+        busy: false,
+        loading: false,
+        statusText: undefined,
+      };
+    case "sendStart":
+      return { ...state, busy: true, statusText: undefined };
+    case "promptStopped":
+      return action.sessionId === state.meta?.sessionId
+        ? { ...state, busy: false, statusText: undefined }
+        : state;
+    case "localUserMessage": {
+      const drafts = new Map(state.drafts);
+      if (state.meta) {
+        drafts.delete(state.meta.sessionId);
+      }
+      return {
+        ...state,
+        blocks: appendUserChunk(state.blocks, action.text),
+        loading: false,
+        draftText: "",
+        drafts,
+      };
+    }
+    case "draftChanged":
+      return { ...state, draftText: action.text };
+    case "sessionUpdate": {
+      if (action.sessionId !== state.meta?.sessionId) {
+        return state;
+      }
+      const blocks = applySessionUpdate(state.blocks, action.update);
+      const failureTitle = extractSessionFailureTitle(action.update);
+      return {
+        ...state,
+        blocks,
+        loading: false,
+        statusText:
+          failureTitle ??
+          (blocks !== state.blocks ? undefined : state.statusText),
+      };
+    }
+    case "replayBatch": {
+      if (action.sessionId !== state.meta?.sessionId) {
+        return state;
+      }
+      let blocks = state.blocks;
+      let statusText = state.statusText;
+      for (const update of action.updates) {
+        const before = blocks;
+        blocks = applySessionUpdate(blocks, update);
+        const failureTitle = extractSessionFailureTitle(update);
+        if (failureTitle !== undefined) {
+          statusText = failureTitle;
+        } else if (blocks !== before) {
+          statusText = undefined;
+        }
+      }
+      return {
+        ...state,
+        blocks,
+        loading: false,
+        busy: action.busy,
+        statusText,
+      };
+    }
+    case "permissionRequest": {
+      if (action.sessionId !== state.meta?.sessionId) {
+        return state;
+      }
+      const item: PermissionItem = {
+        type: "permission",
+        id: genId(),
+        requestId: action.requestId,
+        title: action.toolCall.title ?? "Permission requested",
+        options: action.options,
+        resolvedOptionId: undefined,
+      };
+      return {
+        ...state,
+        blocks: pushToTurn(state.blocks, item),
+        loading: false,
+      };
+    }
+    case "localPermissionResponse":
+      return {
+        ...state,
+        blocks: updateTurnItem(
+          state.blocks,
+          item =>
+            item.type === "permission" && item.requestId === action.requestId,
+          item => ({
+            ...(item as PermissionItem),
+            resolvedOptionId: action.optionId,
+          }),
+        ),
+      };
+    case "permissionResolved":
+      return {
+        ...state,
+        blocks: updateTurnItem(
+          state.blocks,
+          item =>
+            item.type === "permission" &&
+            item.requestId === action.requestId &&
+            item.resolvedOptionId === undefined,
+          item => ({ ...(item as PermissionItem), resolvedOptionId: null }),
+        ),
+      };
+    default:
+      return state;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+
 const BARE_URL_RE = /https?:\/\/[^\s<>"']+/g;
 // Trailing punctuation is almost always sentence punctuation, not part of the URL.
 const URL_TRAILING_PUNCTUATION_RE = /[).,;:!?\]}'"]+$/;
 
-/** Turns bare `https://...` URLs in plain text into clickable links via DOM
- *  APIs (no HTML string building) — used for user messages, which otherwise
- *  render as plain `textContent` so literal markdown-looking characters in a
- *  prompt never get reinterpreted as formatting. */
-function linkify(container: HTMLElement, text: string): void {
-  container.replaceChildren();
+/** Turns bare `https://...` URLs in plain text into clickable links — used
+ *  for user messages, which otherwise render as plain text so literal
+ *  markdown-looking characters in a prompt never get reinterpreted as
+ *  formatting. */
+function linkify(text: string): (string | ReturnType<typeof html>)[] {
+  const parts: (string | ReturnType<typeof html>)[] = [];
   let lastIndex = 0;
   for (const match of text.matchAll(BARE_URL_RE)) {
     let url = match[0];
@@ -69,17 +493,14 @@ function linkify(container: HTMLElement, text: string): void {
     if (!url) {
       continue;
     }
-    container.append(
-      document.createTextNode(text.slice(lastIndex, match.index)),
+    parts.push(text.slice(lastIndex, match.index));
+    parts.push(
+      html`<a href=${url} target="_blank" rel="noopener noreferrer">${url}</a>`,
     );
-    const link = el("a", undefined, url);
-    link.href = url;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    container.append(link);
     lastIndex = match.index + url.length;
   }
-  container.append(document.createTextNode(text.slice(lastIndex)));
+  parts.push(text.slice(lastIndex));
+  return parts;
 }
 
 // Static, trusted markup (not derived from any agent/user data) — safe to
@@ -91,10 +512,12 @@ const CHECK_ICON_SVG = `<svg class="icon-check" width="14" height="14" viewBox="
  *  matching the native chat view's code-block toolbar (minus run/insert,
  *  which need editor access this read-only viewer doesn't have). */
 function addCopyButton(pre: HTMLPreElement): void {
-  const wrapper = el("div", "code-block");
+  const wrapper = document.createElement("div");
+  wrapper.className = "code-block";
   pre.replaceWith(wrapper);
   wrapper.append(pre);
-  const button = el("button", "code-copy-btn");
+  const button = document.createElement("button");
+  button.className = "code-copy-btn";
   button.type = "button";
   button.setAttribute("aria-label", "Copy code");
   button.innerHTML = COPY_ICON_SVG + CHECK_ICON_SVG;
@@ -109,311 +532,461 @@ function addCopyButton(pre: HTMLPreElement): void {
   wrapper.append(button);
 }
 
-interface ToolCardHandle {
-  root: HTMLElement;
-  kindLabel: HTMLElement;
-  title: HTMLElement;
-  status: HTMLElement;
-  body: HTMLElement;
+/** Agent/thought text is markdown; re-parses the full accumulated text on
+ *  every chunk rather than appending incrementally, since a streamed chunk
+ *  boundary can land mid-markdown-construct (e.g. inside a ```` ``` ````
+ *  fence). Safe against injected HTML because the page's CSP has no
+ *  `unsafe-inline` in `script-src`, so any `<script>`/`onerror=` markup
+ *  `marked` emits is inert. hljs/copy-button setup runs as a DOM side effect
+ *  after each render since it must mutate real nodes the innerHTML produced,
+ *  which Preact's diffing doesn't reach into. */
+// Debugging aid: JSON.stringify the underlying data behind a block/item into
+// its `title` attribute, so hovering it shows the raw update(s) that produced
+// it as a native tooltip. Cheap, zero extra UI, easy to strip out later.
+function debugTitle(data: unknown): string {
+  return JSON.stringify(data, null, 2);
 }
 
-function renderToolCallContent(
-  card: ToolCardHandle,
-  update: { content?: ToolCallUpdate["content"] },
-): void {
-  if (!update.content) {
-    return;
-  }
-  card.body.replaceChildren();
-  for (const item of update.content) {
-    if (item.type === "content") {
-      card.body.append(el("pre", "tool-content-text", textOf(item.content)));
-    } else if (item.type === "diff") {
-      const details = el("details", "tool-diff");
-      details.append(el("summary", undefined, item.path));
-      if (item.oldText) {
-        details.append(el("pre", "diff-old", item.oldText));
-      }
-      details.append(el("pre", "diff-new", item.newText));
-      card.body.append(details);
-    } else {
-      card.body.append(el("div", "tool-content-other", "[terminal output]"));
-    }
-  }
-}
-
-/** Renders a stream of `SessionUpdate`s into a container as a linear
- *  transcript: user/agent message bubbles (consecutive chunks of the same
- *  role merge into one bubble) and tool-call cards.
- *
- *  Intentionally unhandled for now (received updates are silently dropped —
- *  nothing here mutates state that would need them): `plan`/`plan_update`/
- *  `plan_removed`, `available_commands_update`, `current_mode_update`,
- *  `config_option_update`, `usage_update`, `session_info_update`. */
-export class TranscriptRenderer {
-  private readonly container: HTMLElement;
-  private readonly toolCards = new Map<string, ToolCardHandle>();
-  private lastBubble:
-    { role: string; el: HTMLElement; text: string } | undefined;
-  private loadingNote: HTMLElement | undefined;
-  private turnChain:
-    | {
-        details: HTMLDetailsElement | undefined;
-        countEl: HTMLElement | undefined;
-        body: HTMLElement | undefined;
-        startedAt: number;
-        count: number;
-        lastMount: HTMLElement;
-      }
-    | undefined;
-
-  constructor(container: HTMLElement) {
-    this.container = container;
-  }
-
-  clear(): void {
-    this.container.replaceChildren();
-    this.toolCards.clear();
-    this.lastBubble = undefined;
-    this.loadingNote = undefined;
-    this.turnChain = undefined;
-  }
-
-  appendSystemNote(text: string): void {
-    this.turnChain = undefined;
-    this.container.append(el("div", "system-note", text));
-    this.lastBubble = undefined;
-    this.scrollToEnd();
-  }
-
-  /** Same as `appendSystemNote`, but remembered so the next real transcript
-   *  content (`applyUpdate`) removes it automatically — used for the
-   *  transient "Loading…" placeholder, which otherwise lingers at the top
-   *  of the transcript once replay actually starts arriving. */
-  appendLoadingNote(text: string): void {
-    this.loadingNote?.remove();
-    this.loadingNote = el("div", "system-note", text);
-    this.container.append(this.loadingNote);
-    this.lastBubble = undefined;
-    this.turnChain = undefined;
-    this.scrollToEnd();
-  }
-
-  /** Same as `appendSystemNote`, but styled to stand out as an actual
-   *  failure (e.g. a session that failed to load) rather than a transient
-   *  status line like "Loading…". */
-  appendErrorNote(text: string): void {
-    this.container.append(el("div", "system-note-error", text));
-    this.lastBubble = undefined;
-    this.turnChain = undefined;
-    this.scrollToEnd();
-  }
-
-  applyUpdate(update: SessionUpdate): void {
-    if (this.loadingNote) {
-      this.loadingNote.remove();
-      this.loadingNote = undefined;
-    }
-    switch (update.sessionUpdate) {
-      case "user_message_chunk":
-        this.appendBubble("user", textOf(update.content));
-        break;
-      case "agent_message_chunk":
-        this.appendBubble("agent", textOf(update.content));
-        break;
-      case "agent_thought_chunk":
-        this.appendBubble("thought", textOf(update.content));
-        break;
-      case "tool_call":
-        this.applyToolCall(update);
-        break;
-      case "tool_call_update":
-        this.applyToolCallUpdate(update);
-        break;
-      default:
-        // See class doc comment — not rendered yet.
-        break;
-    }
-  }
-
-  /** Everything the agent produces (text, tool calls, reasoning) between two
-   *  user messages is one logical turn. Matches VS Code's own chat view: only
-   *  the most recent item of the turn stays visible at the top level: every
-   *  earlier item gets folded into a collapsible "Completed N steps in
-   *  Ys" wrapper as soon as it's superseded. Since we don't know an item is
-   *  "not last" until the next one arrives, folding happens retroactively —
-   *  each call moves the previous last item into the wrapper (creating it
-   *  lazily on the second item) before making `mount` the new last item. A
-   *  user message (see `appendBubble`) or a system note ends the turn,
-   *  leaving whatever's currently visible as the permanent final state. */
-  private presentTurnItem(mount: HTMLElement): void {
-    const chain = this.turnChain;
-    if (!chain) {
-      this.turnChain = {
-        details: undefined,
-        countEl: undefined,
-        body: undefined,
-        startedAt: Date.now(),
-        count: 0,
-        lastMount: mount,
-      };
-      this.container.append(mount);
+function MarkdownBody({
+  text,
+  class: className,
+  debug,
+}: {
+  text: string;
+  class: string;
+  debug?: unknown;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const rendered = marked.parse(text, { async: false }) as string;
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) {
       return;
     }
-    if (!chain.details) {
-      const details = el("details", "tool-card tool-chain");
-      const summary = el("summary", "tool-card-header");
-      const countEl = el("span", "tool-card-title");
-      summary.append(countEl);
-      const body = el("div", "tool-chain-body");
-      details.append(summary, body);
-      this.container.insertBefore(details, chain.lastMount);
-      chain.details = details;
-      chain.countEl = countEl;
-      chain.body = body;
-    }
-    chain.body!.append(chain.lastMount);
-    chain.count += 1;
-    const elapsedSeconds = Math.max(0, Math.round((Date.now() - chain.startedAt) / 1000));
-    const minutes = Math.floor(elapsedSeconds / 60);
-    const seconds = elapsedSeconds % 60;
-    const duration = minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
-    chain.countEl!.textContent = `Completed ${chain.count} step${chain.count === 1 ? "" : "s"} in ${duration}`;
-    this.container.append(mount);
-    chain.lastMount = mount;
-  }
-
-  private appendBubble(role: string, text: string): void {
-    if (this.lastBubble?.role === role) {
-      this.lastBubble.text += text;
-      this.renderBubble(this.lastBubble);
-      this.scrollToEnd();
-      return;
-    }
-    let mount: HTMLElement;
-    let content: HTMLElement;
-    if (role === "thought") {
-      // Collapsed by default, like a tool call — reasoning is supplementary,
-      // not the primary reply, and can get long.
-      const details = el("details", "tool-card thought-card");
-      const summary = el("summary", "tool-card-header", "Thought");
-      const body = el("div", "bubble bubble-thought");
-      details.append(summary, body);
-      mount = details;
-      content = body;
-      this.presentTurnItem(mount);
-    } else if (role === "user") {
-      // Ends the turn — the user bubble itself is never foldable, and
-      // whatever was last in the agent's turn stays visible for good.
-      const bubble = el("div", `bubble bubble-${role}`);
-      mount = bubble;
-      content = bubble;
-      this.turnChain = undefined;
-      this.container.append(mount);
-    } else {
-      const bubble = el("div", `bubble bubble-${role}`);
-      mount = bubble;
-      content = bubble;
-      this.presentTurnItem(mount);
-    }
-    this.lastBubble = { role, el: content, text };
-    this.renderBubble(this.lastBubble);
-    this.scrollToEnd();
-  }
-
-  /** Agent/thought text is markdown; user text is rendered verbatim so
-   *  literal prompt text (which may itself contain `#`/`*`/backticks etc.)
-   *  never gets reinterpreted as formatting. Re-parses the full accumulated
-   *  text on every chunk rather than appending incrementally, since a
-   *  streamed chunk boundary can land mid-markdown-construct (e.g. inside a
-   *  ```` ``` ```` fence). Safe against injected HTML because the page's CSP
-   *  has no `unsafe-inline` in `script-src`, so any `<script>`/`onerror=`
-   *  markup `marked` emits is inert. */
-  private renderBubble(bubble: {
-    role: string;
-    el: HTMLElement;
-    text: string;
-  }): void {
-    if (bubble.role === "user") {
-      linkify(bubble.el, bubble.text);
-      return;
-    }
-    bubble.el.innerHTML = marked.parse(bubble.text, { async: false });
-    for (const codeEl of bubble.el.querySelectorAll<HTMLElement>("pre code")) {
+    for (const codeEl of node.querySelectorAll<HTMLElement>("pre code")) {
       hljs.highlightElement(codeEl);
     }
-    for (const pre of bubble.el.querySelectorAll<HTMLPreElement>("pre")) {
+    for (const pre of node.querySelectorAll<HTMLPreElement>("pre")) {
       addCopyButton(pre);
     }
-  }
+  }, [rendered]);
+  return html`<div
+    class=${className}
+    ref=${ref}
+    title=${debug !== undefined ? debugTitle(debug) : undefined}
+    dangerouslySetInnerHTML=${{ __html: rendered }}
+  ></div>`;
+}
 
-  private toolCardFor(
-    toolCallId: string,
-    title: string,
-    kind?: ToolKind | null,
-  ): ToolCardHandle {
-    let card = this.toolCards.get(toolCallId);
-    if (card) {
-      return card;
+/** `<details>` has no reactive "open" prop — it's a one-time initial value,
+ *  set imperatively so a later re-render (e.g. the status text updating)
+ *  doesn't fight a user who's manually collapsed it back. Used to default
+ *  the currently in-progress step of a live turn open, so there's visible
+ *  progress instead of every step looking collapsed the instant it appears. */
+function useOpenOnMount(defaultOpen: boolean | undefined) {
+  const ref = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    if (defaultOpen && ref.current) {
+      ref.current.open = true;
     }
-    // <details>/<summary> so each call is collapsed by default (matches
-    // VS Code's own chat view) — the browser handles show/hide on click,
-    // no extra state or listeners needed here.
-    const root = el("details", "tool-card");
-    const header = el("summary", "tool-card-header");
-    const kindLabelEl = el(
-      "span",
-      "tool-card-kind",
-      TOOL_KIND_LABELS[kind ?? "other"],
+  }, []);
+  return ref;
+}
+
+// Full tool output (a whole file's contents, a long command's stdout) can run
+// to tens of thousands of characters — collapse past this length by default
+// with a "Show more" toggle, same idea as the tool card itself being collapsed.
+const TOOL_CONTENT_TRUNCATE_LENGTH = 2000;
+
+function TruncatedPre({
+  text,
+  class: className,
+}: {
+  text: string;
+  class: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const isLong = text.length > TOOL_CONTENT_TRUNCATE_LENGTH;
+  const shown =
+    expanded || !isLong ? text : text.slice(0, TOOL_CONTENT_TRUNCATE_LENGTH);
+  return html`
+    <div>
+      <pre class=${className}>${shown}${!expanded && isLong ? "…" : ""}</pre>
+      ${
+        isLong
+          ? html`<button
+              class="permission-btn tool-content-expand-btn"
+              onClick=${() => setExpanded(!expanded)}
+            >
+              ${expanded ? "Show less" : "Show more"}
+            </button>`
+          : null
+      }
+    </div>
+  `;
+}
+
+function ToolCallContentView({
+  content,
+}: {
+  content: ToolCallUpdate["content"];
+}) {
+  if (!content || content.length === 0) {
+    return null;
+  }
+  return content.map((item, index) => {
+    if (item.type === "content") {
+      return html`<${TruncatedPre}
+        key=${index}
+        text=${textOf(item.content)}
+        class="tool-content-text"
+      />`;
+    }
+    if (item.type === "diff") {
+      return html`
+        <details class="tool-diff" key=${index}>
+          <summary>${item.path}</summary>
+          ${item.oldText ? html`<pre class="diff-old">${item.oldText}</pre>` : null}
+          <pre class="diff-new">${item.newText}</pre>
+        </details>
+      `;
+    }
+    return html`<div class="tool-content-other" key=${index}>
+      [terminal output]
+    </div>`;
+  });
+}
+
+function ToolCardView({
+  item,
+  defaultOpen,
+}: {
+  item: ToolItem;
+  defaultOpen?: boolean;
+}) {
+  const ref = useOpenOnMount(defaultOpen);
+  return html`
+    <details class="tool-card" ref=${ref} title=${debugTitle(item)}>
+      <summary class="tool-card-header">
+        <span class="tool-card-kind">${TOOL_KIND_LABELS[item.kind]}</span>
+        <span class="tool-card-title">${item.title}</span>
+        <span class="tool-card-status">${item.status}</span>
+      </summary>
+      <div class="tool-card-body">
+        <${ToolCallContentView} content=${item.content} />
+      </div>
+    </details>
+  `;
+}
+
+function PermissionCardView({
+  item,
+  onRespond,
+}: {
+  item: PermissionItem;
+  onRespond: (requestId: string, optionId: string) => void;
+}) {
+  const resolved = item.resolvedOptionId !== undefined;
+  return html`
+    <div
+      class="permission-card ${resolved ? "permission-resolved" : ""}"
+      title=${debugTitle(item)}
+    >
+      <div class="permission-title">${item.title}</div>
+      <div class="permission-buttons">
+        ${item.options.map(
+          option => html`
+            <button
+              key=${option.optionId}
+              class="permission-btn permission-${option.kind}"
+              disabled=${resolved}
+              onClick=${() => onRespond(item.requestId, option.optionId)}
+            >
+              ${option.name}
+            </button>
+          `,
+        )}
+      </div>
+    </div>
+  `;
+}
+
+function ThoughtCardView({
+  item,
+  defaultOpen,
+}: {
+  item: TextItem;
+  defaultOpen?: boolean;
+}) {
+  const ref = useOpenOnMount(defaultOpen);
+  return html`
+    <details
+      class="tool-card thought-card"
+      ref=${ref}
+      title=${debugTitle(item)}
+    >
+      <summary class="tool-card-header">Thought</summary>
+      <${MarkdownBody} text=${item.text} class="bubble bubble-thought" />
+    </details>
+  `;
+}
+
+function TurnItemView({
+  item,
+  onRespond,
+  defaultOpen,
+}: {
+  item: TurnItem;
+  onRespond: (requestId: string, optionId: string) => void;
+  defaultOpen?: boolean;
+}) {
+  if (item.type === "text") {
+    if (item.role === "thought") {
+      return html`<${ThoughtCardView}
+        item=${item}
+        defaultOpen=${defaultOpen}
+      />`;
+    }
+    return html`<${MarkdownBody}
+      text=${item.text}
+      class="bubble bubble-agent"
+      debug=${item}
+    />`;
+  }
+  if (item.type === "tool") {
+    return html`<${ToolCardView} item=${item} defaultOpen=${defaultOpen} />`;
+  }
+  return html`<${PermissionCardView} item=${item} onRespond=${onRespond} />`;
+}
+
+/** Everything the agent produces between two user messages is one turn: only
+ *  the most recent item stays visible at the top level, every earlier item
+ *  folds into a collapsible "Completed N steps" wrapper — matches VS Code's
+ *  own chat view. No duration in the label: ACP doesn't carry per-update
+ *  timestamps, so there's no real elapsed time to report. */
+function TurnBlockView({
+  turn,
+  onRespond,
+  live,
+}: {
+  turn: TurnBlock;
+  onRespond: (requestId: string, optionId: string) => void;
+  live: boolean;
+}) {
+  const items = turn.items;
+  if (items.length <= 1) {
+    return items.map(
+      item =>
+        html`<${TurnItemView}
+          key=${item.id}
+          item=${item}
+          onRespond=${onRespond}
+          defaultOpen=${live}
+        />`,
     );
-    const titleEl = el("span", "tool-card-title", title);
-    const statusEl = el("span", "tool-card-status");
-    header.append(kindLabelEl, titleEl, statusEl);
-    const body = el("div", "tool-card-body");
-    root.append(header, body);
-    this.presentTurnItem(root);
-    card = {
-      root,
-      kindLabel: kindLabelEl,
-      title: titleEl,
-      status: statusEl,
-      body,
-    };
-    this.toolCards.set(toolCallId, card);
-    this.lastBubble = undefined;
-    this.scrollToEnd();
-    return card;
+  }
+  const folded = items.slice(0, -1);
+  const last = items[items.length - 1];
+  return [
+    html`
+      <details class="tool-card tool-chain" key="${turn.id}-chain">
+        <summary class="tool-card-header">
+          <span class="tool-card-title"
+            >Completed ${folded.length}
+            step${folded.length === 1 ? "" : "s"}</span
+          >
+        </summary>
+        <div class="tool-chain-body">
+          ${folded.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} />`)}
+        </div>
+      </details>
+    `,
+    html`<${TurnItemView}
+      key=${last.id}
+      item=${last}
+      onRespond=${onRespond}
+      defaultOpen=${live}
+    />`,
+  ];
+}
+
+function NoteView({ block, onFork }: { block: NoteBlock; onFork: () => void }) {
+  return html`
+    <div
+      class=${block.kind === "error" ? "system-note-error" : "system-note"}
+      title=${debugTitle(block)}
+    >
+      <div>${block.text}</div>
+      ${
+        block.forkable
+          ? html`<button class="permission-btn" onClick=${onFork}>
+              Fork session
+            </button>`
+          : null
+      }
+    </div>
+  `;
+}
+
+function BlocksView({
+  blocks,
+  onRespond,
+  onFork,
+  busy,
+}: {
+  blocks: Block[];
+  onRespond: (requestId: string, optionId: string) => void;
+  onFork: () => void;
+  busy: boolean;
+}) {
+  return blocks.map((block, index) => {
+    if (block.type === "note") {
+      return html`<${NoteView}
+        key=${block.id}
+        block=${block}
+        onFork=${onFork}
+      />`;
+    }
+    if (block.type === "user") {
+      return html`<div
+        key=${block.id}
+        class="bubble bubble-user"
+        title=${debugTitle(block)}
+      >
+        ${linkify(block.text)}
+      </div>`;
+    }
+    const live = busy && index === blocks.length - 1;
+    return html`<${TurnBlockView}
+      key=${block.id}
+      turn=${block}
+      onRespond=${onRespond}
+      live=${live}
+    />`;
+  });
+}
+
+function Composer({
+  state,
+  onSend,
+  onCancel,
+  onDraftChange,
+}: {
+  state: ViewState;
+  onSend: (text: string) => void;
+  onCancel: () => void;
+  onDraftChange: (text: string) => void;
+}) {
+  const disabled = !state.meta;
+  // Sending mid-turn ("steering") only works when the connected agent
+  // implements `_session/steering` — without it, a second `session/prompt`
+  // would interrupt the running turn instead of injecting into it, so fall
+  // back to the old block-until-idle behavior for agents that don't.
+  const steeringBlocked = state.busy && !state.meta?.canSteer;
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // <textarea> has no reactive "grow with content" CSS in this Chromium
+  // build — recompute height from scrollHeight on every text change instead;
+  // main.css caps it with max-height + overflow-y so it scrolls internally
+  // past that instead of growing forever.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) {
+      return;
+    }
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [state.draftText]);
+
+  function submit(): void {
+    const trimmed = state.draftText.trim();
+    if (!trimmed || disabled || steeringBlocked) {
+      return;
+    }
+    onSend(trimmed);
   }
 
-  private applyToolCall(
-    update: SessionUpdate & { sessionUpdate: "tool_call" },
-  ): void {
-    const card = this.toolCardFor(update.toolCallId, update.title, update.kind);
-    card.status.textContent = update.status ?? "pending";
-    renderToolCallContent(card, update);
-  }
+  return html`
+    <div class="input-bar">
+      <textarea
+        ref=${textareaRef}
+        class="prompt-input"
+        rows="1"
+        placeholder="Message…"
+        disabled=${disabled || steeringBlocked}
+        value=${state.draftText}
+        onInput=${(event: Event) => onDraftChange((event.target as HTMLTextAreaElement).value)}
+        onKeyDown=${(event: KeyboardEvent) => {
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            submit();
+          }
+        }}
+      ></textarea>
+      ${
+        !steeringBlocked
+          ? html`<button
+              class="send-btn"
+              disabled=${disabled || !state.draftText.trim()}
+              onClick=${submit}
+            >
+              Send
+            </button>`
+          : null
+      }
+      ${state.busy ? html`<button class="send-btn cancel-btn" onClick=${onCancel}>Stop</button>` : null}
+    </div>
+  `;
+}
 
-  private applyToolCallUpdate(
-    update: SessionUpdate & { sessionUpdate: "tool_call_update" },
-  ): void {
-    const card = this.toolCardFor(
-      update.toolCallId,
-      update.title ?? "Tool call",
-      update.kind,
-    );
-    if (update.title) {
-      card.title.textContent = update.title;
+export function Transcript({
+  state,
+  onSend,
+  onCancel,
+  onRespond,
+  onFork,
+  onDraftChange,
+}: {
+  state: ViewState;
+  onSend: (text: string) => void;
+  onCancel: () => void;
+  onRespond: (requestId: string, optionId: string) => void;
+  onFork: () => void;
+  onDraftChange: (text: string) => void;
+}) {
+  const logRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const node = logRef.current;
+    if (node) {
+      node.scrollTop = node.scrollHeight;
     }
-    if (update.kind) {
-      card.kindLabel.textContent = TOOL_KIND_LABELS[update.kind];
-    }
-    if (update.status) {
-      card.status.textContent = update.status;
-    }
-    renderToolCallContent(card, update);
-  }
+  });
 
-  private scrollToEnd(): void {
-    this.container.scrollTop = this.container.scrollHeight;
-  }
+  const title = state.meta
+    ? `${state.meta.agentName} — ${state.meta.title ?? state.meta.sessionId}`
+    : "No session selected";
+
+  return html`
+    <div
+      class="session-header ${state.meta ? "" : "session-header-placeholder"}"
+    >
+      ${title}
+    </div>
+    <div class="chat-log session-log" ref=${logRef}>
+      ${state.loading ? html`<div class="system-note">Loading…</div>` : null}
+      <${BlocksView}
+        blocks=${state.blocks}
+        onRespond=${onRespond}
+        onFork=${onFork}
+        busy=${state.busy}
+      />
+      ${state.busy ? html`<div class="system-note working-note">${state.statusText ?? "Working…"}</div>` : null}
+    </div>
+    <${Composer}
+      state=${state}
+      onSend=${onSend}
+      onCancel=${onCancel}
+      onDraftChange=${onDraftChange}
+    />
+  `;
 }

@@ -2,14 +2,13 @@ import * as vscode from "vscode";
 import { getAgents, saveAgents, type AgentConfig } from "./config.ts";
 import { AGENT_KINDS } from "./kinds.ts";
 
-export async function editAgentsConfigCommand(): Promise<void> {
+export const editAgentsConfigCommand = async () =>
   await vscode.commands.executeCommand(
     "workbench.action.openSettings",
     "acpcode.agents",
   );
-}
 
-export async function addAgentCommand(): Promise<void> {
+export const addAgentCommand = async (): Promise<void> => {
   const kindPick = await vscode.window.showQuickPick(
     AGENT_KINDS.map(agentKind => ({
       label: agentKind.label,
@@ -61,4 +60,4 @@ export async function addAgentCommand(): Promise<void> {
   if (choice === editEnv) {
     await editAgentsConfigCommand();
   }
-}
+};

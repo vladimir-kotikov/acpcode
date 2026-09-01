@@ -2,7 +2,11 @@ import * as crypto from "node:crypto";
 import * as vscode from "vscode";
 import { AgentClient } from "./acp/agentClient.ts";
 import { getAgents, type AgentConfig } from "./acp/agents/config.ts";
-import type { HostToWebviewMessage, ProfileDescriptor, WebviewToHostMessage } from "./shared/protocol.ts";
+import type {
+  HostToWebviewMessage,
+  ProfileDescriptor,
+  WebviewToHostMessage,
+} from "./shared/protocol.ts";
 import { resolveCwd } from "./workspaceUtils.ts";
 
 /** Chat webview, currently dormant — not registered in extension.ts while the
@@ -96,8 +100,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           return;
         }
         try {
-          const stopReason = await this.client.prompt(this.currentSessionId, message.text);
-          this.post({ type: "promptStopped", sessionId: this.currentSessionId, stopReason });
+          const stopReason = await this.client.prompt(
+            this.currentSessionId,
+            message.text,
+          );
+          this.post({
+            type: "promptStopped",
+            sessionId: this.currentSessionId,
+            stopReason,
+          });
         } catch (err) {
           this.post({ type: "error", message: String(err) });
         }
@@ -143,12 +154,25 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.disposeClient();
     this.client = new AgentClient(resolveCwd(), agent.name);
     this.subscriptions.push(
-      this.client.onConnectionStateChanged(({ state, error }) => this.post({ type: "connectionState", state, error })),
-      this.client.onSessionUpdate(({ sessionId, update }) => this.post({ type: "sessionUpdate", sessionId, update })),
-      this.client.onPermissionRequest(({ requestId, sessionId, toolCall, options }) =>
-        this.post({ type: "permissionRequest", requestId, sessionId, toolCall, options }),
+      this.client.onConnectionStateChanged(({ state, error }) =>
+        this.post({ type: "connectionState", state, error }),
       ),
-      this.client.onPermissionResolved(({ requestId }) => this.post({ type: "permissionResolved", requestId })),
+      this.client.onSessionUpdate(({ sessionId, update }) =>
+        this.post({ type: "sessionUpdate", sessionId, update }),
+      ),
+      this.client.onPermissionRequest(
+        ({ requestId, sessionId, toolCall, options }) =>
+          this.post({
+            type: "permissionRequest",
+            requestId,
+            sessionId,
+            toolCall,
+            options,
+          }),
+      ),
+      this.client.onPermissionResolved(({ requestId }) =>
+        this.post({ type: "permissionResolved", requestId }),
+      ),
     );
 
     try {

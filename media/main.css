@@ -214,6 +214,20 @@ code {
   color: var(--vscode-descriptionForeground);
 }
 
+.working-note {
+  animation: working-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes working-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .system-note-error {
   align-self: stretch;
   text-align: left;
@@ -225,6 +239,10 @@ code {
   border: 1px solid var(--vscode-inputValidation-errorBorder);
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.system-note-error .permission-btn {
+  margin-top: var(--vscode-spacing-size60, 6px);
 }
 
 .bubble-agent li {
@@ -446,6 +464,10 @@ code {
   font-size: var(--vscode-fontSize-body2, 0.85em);
 }
 
+.tool-content-expand-btn {
+  font-size: var(--vscode-fontSize-body2, 0.85em);
+}
+
 .tool-content-other {
   font-size: var(--vscode-fontSize-body2, 0.85em);
   font-style: italic;
@@ -521,6 +543,7 @@ code {
 
 .input-bar {
   display: flex;
+  align-items: flex-end;
   gap: 6px;
   padding: 8px;
   border-top: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
@@ -535,6 +558,10 @@ code {
   font-family: inherit;
   font-size: inherit;
   padding: 4px 6px;
+  /* Height is driven from JS (scrollHeight) as content grows; capped here so
+   * it scrolls internally past ~10 lines instead of growing forever. */
+  max-height: 220px;
+  overflow-y: auto;
 }
 
 .send-btn {
@@ -542,11 +569,16 @@ code {
   color: var(--vscode-button-foreground);
   border: none;
   border-radius: 3px;
-  padding: 0 12px;
+  padding: 4px 12px;
   cursor: pointer;
 }
 
 .send-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.cancel-btn {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
 }

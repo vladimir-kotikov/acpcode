@@ -4,6 +4,7 @@ import {
   ndJsonStream,
   PROTOCOL_VERSION,
   type ClientContext,
+  type ForkSessionResponse,
   type LoadSessionResponse,
   type NewSessionResponse,
   type PermissionOption,
@@ -28,9 +29,18 @@ import { agentEnv } from "./agents/config.ts";
 
 /** ACP bridge package per agent kind: the npm package to resolve and which
  *  key in its `bin` map is the executable to spawn. */
-const AGENT_BRIDGES: Record<AgentConfig["kind"], { packageName: string; binName: string }> = {
-  claude: { packageName: "@agentclientprotocol/claude-agent-acp", binName: "claude-agent-acp" },
-  codex: { packageName: "@agentclientprotocol/codex-acp", binName: "codex-acp" },
+const AGENT_BRIDGES: Record<
+  AgentConfig["kind"],
+  { packageName: string; binName: string }
+> = {
+  claude: {
+    packageName: "@agentclientprotocol/claude-agent-acp",
+    binName: "claude-agent-acp",
+  },
+  codex: {
+    packageName: "@agentclientprotocol/codex-acp",
+    binName: "codex-acp",
+  },
 };
 
 /** Resolves the on-disk entry point for a kind's ACP bridge bin. `require`
@@ -42,20 +52,36 @@ export function resolveAgentEntryPoint(kind: AgentConfig["kind"]): string {
   const bridge = AGENT_BRIDGES[kind];
   const here = fileURLToPath(import.meta.url); // <extensionRoot>/src/acp/agentClient.ts
   const extensionRoot = path.resolve(path.dirname(here), "..", "..");
-  const pkgJsonPath = path.join(extensionRoot, "node_modules", bridge.packageName, "package.json");
+  const pkgJsonPath = path.join(
+    extensionRoot,
+    "node_modules",
+    bridge.packageName,
+    "package.json",
+  );
   const pkgDir = path.dirname(pkgJsonPath);
   const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, "utf8")) as {
     bin?: string | Record<string, string>;
   };
-  const binRel = typeof pkgJson.bin === "string" ? pkgJson.bin : pkgJson.bin?.[bridge.binName];
+  const binRel =
+    typeof pkgJson.bin === "string"
+      ? pkgJson.bin
+      : pkgJson.bin?.[bridge.binName];
   if (!binRel) {
-    throw new Error(`${bridge.packageName} package does not declare a "${bridge.binName}" bin entry`);
+    throw new Error(
+      `${bridge.packageName} package does not declare a "${bridge.binName}" bin entry`,
+    );
   }
   return path.join(pkgDir, binRel);
 }
 
-export type ConnectionState = { state: "connecting" | "connected" | "error"; error?: string };
-export type SessionUpdateEvent = { sessionId: SessionId; update: SessionUpdate };
+export type ConnectionState = {
+  state: "connecting" | "connected" | "error";
+  error?: string;
+};
+export type SessionUpdateEvent = {
+  sessionId: SessionId;
+  update: SessionUpdate;
+};
 export type PermissionRequestEvent = {
   requestId: string;
   sessionId: SessionId;
@@ -70,15 +96,28 @@ export type PermissionRequestEvent = {
 export class AgentClient implements vscode.Disposable {
   private child?: ChildProcessWithoutNullStreams;
   private agent?: ClientContext;
-  private readonly pendingPermissions = new Map<string, (response: RequestPermissionResponse) => void>();
+  private readonly pendingPermissions = new Map<
+    string,
+    (response: RequestPermissionResponse) => void
+  >();
   private readonly output: vscode.OutputChannel;
   private permissionCounter = 0;
   private readonly cwd: string;
+  // Advertised via InitializeResponse._meta.steering.supported (the agreed
+  // ACP steering wire protocol, "_session/steering" — not yet a built-in
+  // method in the SDK's schema, called through the generic request() escape
+  // hatch). Not every agent kind implements it (e.g. codex-acp doesn't).
+  private steeringSupported = false;
 
-  private readonly connectionStateEmitter = new vscode.EventEmitter<ConnectionState>();
-  private readonly sessionUpdateEmitter = new vscode.EventEmitter<SessionUpdateEvent>();
-  private readonly permissionRequestEmitter = new vscode.EventEmitter<PermissionRequestEvent>();
-  private readonly permissionResolvedEmitter = new vscode.EventEmitter<{ requestId: string }>();
+  private readonly connectionStateEmitter =
+    new vscode.EventEmitter<ConnectionState>();
+  private readonly sessionUpdateEmitter =
+    new vscode.EventEmitter<SessionUpdateEvent>();
+  private readonly permissionRequestEmitter =
+    new vscode.EventEmitter<PermissionRequestEvent>();
+  private readonly permissionResolvedEmitter = new vscode.EventEmitter<{
+    requestId: string;
+  }>();
 
   readonly onConnectionStateChanged = this.connectionStateEmitter.event;
   readonly onSessionUpdate = this.sessionUpdateEmitter.event;
@@ -105,8 +144,12 @@ export class AgentClient implements vscode.Disposable {
       stdio: ["pipe", "pipe", "pipe"] as const,
     });
     this.child = child;
-    child.stderr.on("data", (chunk: Buffer) => this.output.append(chunk.toString()));
-    child.on("error", err => this.connectionStateEmitter.fire({ state: "error", error: String(err) }));
+    child.stderr.on("data", (chunk: Buffer) =>
+      this.output.append(chunk.toString()),
+    );
+    child.on("error", err =>
+      this.connectionStateEmitter.fire({ state: "error", error: String(err) }),
+    );
     child.on("exit", (code, signal) => {
       if (this.child === child) {
         this.child = undefined;
@@ -144,23 +187,45 @@ export class AgentClient implements vscode.Disposable {
         });
       })
       .onNotification(methods.client.session.update, ctx => {
-        this.sessionUpdateEmitter.fire({ sessionId: ctx.params.sessionId, update: ctx.params.update });
+        this.sessionUpdateEmitter.fire({
+          sessionId: ctx.params.sessionId,
+          update: ctx.params.update,
+        });
       });
 
     const connection = app.connect(stream);
     this.agent = connection.agent;
 
     try {
-      await this.agent.request(methods.agent.initialize, {
+      const response = await this.agent.request(methods.agent.initialize, {
         protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: {},
+        // Unlocks the "AIR" session-failure extension (claude-agent-acp's
+        // session-failure-extension.js): without declaring this, the bridge
+        // silently drops connection/retry status (e.g. "Retrying Claude,
+        // attempt 2 of 10") instead of sending it as a session_info_update.
+        clientCapabilities: {
+          _meta: {
+            jetbrains: {
+              air: { version: 1, capabilities: ["sessionFailure"] },
+            },
+          },
+        },
         clientInfo: { name: "acpcode", version: "0.0.1" },
       });
+      const steeringMeta = response._meta?.steering;
+      this.steeringSupported =
+        !!steeringMeta &&
+        typeof steeringMeta === "object" &&
+        (steeringMeta as { supported?: unknown }).supported === true;
       this.connectionStateEmitter.fire({ state: "connected" });
     } catch (err) {
       this.connectionStateEmitter.fire({ state: "error", error: String(err) });
       throw err;
     }
+  }
+
+  canSteer(): boolean {
+    return this.steeringSupported;
   }
 
   private requireAgent(): ClientContext {
@@ -173,15 +238,21 @@ export class AgentClient implements vscode.Disposable {
   /** `cwd` filters to that project directory (and its git worktrees); omit
    *  it to list sessions across every project the agent knows about. */
   async listSessions(cwd?: string): Promise<SessionInfo[]> {
-    const response = await this.requireAgent().request(methods.agent.session.list, cwd ? { cwd } : {});
+    const response = await this.requireAgent().request(
+      methods.agent.session.list,
+      cwd ? { cwd } : {},
+    );
     return response.sessions;
   }
 
   async newSession(): Promise<NewSessionResponse> {
-    return this.requireAgent().request<NewSessionResponse>(methods.agent.session.new, {
-      cwd: this.cwd,
-      mcpServers: [],
-    });
+    return this.requireAgent().request<NewSessionResponse>(
+      methods.agent.session.new,
+      {
+        cwd: this.cwd,
+        mcpServers: [],
+      },
+    );
   }
 
   /** Loads (and replays the history of) a session on this connection. Replay
@@ -193,35 +264,85 @@ export class AgentClient implements vscode.Disposable {
    *  a mismatch fails with "Resource not found" even though the session is
    *  real. Falls back to this connection's cwd for the case where a session
    *  is known to live there already (e.g. one just created on it). */
-  async loadSession(sessionId: SessionId, cwd?: string): Promise<LoadSessionResponse | void> {
-    return this.requireAgent().request<LoadSessionResponse | void>(methods.agent.session.load, {
-      sessionId,
-      cwd: cwd ?? this.cwd,
-      mcpServers: [],
-    });
+  async loadSession(
+    sessionId: SessionId,
+    cwd?: string,
+  ): Promise<LoadSessionResponse | void> {
+    return this.requireAgent().request<LoadSessionResponse | void>(
+      methods.agent.session.load,
+      {
+        sessionId,
+        cwd: cwd ?? this.cwd,
+        mcpServers: [],
+      },
+    );
+  }
+
+  /** Forks a session: resumes its history under a *new* session id instead of
+   *  the original one. The only available fallback when `loadSession` fails
+   *  because the original is currently owned by a live `claude --bg`
+   *  background-agent process elsewhere — ACP has no way to attach to that
+   *  process, only to branch off a copy of its history. */
+  async forkSession(
+    sessionId: SessionId,
+    cwd?: string,
+  ): Promise<ForkSessionResponse> {
+    return this.requireAgent().request<ForkSessionResponse>(
+      methods.agent.session.fork,
+      {
+        sessionId,
+        cwd: cwd ?? this.cwd,
+        mcpServers: [],
+      },
+    );
   }
 
   async prompt(sessionId: SessionId, text: string): Promise<StopReason> {
-    const response = await this.requireAgent().request(methods.agent.session.prompt, {
-      sessionId,
-      prompt: [{ type: "text", text }],
-    });
+    const response = await this.requireAgent().request(
+      methods.agent.session.prompt,
+      {
+        sessionId,
+        prompt: [{ type: "text", text }],
+      },
+    );
     return response.stopReason as StopReason;
   }
 
-  cancelPrompt(sessionId: SessionId): void {
-    void this.requireAgent().notify(methods.agent.session.cancel, { sessionId });
+  /** Injects a follow-up message into a turn that's already running, instead
+   *  of queuing a fresh `session/prompt` behind it. Calling `prompt()` again
+   *  while one is in flight sends an un-marked message the running turn
+   *  treats as an interrupt (matching the interactive CLI's "type to steer,
+   *  it interrupts" behavior) — `_session/steering` is the purpose-built
+   *  method that instead marks the message so the SDK folds it into the
+   *  active turn. Only call this when `canSteer()` is true and the caller
+   *  already knows (client-side) that a turn is genuinely in flight. */
+  async steer(sessionId: SessionId, text: string): Promise<void> {
+    await this.requireAgent().request("_session/steering", {
+      sessionId,
+      prompt: [{ type: "text", text }],
+    });
   }
 
-  async setConfigOption(sessionId: SessionId, configId: string, value: string | boolean): Promise<SessionConfigOption[]> {
+  cancelPrompt(sessionId: SessionId): void {
+    void this.requireAgent().notify(methods.agent.session.cancel, {
+      sessionId,
+    });
+  }
+
+  async setConfigOption(
+    sessionId: SessionId,
+    configId: string,
+    value: string | boolean,
+  ): Promise<SessionConfigOption[]> {
     const request =
       typeof value === "boolean"
         ? { sessionId, configId, value, type: "boolean" as const }
         : { sessionId, configId, value: value as SessionConfigValueId };
-    const response = await this.requireAgent().request<SetSessionConfigOptionResponse>(
-      methods.agent.session.setConfigOption,
-      request,
-    );
+    const response =
+      await this.requireAgent().request<SetSessionConfigOptionResponse>(
+        methods.agent.session.setConfigOption,
+        request,
+      );
     return response.configOptions;
   }
 
@@ -231,7 +352,11 @@ export class AgentClient implements vscode.Disposable {
       return;
     }
     this.pendingPermissions.delete(requestId);
-    resolve({ outcome: optionId ? { outcome: "selected", optionId } : { outcome: "cancelled" } });
+    resolve({
+      outcome: optionId
+        ? { outcome: "selected", optionId }
+        : { outcome: "cancelled" },
+    });
   }
 
   private disconnectChild(): void {

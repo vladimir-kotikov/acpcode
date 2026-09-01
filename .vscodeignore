@@ -1,11 +1,14 @@
 .vscode/**
 .vscode-test/**
+.codegraph/**
+.claude/**
 out/**
 src/test/**
 .gitignore
 .yarnrc
 esbuild.cjs
 vsc-extension-quickstart.md
+Makefile
 **/tsconfig*.json
 **/eslint.config.mjs
 **/*.map

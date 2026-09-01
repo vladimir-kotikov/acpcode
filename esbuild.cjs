@@ -46,8 +46,12 @@ function webviewBuildOptions(entryPoint, outfile) {
 
 async function main() {
   const contexts = await Promise.all([
-    esbuild.context(webviewBuildOptions("src/webview/main.ts", "dist/webview.js")),
-    esbuild.context(webviewBuildOptions("src/webview/sessionView.ts", "dist/sessionView.js")),
+    esbuild.context(
+      webviewBuildOptions("src/webview/main.ts", "dist/webview.js"),
+    ),
+    esbuild.context(
+      webviewBuildOptions("src/webview/sessionView.ts", "dist/sessionView.js"),
+    ),
   ]);
   if (watch) {
     await Promise.all(contexts.map(ctx => ctx.watch()));
