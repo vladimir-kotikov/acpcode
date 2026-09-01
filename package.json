@@ -1,0 +1,247 @@
+{
+  "name": "acpcode",
+  "displayName": "acpcode",
+  "description": "Yet another ACP-based agentic chat",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "type": "module",
+  "activationEvents": [],
+  "main": "./src/extension.ts",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "acpcode",
+          "title": "ACP Code",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "acpcode": [
+        {
+          "id": "acpcode.sessions",
+          "name": "Sessions",
+          "type": "tree"
+        },
+        {
+          "id": "acpcode.sessionView",
+          "name": "Session",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "acpcode.addAgent",
+        "title": "Add Agent",
+        "category": "ACP Code",
+        "icon": "$(person-add)"
+      },
+      {
+        "command": "acpcode.editAgentsConfig",
+        "title": "Edit Agents Config",
+        "category": "ACP Code",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "acpcode.refreshSessions",
+        "title": "Refresh Sessions",
+        "category": "ACP Code",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "acpcode.showAllSessions",
+        "title": "Show All Sessions",
+        "category": "ACP Code",
+        "icon": "$(list-flat)"
+      },
+      {
+        "command": "acpcode.showWorkspaceSessions",
+        "title": "Show Workspace Sessions Only",
+        "category": "ACP Code",
+        "icon": "$(root-folder)"
+      },
+      {
+        "command": "acpcode.toggleGroupSessionsByCwd",
+        "title": "Toggle Grouping Sessions by Directory",
+        "category": "ACP Code"
+      },
+      {
+        "command": "acpcode.openSessionInEditor",
+        "title": "Open Session in Editor",
+        "category": "ACP Code",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "acpcode.openTreeSessionInEditor",
+        "title": "Open Session in Editor",
+        "category": "ACP Code",
+        "icon": "$(link-external)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "acpcode.addAgent",
+          "when": "view == acpcode.sessions",
+          "group": "navigation"
+        },
+        {
+          "command": "acpcode.editAgentsConfig",
+          "when": "view == acpcode.sessions",
+          "group": "navigation"
+        },
+        {
+          "command": "acpcode.showWorkspaceSessions",
+          "when": "view == acpcode.sessions && config.acpcode.sessionScope == all",
+          "group": "navigation"
+        },
+        {
+          "command": "acpcode.showAllSessions",
+          "when": "view == acpcode.sessions && config.acpcode.sessionScope == workspace",
+          "group": "navigation"
+        },
+        {
+          "command": "acpcode.refreshSessions",
+          "when": "view == acpcode.sessions",
+          "group": "navigation"
+        },
+        {
+          "command": "acpcode.openSessionInEditor",
+          "when": "view == acpcode.sessionView",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "acpcode.openTreeSessionInEditor",
+          "when": "view == acpcode.sessions && viewItem == acpcode.session",
+          "group": "inline"
+        },
+        {
+          "command": "acpcode.openTreeSessionInEditor",
+          "when": "view == acpcode.sessions && viewItem == acpcode.session",
+          "group": "9_acpcode"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ACP Code",
+      "properties": {
+        "acpcode.agents": {
+          "type": "array",
+          "description": "Configured agents shown in the Sessions view, e.g. Claude profiles mirroring shell aliases like `claude-personal='CLAUDE_CONFIG_DIR=~/.claude-personal claude'`.",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "kind"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Display name for this agent. Must be unique."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "claude",
+                  "codex"
+                ],
+                "description": "Which ACP agent implementation to spawn."
+              },
+              "env": {
+                "type": "object",
+                "description": "Extra environment variables to set when spawning this agent, e.g. CLAUDE_CONFIG_DIR.",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "default": {}
+              }
+            }
+          },
+          "default": [
+            {
+              "name": "Claude",
+              "kind": "claude",
+              "env": {}
+            },
+            {
+              "name": "Claude (personal)",
+              "kind": "claude",
+              "env": {
+                "CLAUDE_CONFIG_DIR": "~/.claude-personal"
+              }
+            }
+          ]
+        },
+        "acpcode.sessionScope": {
+          "type": "string",
+          "enum": [
+            "all",
+            "workspace"
+          ],
+          "enumDescriptions": [
+            "Show every session for each agent, regardless of directory.",
+            "Show only sessions whose directory matches one of the current workspace folders."
+          ],
+          "default": "all",
+          "description": "Which sessions to show per agent in the Sessions view."
+        },
+        "acpcode.groupSessionsByCwd": {
+          "type": "boolean",
+          "default": false,
+          "description": "Group each agent's sessions by their working directory in the Sessions view."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && npm run build:webview",
+    "build:webview": "node esbuild.cjs",
+    "watch": "npm-run-all -p watch:*",
+    "watch:webview": "node esbuild.cjs --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.cjs --production",
+    "compile-tests": "tsc -p tsconfig.test.json",
+    "watch-tests": "tsc -p tsconfig.test.json -w",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "^0.68.0",
+    "@agentclientprotocol/codex-acp": "^1.6.2",
+    "@agentclientprotocol/sdk": "^1.3.0",
+    "highlight.js": "^11.12.0",
+    "marked": "^18.0.11"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.5.0",
+    "npm-run-all": "^4.1.5",
+    "prettier": "^3.9.6",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  },
+  "prettier": {
+    "arrowParens": "avoid"
+  }
+}
