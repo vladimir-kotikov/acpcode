@@ -7,6 +7,7 @@
 // wrapper. Browser-side only — no vscode (extension host) imports.
 
 import type {
+  AvailableCommand,
   ContentBlock,
   PermissionOption,
   SessionId,
@@ -117,6 +118,9 @@ export interface ViewState {
   // attempt 2 of 10." from the AIR session-failure extension. Cleared once
   // real content resumes (it's stale by then) or the turn ends.
   statusText: string | undefined;
+  // Slash commands the agent advertised for this session, for the
+  // composer's completion popup. Empty until the agent sends one.
+  availableCommands: AvailableCommand[];
 }
 
 export const initialState: ViewState = {
@@ -127,6 +131,7 @@ export const initialState: ViewState = {
   draftText: "",
   drafts: new Map(),
   statusText: undefined,
+  availableCommands: [],
 };
 
 export type Action =
@@ -326,6 +331,10 @@ function extractSessionFailureTitle(update: SessionUpdate): string | undefined {
   return typeof title === "string" ? title : undefined;
 }
 
+function extractAvailableCommands(update: SessionUpdate): AvailableCommand[] | undefined {
+  return update.sessionUpdate === "available_commands_update" ? update.availableCommands : undefined;
+}
+
 export function reduce(state: ViewState, action: Action): ViewState {
   switch (action.type) {
     case "loading": {
@@ -345,6 +354,7 @@ export function reduce(state: ViewState, action: Action): ViewState {
         draftText: drafts.get(action.meta.sessionId) ?? "",
         drafts,
         statusText: undefined,
+        availableCommands: [],
       };
     }
     case "error":
@@ -391,6 +401,7 @@ export function reduce(state: ViewState, action: Action): ViewState {
       }
       const blocks = applySessionUpdate(state.blocks, action.update);
       const failureTitle = extractSessionFailureTitle(action.update);
+      const commands = extractAvailableCommands(action.update);
       return {
         ...state,
         blocks,
@@ -398,6 +409,7 @@ export function reduce(state: ViewState, action: Action): ViewState {
         statusText:
           failureTitle ??
           (blocks !== state.blocks ? undefined : state.statusText),
+        availableCommands: commands ?? state.availableCommands,
       };
     }
     case "replayBatch": {
@@ -406,6 +418,7 @@ export function reduce(state: ViewState, action: Action): ViewState {
       }
       let blocks = state.blocks;
       let statusText = state.statusText;
+      let availableCommands = state.availableCommands;
       for (const update of action.updates) {
         const before = blocks;
         blocks = applySessionUpdate(blocks, update);
@@ -415,9 +428,11 @@ export function reduce(state: ViewState, action: Action): ViewState {
         } else if (blocks !== before) {
           statusText = undefined;
         }
+        availableCommands = extractAvailableCommands(update) ?? availableCommands;
       }
       return {
         ...state,
+        availableCommands,
         blocks,
         loading: false,
         busy: action.busy,
@@ -866,6 +881,42 @@ function BlocksView({
   });
 }
 
+// Only while the whole message is still just "/" + a bare command name (no
+// space yet) — once a space appears the user's typing the command's
+// arguments, not still choosing which command, so the popup should be gone.
+function matchSlashCommand(text: string): string | undefined {
+  const match = /^\/(\S*)$/.exec(text);
+  return match ? match[1] : undefined;
+}
+
+function SlashCommandMenu({
+  commands,
+  selectedIndex,
+  onSelect,
+}: {
+  commands: AvailableCommand[];
+  selectedIndex: number;
+  onSelect: (command: AvailableCommand) => void;
+}) {
+  return html`
+    <div class="slash-menu">
+      ${commands.map(
+        (command, index) => html`
+          <button
+            key=${command.name}
+            type="button"
+            class="slash-menu-item ${index === selectedIndex ? "slash-menu-item-selected" : ""}"
+            onClick=${() => onSelect(command)}
+          >
+            <span class="slash-menu-name">/${command.name}</span>
+            <span class="slash-menu-description">${command.input?.hint ?? command.description}</span>
+          </button>
+        `,
+      )}
+    </div>
+  `;
+}
+
 function Composer({
   state,
   onSend,
@@ -884,6 +935,8 @@ function Composer({
   // back to the old block-until-idle behavior for agents that don't.
   const steeringBlocked = state.busy && !state.meta?.canSteer;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [dismissed, setDismissed] = useState(false);
 
   // <textarea> has no reactive "grow with content" CSS in this Chromium
   // build — recompute height from scrollHeight on every text change instead;
@@ -898,6 +951,16 @@ function Composer({
     el.style.height = `${el.scrollHeight}px`;
   }, [state.draftText]);
 
+  const partial = matchSlashCommand(state.draftText);
+  useEffect(() => {
+    setSelectedIndex(0);
+    setDismissed(false);
+  }, [partial]);
+  const suggestions =
+    partial === undefined || dismissed
+      ? []
+      : state.availableCommands.filter(command => command.name.startsWith(partial)).slice(0, 8);
+
   function submit(): void {
     const trimmed = state.draftText.trim();
     if (!trimmed || disabled || steeringBlocked) {
@@ -906,8 +969,16 @@ function Composer({
     onSend(trimmed);
   }
 
+  function selectCommand(command: AvailableCommand): void {
+    onDraftChange(`/${command.name} `);
+    textareaRef.current?.focus();
+  }
+
   return html`
     <div class="input-bar">
+      ${suggestions.length > 0
+        ? html`<${SlashCommandMenu} commands=${suggestions} selectedIndex=${selectedIndex} onSelect=${selectCommand} />`
+        : null}
       <textarea
         ref=${textareaRef}
         class="prompt-input"
@@ -917,6 +988,28 @@ function Composer({
         value=${state.draftText}
         onInput=${(event: Event) => onDraftChange((event.target as HTMLTextAreaElement).value)}
         onKeyDown=${(event: KeyboardEvent) => {
+          if (suggestions.length > 0) {
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              setSelectedIndex(index => (index + 1) % suggestions.length);
+              return;
+            }
+            if (event.key === "ArrowUp") {
+              event.preventDefault();
+              setSelectedIndex(index => (index - 1 + suggestions.length) % suggestions.length);
+              return;
+            }
+            if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
+              event.preventDefault();
+              selectCommand(suggestions[selectedIndex]);
+              return;
+            }
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setDismissed(true);
+              return;
+            }
+          }
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             submit();

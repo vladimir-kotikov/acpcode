@@ -542,11 +542,59 @@ code {
 }
 
 .input-bar {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 6px;
   padding: 8px;
   border-top: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
+}
+
+.slash-menu {
+  position: absolute;
+  bottom: 100%;
+  left: 8px;
+  right: 8px;
+  margin-bottom: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--vscode-dropdown-background, var(--vscode-editorWidget-background));
+  border: 1px solid var(--vscode-dropdown-border, var(--vscode-sideBarSectionHeader-border));
+  border-radius: var(--vscode-cornerRadius-medium, 6px);
+  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.slash-menu-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--vscode-spacing-size80, 8px);
+  padding: var(--vscode-spacing-size40, 4px) var(--vscode-spacing-size80, 8px);
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  color: var(--vscode-foreground);
+  font: inherit;
+}
+
+.slash-menu-item:hover,
+.slash-menu-item-selected {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.slash-menu-name {
+  flex-shrink: 0;
+  font-weight: var(--vscode-fontWeight-semiBold, 600);
+}
+
+.slash-menu-description {
+  overflow: hidden;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--vscode-fontSize-body2, 0.85em);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .prompt-input {
