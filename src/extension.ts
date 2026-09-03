@@ -8,7 +8,7 @@ import {
   SessionViewProvider,
   type SessionTarget,
 } from "./sessionViewProvider.ts";
-import { setSessionScope, toggleGroupSessionsByCwd } from "./settings.ts";
+import { toggleGroupSessionsByCwd } from "./settings.ts";
 import { SessionsTreeProvider } from "./treeProvider.ts";
 
 export function activate(context: vscode.ExtensionContext) {
@@ -37,12 +37,6 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(
       "acpcode.refreshSessions",
       treeProvider.refresh,
-    ),
-    vscode.commands.registerCommand("acpcode.showAllSessions", () =>
-      setSessionScope("all"),
-    ),
-    vscode.commands.registerCommand("acpcode.showWorkspaceSessions", () =>
-      setSessionScope("workspace"),
     ),
     vscode.commands.registerCommand(
       "acpcode.toggleGroupSessionsByCwd",

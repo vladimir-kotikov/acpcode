@@ -56,18 +56,6 @@
         "icon": "$(refresh)"
       },
       {
-        "command": "acpcode.showAllSessions",
-        "title": "Show All Sessions",
-        "category": "ACP Code",
-        "icon": "$(list-flat)"
-      },
-      {
-        "command": "acpcode.showWorkspaceSessions",
-        "title": "Show Workspace Sessions Only",
-        "category": "ACP Code",
-        "icon": "$(root-folder)"
-      },
-      {
         "command": "acpcode.toggleGroupSessionsByCwd",
         "title": "Toggle Grouping Sessions by Directory",
         "category": "ACP Code"
@@ -95,16 +83,6 @@
         {
           "command": "acpcode.editAgentsConfig",
           "when": "view == acpcode.sessions",
-          "group": "navigation"
-        },
-        {
-          "command": "acpcode.showWorkspaceSessions",
-          "when": "view == acpcode.sessions && config.acpcode.sessionScope == all",
-          "group": "navigation"
-        },
-        {
-          "command": "acpcode.showAllSessions",
-          "when": "view == acpcode.sessions && config.acpcode.sessionScope == workspace",
           "group": "navigation"
         },
         {
@@ -180,19 +158,6 @@
               }
             }
           ]
-        },
-        "acpcode.sessionScope": {
-          "type": "string",
-          "enum": [
-            "all",
-            "workspace"
-          ],
-          "enumDescriptions": [
-            "Show every session for each agent, regardless of directory.",
-            "Show only sessions whose directory matches one of the current workspace folders."
-          ],
-          "default": "all",
-          "description": "Which sessions to show per agent in the Sessions view."
         },
         "acpcode.groupSessionsByCwd": {
           "type": "boolean",

@@ -1,12 +1,11 @@
 import type { SessionInfo } from "@agentclientprotocol/sdk";
-import * as os from "node:os";
 import * as path from "node:path";
 import { match } from "ts-pattern";
 import * as vscode from "vscode";
 import type { AgentClient } from "./acp/agentClient.ts";
 import type { AgentConnectionPool } from "./acp/agentPool.ts";
 import { getAgents, type AgentConfig } from "./acp/agents/config.ts";
-import { getGroupSessionsByCwd, getSessionScope } from "./settings.ts";
+import { getGroupSessionsByCwd } from "./settings.ts";
 import { resolveCwd } from "./workspaceUtils.ts";
 
 type MaybePromise<T> = T | Promise<T>;
@@ -97,7 +96,6 @@ export class SessionsTreeProvider
     this.configListener = vscode.workspace.onDidChangeConfiguration(event => {
       if (
         event.affectsConfiguration("acpcode.agents") ||
-        event.affectsConfiguration("acpcode.sessionScope") ||
         event.affectsConfiguration("acpcode.groupSessionsByCwd")
       ) {
         // Agent definitions themselves may have changed (env vars, etc.) —
@@ -199,24 +197,23 @@ export class SessionsTreeProvider
       })
       .exhaustive();
 
-  /** "all": unfiltered session/list (across every project the agent knows
-   *  about). "workspace": one session/list call per open workspace folder,
-   *  merged and deduped — falls back to the home directory when no folder
-   *  is open, since that's what a bare-window agent would have spawned into. */
-
+  /** One `session/list` call per currently-open workspace folder, merged and
+   *  deduped. No "list every session this agent has ever seen" mode: the
+   *  underlying agents disagree on what that even means — Claude's session
+   *  storage is project-scoped and its SDK silently narrows an unscoped
+   *  `session/list` to a single project, while Codex's is date-scoped and
+   *  genuinely global — so a per-cwd listing is the only option that behaves
+   *  the same regardless of which agent is connected. No folder open means
+   *  nothing to list. */
   private listSessionsForScope = (client: AgentClient, cwd?: string) => {
     if (cwd !== undefined) {
       return client.listSessions(cwd);
     }
 
     const folders = vscode.workspace.workspaceFolders ?? [];
-    return getSessionScope() === "all"
-      ? client.listSessions()
-      : folders.length === 0
-        ? client.listSessions(os.homedir())
-        : Promise.all(
-            folders.map(folder => client.listSessions(folder.uri.fsPath)),
-          ).then(sessions => uniq(sessions.flat(), s => s.sessionId));
+    return Promise.all(
+      folders.map(folder => client.listSessions(folder.uri.fsPath)),
+    ).then(sessions => uniq(sessions.flat(), s => s.sessionId));
   };
 
   dispose = () => this.configListener.dispose();
