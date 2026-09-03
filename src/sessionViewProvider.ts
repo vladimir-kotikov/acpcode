@@ -109,6 +109,15 @@ class SessionViewSession implements vscode.Disposable {
   // single batch instead of N separate renders in the webview.
   private replayingHistory = false;
   private pendingPrompts = 0;
+  // True only once this session is known-registered on the bridge — either
+  // `loadSession` returned successfully, or it was seeded from a peer that
+  // was itself already loaded. `current` alone isn't enough: it's set before
+  // `loadSession` is even attempted, so a session whose load is still in
+  // flight or that failed would otherwise look like a perfectly good peer to
+  // seed from — which skips calling `loadSession` entirely (see its doc
+  // comment), leaving the bridge with no record of the session at all and
+  // every later `prompt`/`steer` failing with "Session not found".
+  private loaded = false;
 
   constructor(pool: AgentConnectionPool) {
     this.pool = pool;
@@ -116,13 +125,14 @@ class SessionViewSession implements vscode.Disposable {
 
   matches(target: SessionTarget): boolean {
     return (
+      this.loaded &&
       this.current?.agentName === target.agentName &&
       this.current?.sessionId === target.sessionId
     );
   }
 
   snapshot(): SessionSnapshot | undefined {
-    return this.current
+    return this.current && this.loaded
       ? { buffer: [...this.buffer], busy: this.pendingPrompts > 0 }
       : undefined;
   }
@@ -215,6 +225,7 @@ class SessionViewSession implements vscode.Disposable {
 
     this.current = target;
     this.buffer = [];
+    this.loaded = false;
     this.post({
       type: "loading",
       meta: {
@@ -227,6 +238,7 @@ class SessionViewSession implements vscode.Disposable {
 
     if (seed) {
       this.buffer = [...seed.buffer];
+      this.loaded = true;
       this.post({
         type: "replayBatch",
         sessionId: target.sessionId,
@@ -240,6 +252,7 @@ class SessionViewSession implements vscode.Disposable {
     try {
       await client.loadSession(target.sessionId, target.cwd);
       this.replayingHistory = false;
+      this.loaded = true;
       this.post({
         type: "replayBatch",
         sessionId: target.sessionId,

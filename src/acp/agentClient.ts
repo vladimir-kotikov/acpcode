@@ -298,6 +298,7 @@ export class AgentClient implements vscode.Disposable {
   }
 
   async prompt(sessionId: SessionId, text: string): Promise<StopReason> {
+    this.echoUserMessage(sessionId, text);
     const response = await this.requireAgent().request(
       methods.agent.session.prompt,
       {
@@ -317,9 +318,30 @@ export class AgentClient implements vscode.Disposable {
    *  active turn. Only call this when `canSteer()` is true and the caller
    *  already knows (client-side) that a turn is genuinely in flight. */
   async steer(sessionId: SessionId, text: string): Promise<void> {
+    this.echoUserMessage(sessionId, text);
     await this.requireAgent().request("_session/steering", {
       sessionId,
       prompt: [{ type: "text", text }],
+    });
+  }
+
+  /** ACP doesn't echo a prompt you send back as a `user_message_chunk` (that
+   *  update kind is only otherwise seen during history replay) — so without
+   *  this, only whichever `SessionViewSession` sent the message would ever
+   *  know a turn boundary happened there; every other view sharing this
+   *  connection (e.g. the sidebar, when the message was sent from an editor
+   *  tab) would never see it, merging two turns into one and folding away
+   *  content that should stay pinned as "the last item of the completed
+   *  turn." Firing it through the same `onSessionUpdate` every view already
+   *  subscribes to fixes that for all of them in one place, instead of each
+   *  view needing its own client-side optimistic echo. */
+  private echoUserMessage(sessionId: SessionId, text: string): void {
+    this.sessionUpdateEmitter.fire({
+      sessionId,
+      update: {
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text },
+      },
     });
   }
 
@@ -357,6 +379,12 @@ export class AgentClient implements vscode.Disposable {
         ? { outcome: "selected", optionId }
         : { outcome: "cancelled" },
     });
+    // Every SessionViewSession sharing this connection stays subscribed to
+    // this event, not just whichever view the click happened in — without
+    // firing it here, a sibling view (e.g. the sidebar, when the click was in
+    // an editor tab) never learns the request settled and keeps showing its
+    // buttons as active.
+    this.permissionResolvedEmitter.fire({ requestId });
   }
 
   private disconnectChild(): void {

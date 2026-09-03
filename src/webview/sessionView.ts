@@ -77,7 +77,7 @@ function Root() {
   }, []);
 
   function onSend(text: string): void {
-    dispatch({ type: "localUserMessage", text });
+    dispatch({ type: "draftSent" });
     dispatch({ type: "sendStart" });
     vscode.postMessage({ type: "sendPrompt", text });
   }

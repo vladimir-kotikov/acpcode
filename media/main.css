@@ -475,9 +475,10 @@ code {
   margin: var(--vscode-spacing-size40, 4px) 0;
 }
 
-.tool-diff summary {
-  cursor: pointer;
+.tool-diff-path {
   font-size: var(--vscode-fontSize-body2, 0.85em);
+  color: var(--vscode-descriptionForeground);
+  margin: var(--vscode-spacing-size40, 4px) 0 2px;
 }
 
 .diff-old {

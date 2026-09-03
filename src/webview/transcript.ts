@@ -47,6 +47,14 @@ const TOOL_KIND_LABELS: Record<ToolKind, string> = {
   other: "Tool",
 };
 
+// Some agents already fold the verb into the title (e.g. edit calls titled
+// "Edit package.json"); others don't (e.g. web search titled with just the
+// query). Only show the separate kind-label span when the title doesn't
+// already start with it, to avoid "Edit Edit package.json".
+function showsOwnKindLabel(kind: ToolKind, title: string): boolean {
+  return title.toLowerCase().startsWith(TOOL_KIND_LABELS[kind].toLowerCase());
+}
+
 // ---------------------------------------------------------------------------
 // State
 
@@ -72,6 +80,7 @@ interface PermissionItem {
   id: string;
   requestId: string;
   title: string;
+  kind: ToolKind;
   options: PermissionOption[];
   // undefined = pending, null = resolved without knowing which option (e.g.
   // the request was aborted host-side), string = the clicked option's id.
@@ -146,7 +155,7 @@ export type Action =
   | { type: "error"; text: string; forkable?: boolean }
   | { type: "sendStart" }
   | { type: "promptStopped"; sessionId: SessionId; stopReason: StopReason }
-  | { type: "localUserMessage"; text: string }
+  | { type: "draftSent" }
   | {
       type: "permissionRequest";
       requestId: string;
@@ -380,18 +389,16 @@ export function reduce(state: ViewState, action: Action): ViewState {
       return action.sessionId === state.meta?.sessionId
         ? { ...state, busy: false, statusText: undefined }
         : state;
-    case "localUserMessage": {
+    // The user bubble itself now always arrives through "sessionUpdate" (see
+    // AgentClient.echoUserMessage) so every view showing this session gets
+    // it, not just whichever one sent it — this action only clears the
+    // composer, dispatched locally for instant feedback on click.
+    case "draftSent": {
       const drafts = new Map(state.drafts);
       if (state.meta) {
         drafts.delete(state.meta.sessionId);
       }
-      return {
-        ...state,
-        blocks: appendUserChunk(state.blocks, action.text),
-        loading: false,
-        draftText: "",
-        drafts,
-      };
+      return { ...state, draftText: "", drafts };
     }
     case "draftChanged":
       return { ...state, draftText: action.text };
@@ -448,6 +455,7 @@ export function reduce(state: ViewState, action: Action): ViewState {
         id: genId(),
         requestId: action.requestId,
         title: action.toolCall.title ?? "Permission requested",
+        kind: action.toolCall.kind ?? "other",
         options: action.options,
         resolvedOptionId: undefined,
       };
@@ -658,12 +666,14 @@ function ToolCallContentView({
       />`;
     }
     if (item.type === "diff") {
+      // No extra <details> fold here — the tool card itself is already the
+      // one collapse point, matching plain content (Read) rendering directly.
       return html`
-        <details class="tool-diff" key=${index}>
-          <summary>${item.path}</summary>
+        <div class="tool-diff" key=${index}>
+          <div class="tool-diff-path">${item.path}</div>
           ${item.oldText ? html`<pre class="diff-old">${item.oldText}</pre>` : null}
           <pre class="diff-new">${item.newText}</pre>
-        </details>
+        </div>
       `;
     }
     return html`<div class="tool-content-other" key=${index}>
@@ -683,7 +693,13 @@ function ToolCardView({
   return html`
     <details class="tool-card" ref=${ref} title=${debugTitle(item)}>
       <summary class="tool-card-header">
-        <span class="tool-card-kind">${TOOL_KIND_LABELS[item.kind]}</span>
+        ${
+          !showsOwnKindLabel(item.kind, item.title)
+            ? html`<span class="tool-card-kind"
+                >${TOOL_KIND_LABELS[item.kind]}</span
+              >`
+            : null
+        }
         <span class="tool-card-title">${item.title}</span>
         <span class="tool-card-status">${item.status}</span>
       </summary>
@@ -707,7 +723,9 @@ function PermissionCardView({
       class="permission-card ${resolved ? "permission-resolved" : ""}"
       title=${debugTitle(item)}
     >
-      <div class="permission-title">${item.title}</div>
+      <div class="permission-title">
+        ${!showsOwnKindLabel(item.kind, item.title) ? `${TOOL_KIND_LABELS[item.kind]}: ` : ""}${item.title}
+      </div>
       <div class="permission-buttons">
         ${item.options.map(
           option => html`
