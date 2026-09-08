@@ -483,7 +483,9 @@ export function reduce(state: ViewState, action: Action): ViewState {
         ...state,
         blocks: updateTurnItem(
           state.blocks,
-          item => item.type === "tool" && item.pendingPermission?.requestId === action.requestId,
+          item =>
+            item.type === "tool" &&
+            item.pendingPermission?.requestId === action.requestId,
           item => {
             const tool = item as ToolItem;
             return {
@@ -673,7 +675,11 @@ interface DiffLine {
 function toDiffLines(oldText: string, newText: string): DiffLine[] {
   const lines: DiffLine[] = [];
   for (const change of diffLines(oldText, newText)) {
-    const kind: DiffLineKind = change.added ? "add" : change.removed ? "remove" : "context";
+    const kind: DiffLineKind = change.added
+      ? "add"
+      : change.removed
+        ? "remove"
+        : "context";
     const chunkLines = change.value.split("\n");
     // diffLines' value always ends with "\n" except possibly the very last
     // chunk of the whole diff - drop the empty string that split() leaves.
@@ -693,7 +699,9 @@ function toDiffLines(oldText: string, newText: string): DiffLine[] {
 // text either side.
 const DIFF_CONTEXT_LINES = 3;
 
-function windowDiffContext(lines: DiffLine[]): (DiffLine | { kind: "ellipsis" })[] {
+function windowDiffContext(
+  lines: DiffLine[],
+): (DiffLine | { kind: "ellipsis" })[] {
   const result: (DiffLine | { kind: "ellipsis" })[] = [];
   let i = 0;
   while (i < lines.length) {
@@ -720,19 +728,34 @@ function windowDiffContext(lines: DiffLine[]): (DiffLine | { kind: "ellipsis" })
   return result;
 }
 
-const DIFF_LINE_PREFIX: Record<DiffLineKind, string> = { add: "+ ", remove: "- ", context: "  " };
+const DIFF_LINE_PREFIX: Record<DiffLineKind, string> = {
+  add: "+ ",
+  remove: "- ",
+  context: "  ",
+};
 
-function DiffView({ path, oldText, newText }: { path: string; oldText: string; newText: string }) {
+function DiffView({
+  path,
+  oldText,
+  newText,
+}: {
+  path: string;
+  oldText: string;
+  newText: string;
+}) {
   const lines = windowDiffContext(toDiffLines(oldText, newText));
   // No whitespace between <pre> and the mapped lines: <pre> preserves it
   // literally, and a stray indentation/newline text node here would show up
   // as a visible blank line.
   return html`<div class="tool-diff">
     <div class="tool-diff-path">${path}</div>
-    <pre class="diff-lines">${lines.map((line, index) =>
+    <pre class="diff-lines">
+${lines.map((line, index) =>
       line.kind === "ellipsis"
         ? html`<div class="diff-line diff-line-ellipsis" key=${index}>⋯</div>`
-        : html`<div class="diff-line diff-line-${line.kind}" key=${index}>${DIFF_LINE_PREFIX[line.kind]}${line.text}</div>`,
+        : html`<div class="diff-line diff-line-${line.kind}" key=${index}>
+            ${DIFF_LINE_PREFIX[line.kind]}${line.text}
+          </div>`,
     )}</pre>
   </div>`;
 }
@@ -756,7 +779,12 @@ function ToolCallContentView({
     if (item.type === "diff") {
       // No extra <details> fold here — the tool card itself is already the
       // one collapse point, matching plain content (Read) rendering directly.
-      return html`<${DiffView} key=${index} path=${item.path} oldText=${item.oldText ?? ""} newText=${item.newText} />`;
+      return html`<${DiffView}
+        key=${index}
+        path=${item.path}
+        oldText=${item.oldText ?? ""}
+        newText=${item.newText}
+      />`;
     }
     return html`<div class="tool-content-other" key=${index}>
       [terminal output]
@@ -806,7 +834,9 @@ function ToolCardView({
 }) {
   // A pending approval needs to actually be visible, not hidden behind a
   // collapsed card the user has to think to expand.
-  const pendingApproval = item.pendingPermission?.resolvedOptionId === undefined && !!item.pendingPermission;
+  const pendingApproval =
+    item.pendingPermission?.resolvedOptionId === undefined &&
+    !!item.pendingPermission;
   const ref = useOpenOnMount(defaultOpen || pendingApproval);
   return html`
     <details class="tool-card" ref=${ref} title=${debugTitle(item)}>
@@ -823,9 +853,14 @@ function ToolCardView({
       </summary>
       <div class="tool-card-body">
         <${ToolCallContentView} content=${item.content} />
-        ${item.pendingPermission
-          ? html`<${PendingPermissionView} pendingPermission=${item.pendingPermission} onRespond=${onRespond} />`
-          : null}
+        ${
+          item.pendingPermission
+            ? html`<${PendingPermissionView}
+                pendingPermission=${item.pendingPermission}
+                onRespond=${onRespond}
+              />`
+            : null
+        }
       </div>
     </details>
   `;
@@ -873,7 +908,11 @@ function TurnItemView({
       debug=${item}
     />`;
   }
-  return html`<${ToolCardView} item=${item} defaultOpen=${defaultOpen} onRespond=${onRespond} />`;
+  return html`<${ToolCardView}
+    item=${item}
+    defaultOpen=${defaultOpen}
+    onRespond=${onRespond}
+  />`;
 }
 
 /** Everything the agent produces between two user messages is one turn: only
@@ -1034,11 +1073,25 @@ function SlashCommandMenu({
 }
 
 function SendIcon() {
-  return html`<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 2 13 8H10V14H6V8H3Z" /></svg>`;
+  return html`<svg
+    width="14"
+    height="14"
+    viewBox="0 0 16 16"
+    fill="currentColor"
+  >
+    <path d="M8 2 13 8H10V14H6V8H3Z" />
+  </svg>`;
 }
 
 function StopIcon() {
-  return html`<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5" /></svg>`;
+  return html`<svg
+    width="14"
+    height="14"
+    viewBox="0 0 16 16"
+    fill="currentColor"
+  >
+    <rect x="4" y="4" width="8" height="8" rx="1.5" />
+  </svg>`;
 }
 
 function Composer({
@@ -1084,10 +1137,16 @@ function Composer({
     partial === undefined || dismissed
       ? []
       : state.availableCommands
-          .filter(command => fuzzyMatches(partial.toLowerCase(), command.name.toLowerCase()))
+          .filter(command =>
+            fuzzyMatches(partial.toLowerCase(), command.name.toLowerCase()),
+          )
           .sort((a, b) => {
-            const aPrefix = a.name.toLowerCase().startsWith(partial.toLowerCase());
-            const bPrefix = b.name.toLowerCase().startsWith(partial.toLowerCase());
+            const aPrefix = a.name
+              .toLowerCase()
+              .startsWith(partial.toLowerCase());
+            const bPrefix = b.name
+              .toLowerCase()
+              .startsWith(partial.toLowerCase());
             return aPrefix === bPrefix ? 0 : aPrefix ? -1 : 1;
           });
 
@@ -1162,7 +1221,8 @@ function Composer({
         // whenever there's actually something typed to inject, otherwise
         // there's nothing useful Send could do — "Stop" is the only
         // meaningful action, so that's what takes over the slot.
-        const canSend = !disabled && !steeringBlocked && !!state.draftText.trim();
+        const canSend =
+          !disabled && !steeringBlocked && !!state.draftText.trim();
         const showStop = state.busy && !canSend;
         return html`<button
           class="send-btn ${showStop ? "cancel-btn" : ""}"
@@ -1206,7 +1266,8 @@ export function Transcript({
       return;
     }
     const onScroll = () => {
-      const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+      const distanceFromBottom =
+        node.scrollHeight - node.scrollTop - node.clientHeight;
       atBottomRef.current = distanceFromBottom < 48;
     };
     node.addEventListener("scroll", onScroll);

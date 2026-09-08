@@ -93,7 +93,10 @@ export class SessionsTreeProvider
 
   readonly onDidChangeTreeData = this.changeEmitter.event;
 
-  constructor(pool: AgentConnectionPool, sessionViewProvider: SessionViewProvider) {
+  constructor(
+    pool: AgentConnectionPool,
+    sessionViewProvider: SessionViewProvider,
+  ) {
     this.pool = pool;
     this.sessionViewProvider = sessionViewProvider;
     this.configListener = vscode.workspace.onDidChangeConfiguration(event => {
@@ -128,7 +131,9 @@ export class SessionsTreeProvider
     if (confirmed !== "Delete") {
       return;
     }
-    const agent = getAgents().find(candidate => candidate.name === node.agent.name);
+    const agent = getAgents().find(
+      candidate => candidate.name === node.agent.name,
+    );
     if (!agent) {
       return;
     }
@@ -143,8 +148,13 @@ export class SessionsTreeProvider
 
   /** Invoked from a cwd-group row (with that cwd) or an agent row (falls back
    *  to the workspace cwd, matching how the ungrouped list is scoped). */
-  newSession = async (node: { agent: { name: string }; cwd?: string }): Promise<void> => {
-    const agent = getAgents().find(candidate => candidate.name === node.agent.name);
+  newSession = async (node: {
+    agent: { name: string };
+    cwd?: string;
+  }): Promise<void> => {
+    const agent = getAgents().find(
+      candidate => candidate.name === node.agent.name,
+    );
     if (!agent) {
       return;
     }
@@ -152,7 +162,11 @@ export class SessionsTreeProvider
     const client = await this.pool.connect(agent, cwd);
     const response = await client.newSession(cwd);
     this.refresh();
-    await this.sessionViewProvider.openSession({ agentName: agent.name, sessionId: response.sessionId, cwd });
+    await this.sessionViewProvider.openSession({
+      agentName: agent.name,
+      sessionId: response.sessionId,
+      cwd,
+    });
   };
 
   getTreeItem = (node: TreeNode): vscode.TreeItem =>

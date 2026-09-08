@@ -503,7 +503,10 @@ export class SessionViewProvider
       cwd: state.cwd,
       title: state.title,
     };
-    await session.attachSession(target, this.findPeer(target, session)?.snapshot());
+    await session.attachSession(
+      target,
+      this.findPeer(target, session)?.snapshot(),
+    );
   };
 
   private bindPanel(panel: vscode.WebviewPanel): SessionViewSession {
