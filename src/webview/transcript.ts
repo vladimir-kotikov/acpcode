@@ -381,7 +381,8 @@ export function reduce(state: ViewState, action: Action): ViewState {
         blocks: [],
         busy: false,
         loading: true,
-        draftText: drafts.get(action.meta.sessionId) ?? action.restoredDraftText ?? "",
+        draftText:
+          drafts.get(action.meta.sessionId) ?? action.restoredDraftText ?? "",
         drafts,
         statusText: undefined,
         availableCommands: [],
@@ -1257,6 +1258,7 @@ function Composer({
 
 export function Transcript({
   state,
+  atBottomRef,
   onSend,
   onCancel,
   onRespond,
@@ -1264,6 +1266,7 @@ export function Transcript({
   onDraftChange,
 }: {
   state: ViewState;
+  atBottomRef: { current: boolean };
   onSend: (text: string) => void;
   onCancel: () => void;
   onRespond: (requestId: string, optionId: string) => void;
@@ -1277,7 +1280,9 @@ export function Transcript({
   // the new content, so scrollHeight no longer reflects "where things stood
   // right before this update" — checking there would always read as "not at
   // the bottom" the instant anything taller than the old scrollback arrives.
-  const atBottomRef = useRef(true);
+  // Owned by the caller (Root, in sessionView.ts) so onSend can force it to
+  // true directly — sending overrides wherever the user's currently
+  // scrolled, they just acted, they want to see it happen.
   useEffect(() => {
     const node = logRef.current;
     if (!node) {

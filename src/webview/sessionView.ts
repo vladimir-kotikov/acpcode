@@ -31,6 +31,9 @@ function Root() {
   // the current dispatch through a ref rather than a stale closure.
   const dispatchRef = useRef(dispatch);
   dispatchRef.current = dispatch;
+  // Owned here (not inside Transcript) so onSend below can force it
+  // directly — see Transcript's own comment on the scroll-tracking effect.
+  const atBottomRef = useRef(true);
 
   // Single spot persisting both halves of PersistedState — covers both the
   // session-changed case (meta updates on "loading") and every keystroke in
@@ -106,6 +109,7 @@ function Root() {
   }, []);
 
   function onSend(text: string): void {
+    atBottomRef.current = true;
     dispatch({ type: "draftSent" });
     dispatch({ type: "sendStart" });
     vscode.postMessage({ type: "sendPrompt", text });
@@ -126,6 +130,7 @@ function Root() {
 
   return html`<${Transcript}
     state=${state}
+    atBottomRef=${atBottomRef}
     onSend=${onSend}
     onCancel=${onCancel}
     onRespond=${onRespond}
