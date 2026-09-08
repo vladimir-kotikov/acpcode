@@ -341,8 +341,12 @@ function extractSessionFailureTitle(update: SessionUpdate): string | undefined {
   return typeof title === "string" ? title : undefined;
 }
 
-function extractAvailableCommands(update: SessionUpdate): AvailableCommand[] | undefined {
-  return update.sessionUpdate === "available_commands_update" ? update.availableCommands : undefined;
+function extractAvailableCommands(
+  update: SessionUpdate,
+): AvailableCommand[] | undefined {
+  return update.sessionUpdate === "available_commands_update"
+    ? update.availableCommands
+    : undefined;
 }
 
 export function reduce(state: ViewState, action: Action): ViewState {
@@ -436,7 +440,8 @@ export function reduce(state: ViewState, action: Action): ViewState {
         } else if (blocks !== before) {
           statusText = undefined;
         }
-        availableCommands = extractAvailableCommands(update) ?? availableCommands;
+        availableCommands =
+          extractAvailableCommands(update) ?? availableCommands;
       }
       return {
         ...state,
@@ -910,6 +915,19 @@ function matchSlashCommand(text: string): string | undefined {
   return match ? match[1] : undefined;
 }
 
+/** True if every character of `query` appears in `target`, in order (not
+ *  necessarily contiguous) — same idea as VS Code's own command-palette/quick-
+ *  open matching, just without the match-position highlighting. */
+function fuzzyMatches(query: string, target: string): boolean {
+  let qi = 0;
+  for (let ti = 0; ti < target.length && qi < query.length; ti++) {
+    if (target[ti] === query[qi]) {
+      qi++;
+    }
+  }
+  return qi === query.length;
+}
+
 function SlashCommandMenu({
   commands,
   selectedIndex,
@@ -930,7 +948,9 @@ function SlashCommandMenu({
             onClick=${() => onSelect(command)}
           >
             <span class="slash-menu-name">/${command.name}</span>
-            <span class="slash-menu-description">${command.input?.hint ?? command.description}</span>
+            <span class="slash-menu-description"
+              >${command.input?.hint ?? command.description}</span
+            >
           </button>
         `,
       )}
@@ -980,7 +1000,13 @@ function Composer({
   const suggestions =
     partial === undefined || dismissed
       ? []
-      : state.availableCommands.filter(command => command.name.startsWith(partial)).slice(0, 8);
+      : state.availableCommands
+          .filter(command => fuzzyMatches(partial.toLowerCase(), command.name.toLowerCase()))
+          .sort((a, b) => {
+            const aPrefix = a.name.toLowerCase().startsWith(partial.toLowerCase());
+            const bPrefix = b.name.toLowerCase().startsWith(partial.toLowerCase());
+            return aPrefix === bPrefix ? 0 : aPrefix ? -1 : 1;
+          });
 
   function submit(): void {
     const trimmed = state.draftText.trim();
@@ -997,9 +1023,15 @@ function Composer({
 
   return html`
     <div class="input-bar">
-      ${suggestions.length > 0
-        ? html`<${SlashCommandMenu} commands=${suggestions} selectedIndex=${selectedIndex} onSelect=${selectCommand} />`
-        : null}
+      ${
+        suggestions.length > 0
+          ? html`<${SlashCommandMenu}
+              commands=${suggestions}
+              selectedIndex=${selectedIndex}
+              onSelect=${selectCommand}
+            />`
+          : null
+      }
       <textarea
         ref=${textareaRef}
         class="prompt-input"
@@ -1017,10 +1049,15 @@ function Composer({
             }
             if (event.key === "ArrowUp") {
               event.preventDefault();
-              setSelectedIndex(index => (index - 1 + suggestions.length) % suggestions.length);
+              setSelectedIndex(
+                index => (index - 1 + suggestions.length) % suggestions.length,
+              );
               return;
             }
-            if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
+            if (
+              event.key === "Tab" ||
+              (event.key === "Enter" && !event.shiftKey)
+            ) {
               event.preventDefault();
               selectCommand(suggestions[selectedIndex]);
               return;

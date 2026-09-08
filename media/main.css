@@ -561,8 +561,12 @@ code {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  background: var(--vscode-dropdown-background, var(--vscode-editorWidget-background));
-  border: 1px solid var(--vscode-dropdown-border, var(--vscode-sideBarSectionHeader-border));
+  background: var(
+    --vscode-dropdown-background,
+    var(--vscode-editorWidget-background)
+  );
+  border: 1px solid
+    var(--vscode-dropdown-border, var(--vscode-sideBarSectionHeader-border));
   border-radius: var(--vscode-cornerRadius-medium, 6px);
   box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.2);
 }
