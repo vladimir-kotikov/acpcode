@@ -471,9 +471,9 @@ export function reduce(state: ViewState, action: Action): ViewState {
       return {
         ...state,
         blocks: upsertToolCall(state.blocks, action.toolCall, {
-        requestId: action.requestId,
-        options: action.options,
-        resolvedOptionId: undefined,
+          requestId: action.requestId,
+          options: action.options,
+          resolvedOptionId: undefined,
         }),
         loading: false,
       };
@@ -490,7 +490,7 @@ export function reduce(state: ViewState, action: Action): ViewState {
               ...tool,
               pendingPermission: tool.pendingPermission && {
                 ...tool.pendingPermission,
-            resolvedOptionId: action.optionId,
+                resolvedOptionId: action.optionId,
               },
             };
           },
@@ -1193,9 +1193,28 @@ export function Transcript({
   onDraftChange: (text: string) => void;
 }) {
   const logRef = useRef<HTMLDivElement>(null);
+  // Whether the user was scrolled at/near the bottom, tracked continuously by
+  // a scroll listener rather than computed inside the content-update effect
+  // below: by the time that effect runs, the DOM has already grown to fit
+  // the new content, so scrollHeight no longer reflects "where things stood
+  // right before this update" — checking there would always read as "not at
+  // the bottom" the instant anything taller than the old scrollback arrives.
+  const atBottomRef = useRef(true);
   useEffect(() => {
     const node = logRef.current;
-    if (node) {
+    if (!node) {
+      return;
+    }
+    const onScroll = () => {
+      const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+      atBottomRef.current = distanceFromBottom < 48;
+    };
+    node.addEventListener("scroll", onScroll);
+    return () => node.removeEventListener("scroll", onScroll);
+  }, []);
+  useEffect(() => {
+    const node = logRef.current;
+    if (node && atBottomRef.current) {
       node.scrollTop = node.scrollHeight;
     }
   });
