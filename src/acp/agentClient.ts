@@ -27,6 +27,28 @@ import * as vscode from "vscode";
 import type { AgentConfig } from "./agents/config.ts";
 import { agentEnv } from "./agents/config.ts";
 
+/** Pulls the AIR extension's session-failure title out of a response's
+ *  `_meta`, but only when `severity` is "error" — see `prompt()`'s doc
+ *  comment for why this needs checking at all. */
+function extractAirFailureTitle(
+  meta: { [key: string]: unknown } | null | undefined,
+): string | undefined {
+  const jetbrains = meta?.jetbrains;
+  const air =
+    jetbrains && typeof jetbrains === "object"
+      ? (jetbrains as Record<string, unknown>).air
+      : undefined;
+  const failure =
+    air && typeof air === "object"
+      ? (air as Record<string, unknown>).sessionFailure
+      : undefined;
+  if (!failure || typeof failure !== "object") {
+    return undefined;
+  }
+  const { title, severity } = failure as Record<string, unknown>;
+  return severity === "error" && typeof title === "string" ? title : undefined;
+}
+
 /** ACP bridge package per agent kind: the npm package to resolve and which
  *  key in its `bin` map is the executable to spawn. */
 const AGENT_BRIDGES: Record<
@@ -305,7 +327,18 @@ export class AgentClient implements vscode.Disposable {
     );
   }
 
-  async prompt(sessionId: SessionId, text: string): Promise<StopReason> {
+  /** `failureTitle` surfaces an AIR session failure (see
+   *  session-failure-extension.js's `sessionFailureMeta`) that settled the
+   *  turn WITHOUT a `RequestError` — e.g. hitting a spend/usage limit ends
+   *  the turn normally (`stopReason: "end_turn"`) with the real reason
+   *  attached only to this response's `_meta`, not thrown. Miss it here and
+   *  the caller has no way to know the turn "succeeded" into silence. Only
+   *  `severity: "error"` failures are reported; `"warning"` ones (e.g.
+   *  transient retry notices) arrive separately as `session_info_update`. */
+  async prompt(
+    sessionId: SessionId,
+    text: string,
+  ): Promise<{ stopReason: StopReason; failureTitle?: string }> {
     this.echoUserMessage(sessionId, text);
     const response = await this.requireAgent().request(
       methods.agent.session.prompt,
@@ -314,7 +347,10 @@ export class AgentClient implements vscode.Disposable {
         prompt: [{ type: "text", text }],
       },
     );
-    return response.stopReason as StopReason;
+    return {
+      stopReason: response.stopReason as StopReason,
+      failureTitle: extractAirFailureTitle(response._meta),
+    };
   }
 
   /** Injects a follow-up message into a turn that's already running, instead

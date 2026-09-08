@@ -342,8 +342,15 @@ function readNested(value: unknown, ...keys: string[]): unknown {
  *  connection/retry status, which lives under a specific `_meta` path (see
  *  `sessionFailureMeta` in the bridge's `session-failure-extension.js`). Only
  *  surfaced at all because AgentClient declares the `jetbrains.air` client
- *  capability at `initialize` — without it the bridge never sends these. */
-function extractSessionFailureTitle(update: SessionUpdate): string | undefined {
+ *  capability at `initialize` — without it the bridge never sends these.
+ *  `severity` distinguishes a transient retry notice ("warning", e.g.
+ *  "Retrying Claude, attempt 2 of 10") from a real failure ("error", e.g.
+ *  hitting a spend/usage limit) — the reducer only turns the latter into a
+ *  permanent note, since a status line that's wiped the instant the turn
+ *  ends would otherwise show it for a moment and then silently drop it. */
+function extractSessionFailure(
+  update: SessionUpdate,
+): { title: string; severity: string } | undefined {
   if (update.sessionUpdate !== "session_info_update") {
     return undefined;
   }
@@ -354,7 +361,16 @@ function extractSessionFailureTitle(update: SessionUpdate): string | undefined {
     "sessionFailure",
     "title",
   );
-  return typeof title === "string" ? title : undefined;
+  const severity = readNested(
+    update._meta,
+    "jetbrains",
+    "air",
+    "sessionFailure",
+    "severity",
+  );
+  return typeof title === "string" && typeof severity === "string"
+    ? { title, severity }
+    : undefined;
 }
 
 function extractAvailableCommands(
@@ -428,16 +444,25 @@ export function reduce(state: ViewState, action: Action): ViewState {
       if (action.sessionId !== state.meta?.sessionId) {
         return state;
       }
-      const blocks = applySessionUpdate(state.blocks, action.update);
-      const failureTitle = extractSessionFailureTitle(action.update);
+      let blocks = applySessionUpdate(state.blocks, action.update);
+      const failure = extractSessionFailure(action.update);
+      if (failure?.severity === "error") {
+        blocks = [
+          ...blocks,
+          { type: "note", id: genId(), kind: "error", text: failure.title },
+        ];
+      }
       const commands = extractAvailableCommands(action.update);
       return {
         ...state,
         blocks,
         loading: false,
         statusText:
-          failureTitle ??
-          (blocks !== state.blocks ? undefined : state.statusText),
+          failure && failure.severity !== "error"
+            ? failure.title
+            : blocks !== state.blocks
+              ? undefined
+              : state.statusText,
         availableCommands: commands ?? state.availableCommands,
       };
     }
@@ -451,9 +476,15 @@ export function reduce(state: ViewState, action: Action): ViewState {
       for (const update of action.updates) {
         const before = blocks;
         blocks = applySessionUpdate(blocks, update);
-        const failureTitle = extractSessionFailureTitle(update);
-        if (failureTitle !== undefined) {
-          statusText = failureTitle;
+        const failure = extractSessionFailure(update);
+        if (failure?.severity === "error") {
+          blocks = [
+            ...blocks,
+            { type: "note", id: genId(), kind: "error", text: failure.title },
+          ];
+          statusText = undefined;
+        } else if (failure) {
+          statusText = failure.title;
         } else if (blocks !== before) {
           statusText = undefined;
         }
@@ -759,12 +790,12 @@ function DiffView({
     <div class="tool-diff-path">${path}</div>
     <pre class="diff-lines">
 ${lines.map((line, index) =>
-      line.kind === "ellipsis"
-        ? html`<div class="diff-line diff-line-ellipsis" key=${index}>⋯</div>`
-        : html`<div class="diff-line diff-line-${line.kind}" key=${index}>
-            ${DIFF_LINE_PREFIX[line.kind]}${line.text}
-          </div>`,
-    )}</pre>
+  line.kind === "ellipsis"
+    ? html`<div class="diff-line diff-line-ellipsis" key=${index}>⋯</div>`
+    : html`<div class="diff-line diff-line-${line.kind}" key=${index}>
+        ${DIFF_LINE_PREFIX[line.kind]}${line.text}
+      </div>`,
+)}</pre>
   </div>`;
 }
 
@@ -970,9 +1001,9 @@ function TurnBlockView({
       return html`<${TurnItemView}
         key=${group.item.id}
         item=${group.item}
-          onRespond=${onRespond}
+        onRespond=${onRespond}
       />`;
-  }
+    }
     return html`
       <details class="tool-card tool-chain" key="${group.items[0].id}-fold">
         <summary class="tool-card-header">

@@ -345,12 +345,16 @@ class SessionViewSession implements vscode.Disposable {
         await client.steer(target.sessionId, text);
         return;
       }
-      const stopReason = await client.prompt(target.sessionId, text);
-      this.post({
-        type: "promptStopped",
-        sessionId: target.sessionId,
-        stopReason,
-      });
+      const result = await client.prompt(target.sessionId, text);
+      if (result.failureTitle) {
+        this.post({ type: "error", message: result.failureTitle });
+      } else {
+        this.post({
+          type: "promptStopped",
+          sessionId: target.sessionId,
+          stopReason: result.stopReason,
+        });
+      }
     } catch (err) {
       this.post({ type: "error", message: describeError(err) });
     } finally {

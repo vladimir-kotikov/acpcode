@@ -100,7 +100,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           return;
         }
         try {
-          const stopReason = await this.client.prompt(
+          const { stopReason } = await this.client.prompt(
             this.currentSessionId,
             message.text,
           );
