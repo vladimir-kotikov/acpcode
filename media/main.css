@@ -481,16 +481,29 @@ code {
   margin: var(--vscode-spacing-size40, 4px) 0 2px;
 }
 
-.diff-old {
-  background: var(--vscode-diffEditor-removedTextBackground);
-  white-space: pre-wrap;
+.diff-lines {
   margin: 2px 0;
+  font-size: var(--vscode-fontSize-body2, 0.85em);
+  overflow-x: auto;
 }
 
-.diff-new {
+.diff-line {
+  white-space: pre;
+  padding: 0 4px;
+}
+
+.diff-line-add {
   background: var(--vscode-diffEditor-insertedTextBackground);
-  white-space: pre-wrap;
-  margin: 2px 0;
+}
+
+.diff-line-remove {
+  background: var(--vscode-diffEditor-removedTextBackground);
+}
+
+.diff-line-ellipsis {
+  padding: 2px 4px;
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
 }
 
 .plan-card {

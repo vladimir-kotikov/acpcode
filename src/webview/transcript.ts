@@ -16,6 +16,7 @@ import type {
   ToolCallUpdate,
   ToolKind,
 } from "@agentclientprotocol/sdk";
+import { diffLines } from "diff";
 import hljs from "highlight.js";
 import { html } from "htm/preact";
 import { marked } from "marked";
@@ -526,34 +527,6 @@ export function reduce(state: ViewState, action: Action): ViewState {
 // ---------------------------------------------------------------------------
 // Rendering
 
-const BARE_URL_RE = /https?:\/\/[^\s<>"']+/g;
-// Trailing punctuation is almost always sentence punctuation, not part of the URL.
-const URL_TRAILING_PUNCTUATION_RE = /[).,;:!?\]}'"]+$/;
-
-/** Turns bare `https://...` URLs in plain text into clickable links — used
- *  for user messages, which otherwise render as plain text so literal
- *  markdown-looking characters in a prompt never get reinterpreted as
- *  formatting. */
-function linkify(text: string): (string | ReturnType<typeof html>)[] {
-  const parts: (string | ReturnType<typeof html>)[] = [];
-  let lastIndex = 0;
-  for (const match of text.matchAll(BARE_URL_RE)) {
-    let url = match[0];
-    const trailing = url.match(URL_TRAILING_PUNCTUATION_RE)?.[0] ?? "";
-    url = url.slice(0, url.length - trailing.length);
-    if (!url) {
-      continue;
-    }
-    parts.push(text.slice(lastIndex, match.index));
-    parts.push(
-      html`<a href=${url} target="_blank" rel="noopener noreferrer">${url}</a>`,
-    );
-    lastIndex = match.index + url.length;
-  }
-  parts.push(text.slice(lastIndex));
-  return parts;
-}
-
 // Static, trusted markup (not derived from any agent/user data) — safe to
 // assign via innerHTML.
 const COPY_ICON_SVG = `<svg class="icon-copy" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M3.5 10.5V3a1 1 0 0 1 1-1H11"/></svg>`;
@@ -583,7 +556,8 @@ function addCopyButton(pre: HTMLPreElement): void {
   wrapper.append(button);
 }
 
-/** Agent/thought text is markdown; re-parses the full accumulated text on
+/** Renders markdown for agent, thought, and user text alike; re-parses the
+ *  full accumulated text on
  *  every chunk rather than appending incrementally, since a streamed chunk
  *  boundary can land mid-markdown-construct (e.g. inside a ```` ``` ````
  *  fence). Safe against injected HTML because the page's CSP has no
@@ -677,6 +651,92 @@ function TruncatedPre({
   `;
 }
 
+// Shell/execute output routinely arrives already wrapped by the agent in a
+// markdown fence (e.g. ```console ... ```), formatted for a markdown-rendering
+// client. We render tool content as plain text on purpose (raw output can
+// contain its own literal markdown-looking characters that shouldn't be
+// reinterpreted), so an outer fence just shows up as literal backticks
+// instead of being stripped the way a markdown renderer would. The <pre>
+// styling already conveys "this is code" — unwrap a well-formed wrapping
+// fence rather than displaying its markers.
+function stripCodeFence(text: string): string {
+  const match = /^```[^\n]*\n([\s\S]*?)\n?```\s*$/.exec(text.trim());
+  return match ? match[1] : text;
+}
+
+type DiffLineKind = "add" | "remove" | "context";
+interface DiffLine {
+  text: string;
+  kind: DiffLineKind;
+}
+
+function toDiffLines(oldText: string, newText: string): DiffLine[] {
+  const lines: DiffLine[] = [];
+  for (const change of diffLines(oldText, newText)) {
+    const kind: DiffLineKind = change.added ? "add" : change.removed ? "remove" : "context";
+    const chunkLines = change.value.split("\n");
+    // diffLines' value always ends with "\n" except possibly the very last
+    // chunk of the whole diff - drop the empty string that split() leaves.
+    if (chunkLines[chunkLines.length - 1] === "") {
+      chunkLines.pop();
+    }
+    for (const text of chunkLines) {
+      lines.push({ text, kind });
+    }
+  }
+  return lines;
+}
+
+// Real diffs collapse long unchanged spans to a few lines of surrounding
+// context (like `git diff -U3`) rather than dumping the whole file — without
+// this, a one-line change in a long file would render as a wall of unchanged
+// text either side.
+const DIFF_CONTEXT_LINES = 3;
+
+function windowDiffContext(lines: DiffLine[]): (DiffLine | { kind: "ellipsis" })[] {
+  const result: (DiffLine | { kind: "ellipsis" })[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].kind !== "context") {
+      result.push(lines[i]);
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < lines.length && lines[j].kind === "context") {
+      j++;
+    }
+    const keepBefore = i === 0 ? 0 : DIFF_CONTEXT_LINES;
+    const keepAfter = j === lines.length ? 0 : DIFF_CONTEXT_LINES;
+    if (j - i <= keepBefore + keepAfter) {
+      result.push(...lines.slice(i, j));
+    } else {
+      result.push(...lines.slice(i, i + keepBefore));
+      result.push({ kind: "ellipsis" });
+      result.push(...lines.slice(j - keepAfter, j));
+    }
+    i = j;
+  }
+  return result;
+}
+
+const DIFF_LINE_PREFIX: Record<DiffLineKind, string> = { add: "+ ", remove: "- ", context: "  " };
+
+function DiffView({ path, oldText, newText }: { path: string; oldText: string; newText: string }) {
+  const lines = windowDiffContext(toDiffLines(oldText, newText));
+  // No whitespace between <pre> and the mapped lines: <pre> preserves it
+  // literally, and a stray indentation/newline text node here would show up
+  // as a visible blank line.
+  return html`<div class="tool-diff">
+    <div class="tool-diff-path">${path}</div>
+    <pre class="diff-lines">${lines.map((line, index) =>
+      line.kind === "ellipsis"
+        ? html`<div class="diff-line diff-line-ellipsis" key=${index}>⋯</div>`
+        : html`<div class="diff-line diff-line-${line.kind}" key=${index}>${DIFF_LINE_PREFIX[line.kind]}${line.text}</div>`,
+    )}</pre>
+  </div>`;
+}
+
 function ToolCallContentView({
   content,
 }: {
@@ -689,20 +749,14 @@ function ToolCallContentView({
     if (item.type === "content") {
       return html`<${TruncatedPre}
         key=${index}
-        text=${textOf(item.content)}
+        text=${stripCodeFence(textOf(item.content))}
         class="tool-content-text"
       />`;
     }
     if (item.type === "diff") {
       // No extra <details> fold here — the tool card itself is already the
       // one collapse point, matching plain content (Read) rendering directly.
-      return html`
-        <div class="tool-diff" key=${index}>
-          <div class="tool-diff-path">${item.path}</div>
-          ${item.oldText ? html`<pre class="diff-old">${item.oldText}</pre>` : null}
-          <pre class="diff-new">${item.newText}</pre>
-        </div>
-      `;
+      return html`<${DiffView} key=${index} path=${item.path} oldText=${item.oldText ?? ""} newText=${item.newText} />`;
     }
     return html`<div class="tool-content-other" key=${index}>
       [terminal output]
@@ -911,13 +965,12 @@ function BlocksView({
       />`;
     }
     if (block.type === "user") {
-      return html`<div
+      return html`<${MarkdownBody}
         key=${block.id}
+        text=${block.text}
         class="bubble bubble-user"
-        title=${debugTitle(block)}
-      >
-        ${linkify(block.text)}
-      </div>`;
+        debug=${block}
+      />`;
     }
     const live = busy && index === blocks.length - 1;
     return html`<${TurnBlockView}
