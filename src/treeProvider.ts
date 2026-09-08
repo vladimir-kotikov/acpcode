@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import type { AgentClient } from "./acp/agentClient.ts";
 import type { AgentConnectionPool } from "./acp/agentPool.ts";
 import { getAgents, type AgentConfig } from "./acp/agents/config.ts";
+import type { SessionViewProvider } from "./sessionViewProvider.ts";
 import { getGroupSessionsByCwd } from "./settings.ts";
 import { resolveCwd } from "./workspaceUtils.ts";
 
@@ -84,6 +85,7 @@ export class SessionsTreeProvider
   implements vscode.TreeDataProvider<TreeNode>, vscode.Disposable
 {
   private readonly pool: AgentConnectionPool;
+  private readonly sessionViewProvider: SessionViewProvider;
   private readonly changeEmitter = new vscode.EventEmitter<
     TreeNode | undefined | void
   >();
@@ -91,8 +93,9 @@ export class SessionsTreeProvider
 
   readonly onDidChangeTreeData = this.changeEmitter.event;
 
-  constructor(pool: AgentConnectionPool) {
+  constructor(pool: AgentConnectionPool, sessionViewProvider: SessionViewProvider) {
     this.pool = pool;
+    this.sessionViewProvider = sessionViewProvider;
     this.configListener = vscode.workspace.onDidChangeConfiguration(event => {
       if (
         event.affectsConfiguration("acpcode.agents") ||
@@ -109,6 +112,48 @@ export class SessionsTreeProvider
   /** Re-renders without touching existing connections — a live session
    *  viewer stays connected across a plain "Refresh Sessions" click. */
   refresh = () => this.changeEmitter.fire();
+
+  /** Invoked from a session row's context menu/inline button, which VS Code
+   *  calls with the raw tree node (not a vscode.TreeItem) as the arg. */
+  deleteSession = async (node: {
+    agent: { name: string };
+    session: { sessionId: string; title?: string | null };
+  }): Promise<void> => {
+    const label = node.session.title ?? node.session.sessionId;
+    const confirmed = await vscode.window.showWarningMessage(
+      `Delete session "${label}"? This can't be undone.`,
+      { modal: true },
+      "Delete",
+    );
+    if (confirmed !== "Delete") {
+      return;
+    }
+    const agent = getAgents().find(candidate => candidate.name === node.agent.name);
+    if (!agent) {
+      return;
+    }
+    const client = await this.pool.connect(agent, resolveCwd());
+    await client.deleteSession(node.session.sessionId);
+    this.sessionViewProvider.closeSession({
+      agentName: node.agent.name,
+      sessionId: node.session.sessionId,
+    });
+    this.refresh();
+  };
+
+  /** Invoked from a cwd-group row (with that cwd) or an agent row (falls back
+   *  to the workspace cwd, matching how the ungrouped list is scoped). */
+  newSession = async (node: { agent: { name: string }; cwd?: string }): Promise<void> => {
+    const agent = getAgents().find(candidate => candidate.name === node.agent.name);
+    if (!agent) {
+      return;
+    }
+    const cwd = node.cwd ?? resolveCwd();
+    const client = await this.pool.connect(agent, cwd);
+    const response = await client.newSession(cwd);
+    this.refresh();
+    await this.sessionViewProvider.openSession({ agentName: agent.name, sessionId: response.sessionId, cwd });
+  };
 
   getTreeItem = (node: TreeNode): vscode.TreeItem =>
     match(node)

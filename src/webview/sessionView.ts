@@ -2,12 +2,18 @@ import { html, render } from "htm/preact";
 import { useEffect, useReducer, useRef } from "preact/hooks";
 import type {
   HostToSessionViewMessage,
+  SessionViewMeta,
   SessionViewToHostMessage,
 } from "../shared/sessionViewProtocol.ts";
 import { initialState, reduce, Transcript, type Action } from "./transcript.ts";
 
 declare function acquireVsCodeApi(): {
   postMessage(message: SessionViewToHostMessage): void;
+  // Persisted by VS Code across a window reload and handed back to
+  // WebviewPanelSerializer.deserializeWebviewPanel's `state` param — the
+  // only way an editor tab (not the sidebar, which the host itself keeps
+  // alive) can know which session to re-attach to after a reload.
+  setState(state: SessionViewMeta): void;
 };
 
 const vscode = acquireVsCodeApi();
@@ -26,6 +32,7 @@ function Root() {
       switch (message.type) {
         case "loading":
           action = { type: "loading", meta: message.meta };
+          vscode.setState(message.meta);
           break;
         case "update":
           action = {
@@ -67,6 +74,9 @@ function Root() {
           break;
         case "permissionResolved":
           action = { type: "permissionResolved", requestId: message.requestId };
+          break;
+        case "closed":
+          action = { type: "closed" };
           break;
       }
       dispatchRef.current(action);

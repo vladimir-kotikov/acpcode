@@ -13,11 +13,11 @@ import { SessionsTreeProvider } from "./treeProvider.ts";
 
 export function activate(context: vscode.ExtensionContext) {
   const agentPool = new AgentConnectionPool();
-  const treeProvider = new SessionsTreeProvider(agentPool);
   const sessionViewProvider = new SessionViewProvider(
     context.extensionUri,
     agentPool,
   );
+  const treeProvider = new SessionsTreeProvider(agentPool, sessionViewProvider);
 
   context.subscriptions.push(
     agentPool,
@@ -28,6 +28,10 @@ export function activate(context: vscode.ExtensionContext) {
       "acpcode.sessionView",
       sessionViewProvider,
       { webviewOptions: { retainContextWhenHidden: true } },
+    ),
+    vscode.window.registerWebviewPanelSerializer(
+      "acpcode.sessionViewEditor",
+      sessionViewProvider,
     ),
     vscode.commands.registerCommand("acpcode.addAgent", addAgentCommand),
     vscode.commands.registerCommand(
@@ -64,6 +68,14 @@ export function activate(context: vscode.ExtensionContext) {
           cwd: node.session.cwd,
           title: node.session.title,
         }),
+    ),
+    vscode.commands.registerCommand(
+      "acpcode.deleteSession",
+      treeProvider.deleteSession,
+    ),
+    vscode.commands.registerCommand(
+      "acpcode.newSession",
+      treeProvider.newSession,
     ),
   );
 }

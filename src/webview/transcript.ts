@@ -165,7 +165,8 @@ export type Action =
     }
   | { type: "localPermissionResponse"; requestId: string; optionId: string }
   | { type: "permissionResolved"; requestId: string }
-  | { type: "draftChanged"; text: string };
+  | { type: "draftChanged"; text: string }
+  | { type: "closed" };
 
 let idCounter = 0;
 function genId(): string {
@@ -490,6 +491,8 @@ export function reduce(state: ViewState, action: Action): ViewState {
           item => ({ ...(item as PermissionItem), resolvedOptionId: null }),
         ),
       };
+    case "closed":
+      return { ...initialState, drafts: new Map() };
     default:
       return state;
   }

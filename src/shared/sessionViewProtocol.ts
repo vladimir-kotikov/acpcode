@@ -12,6 +12,11 @@ import type {
 export interface SessionViewMeta {
   agentName: string;
   sessionId: SessionId;
+  // Not otherwise needed for rendering — carried so the webview can persist
+  // it via `vscode.setState()`, which is what lets an editor tab restore
+  // itself (see the WebviewPanelSerializer in sessionViewProvider.ts) across
+  // a window reload with enough to re-attach the same session.
+  cwd: string;
   title?: string | null;
   // Whether this agent supports `_session/steering` — if not, the composer
   // falls back to blocking send while busy, since calling `session/prompt`
@@ -21,6 +26,8 @@ export interface SessionViewMeta {
 
 export type HostToSessionViewMessage =
   | { type: "loading"; meta: SessionViewMeta }
+  // The session this view was showing was deleted — reset to "no session".
+  | { type: "closed" }
   | { type: "update"; sessionId: SessionId; update: SessionUpdate }
   // A batch of already-known updates delivered as one message (history
   // replay, or seeded from another view already showing this session) — one

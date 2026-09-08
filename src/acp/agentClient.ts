@@ -245,14 +245,22 @@ export class AgentClient implements vscode.Disposable {
     return response.sessions;
   }
 
-  async newSession(): Promise<NewSessionResponse> {
+  async newSession(cwd?: string): Promise<NewSessionResponse> {
     return this.requireAgent().request<NewSessionResponse>(
       methods.agent.session.new,
       {
-        cwd: this.cwd,
+        cwd: cwd ?? this.cwd,
         mcpServers: [],
       },
     );
+  }
+
+  /** Only available if the agent advertises the `sessionCapabilities.delete`
+   *  capability (claude-agent-acp always does; codex-acp may not). */
+  async deleteSession(sessionId: SessionId): Promise<void> {
+    await this.requireAgent().request(methods.agent.session.delete, {
+      sessionId,
+    });
   }
 
   /** Loads (and replays the history of) a session on this connection. Replay

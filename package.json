@@ -12,7 +12,9 @@
     "Other"
   ],
   "type": "module",
-  "activationEvents": [],
+  "activationEvents": [
+    "onWebviewPanel:acpcode.sessionViewEditor"
+  ],
   "main": "./src/extension.ts",
   "contributes": {
     "viewsContainers": {
@@ -73,6 +75,18 @@
         "title": "Open Session in Editor",
         "category": "ACP Code",
         "icon": "$(link-external)"
+      },
+      {
+        "command": "acpcode.deleteSession",
+        "title": "Delete Session",
+        "category": "ACP Code",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "acpcode.newSession",
+        "title": "New Session",
+        "category": "ACP Code",
+        "icon": "$(add)"
       }
     ],
     "menus": {
@@ -107,6 +121,36 @@
         {
           "command": "acpcode.openTreeSessionInEditor",
           "when": "view == acpcode.sessions && viewItem == acpcode.session",
+          "group": "9_acpcode"
+        },
+        {
+          "command": "acpcode.deleteSession",
+          "when": "view == acpcode.sessions && viewItem == acpcode.session",
+          "group": "inline"
+        },
+        {
+          "command": "acpcode.deleteSession",
+          "when": "view == acpcode.sessions && viewItem == acpcode.session",
+          "group": "9_acpcode"
+        },
+        {
+          "command": "acpcode.newSession",
+          "when": "view == acpcode.sessions && viewItem == acpcode.cwdGroup",
+          "group": "inline"
+        },
+        {
+          "command": "acpcode.newSession",
+          "when": "view == acpcode.sessions && viewItem == acpcode.cwdGroup",
+          "group": "9_acpcode"
+        },
+        {
+          "command": "acpcode.newSession",
+          "when": "view == acpcode.sessions && viewItem == acpcode.agent",
+          "group": "inline"
+        },
+        {
+          "command": "acpcode.newSession",
+          "when": "view == acpcode.sessions && viewItem == acpcode.agent",
           "group": "9_acpcode"
         }
       ]

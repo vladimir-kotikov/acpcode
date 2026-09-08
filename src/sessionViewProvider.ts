@@ -5,6 +5,7 @@ import type { AgentConnectionPool } from "./acp/agentPool.ts";
 import { getAgents } from "./acp/agents/config.ts";
 import type {
   HostToSessionViewMessage,
+  SessionViewMeta,
   SessionViewToHostMessage,
 } from "./shared/sessionViewProtocol.ts";
 import { resolveCwd } from "./workspaceUtils.ts";
@@ -123,12 +124,25 @@ class SessionViewSession implements vscode.Disposable {
     this.pool = pool;
   }
 
-  matches(target: SessionTarget): boolean {
+  matches(target: Pick<SessionTarget, "agentName" | "sessionId">): boolean {
     return (
       this.loaded &&
       this.current?.agentName === target.agentName &&
       this.current?.sessionId === target.sessionId
     );
+  }
+
+  /** Resets to "no session" — used when the session this view was showing
+   *  was just deleted out from under it. Drops the subscription too: a
+   *  future `attachSession` call re-subscribes fresh, no stale listener
+   *  sitting around filtering on an id nothing will ever match again. */
+  clear(): void {
+    this.subscription?.dispose();
+    this.subscription = undefined;
+    this.current = undefined;
+    this.buffer = [];
+    this.loaded = false;
+    this.post({ type: "closed" });
   }
 
   snapshot(): SessionSnapshot | undefined {
@@ -231,6 +245,7 @@ class SessionViewSession implements vscode.Disposable {
       meta: {
         agentName: target.agentName,
         sessionId: target.sessionId,
+        cwd: target.cwd,
         title: target.title,
         canSteer: client.canSteer(),
       },
@@ -375,6 +390,7 @@ class SessionViewSession implements vscode.Disposable {
       meta: {
         agentName: this.current.agentName,
         sessionId: this.current.sessionId,
+        cwd: this.current.cwd,
         title: this.current.title,
         canSteer: this.pool.get(this.current.agentName)?.canSteer() ?? false,
       },
@@ -403,12 +419,17 @@ class SessionViewSession implements vscode.Disposable {
  *  target (the sidebar's own title-bar button) seeds a new editor session
  *  from whatever the sidebar currently shows, then they diverge. */
 export class SessionViewProvider
-  implements vscode.WebviewViewProvider, vscode.Disposable
+  implements
+    vscode.WebviewViewProvider,
+    vscode.WebviewPanelSerializer<SessionViewMeta | undefined>,
+    vscode.Disposable
 {
   private readonly extensionUri: vscode.Uri;
   private readonly pool: AgentConnectionPool;
   private readonly sidebar: SessionViewSession;
-  private readonly editors = new Set<SessionViewSession>();
+  // Keyed by session (not panel) so closeSession can look up which panel to
+  // dispose for a given target without a separate parallel structure.
+  private readonly editors = new Map<SessionViewSession, vscode.WebviewPanel>();
 
   constructor(extensionUri: vscode.Uri, pool: AgentConnectionPool) {
     this.extensionUri = extensionUri;
@@ -451,33 +472,79 @@ export class SessionViewProvider
       "acpcode.sessionViewEditor",
       `${resolvedTarget.agentName} — ${resolvedTarget.title ?? resolvedTarget.sessionId}`,
       vscode.ViewColumn.Active,
-      {
-        enableScripts: true,
-        localResourceRoots: [this.extensionUri],
-        retainContextWhenHidden: true,
-      },
+      // retainContextWhenHidden is panel.options, not webview.options — only
+      // settable here, at creation. deserializeWebviewPanel doesn't get a
+      // say: VS Code already decided it when it reconstructed the panel.
+      { retainContextWhenHidden: true },
     );
-    panel.webview.html = renderHtml(panel.webview, this.extensionUri);
-    const session = new SessionViewSession(this.pool);
-    session.bind(panel.webview);
-    this.editors.add(session);
-    panel.onDidDispose(() => {
-      session.dispose();
-      this.editors.delete(session);
-    });
+    const session = this.bindPanel(panel);
     await session.attachSession(
       resolvedTarget,
       this.findPeer(resolvedTarget)?.snapshot(),
     );
   };
 
+  /** `WebviewPanelSerializer` for `"acpcode.sessionViewEditor"` (registered in
+   *  extension.ts) — without one, VS Code doesn't attempt to restore these
+   *  tabs across a window reload at all, it just drops them. `state` is
+   *  whatever the webview last passed to its own `vscode.setState()` (see
+   *  sessionView.ts): the `SessionViewMeta` of the session it was showing. */
+  deserializeWebviewPanel = async (
+    panel: vscode.WebviewPanel,
+    state: SessionViewMeta | undefined,
+  ): Promise<void> => {
+    const session = this.bindPanel(panel);
+    if (!state) {
+      return;
+    }
+    const target: SessionTarget = {
+      agentName: state.agentName,
+      sessionId: state.sessionId,
+      cwd: state.cwd,
+      title: state.title,
+    };
+    await session.attachSession(target, this.findPeer(target, session)?.snapshot());
+  };
+
+  private bindPanel(panel: vscode.WebviewPanel): SessionViewSession {
+    panel.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [this.extensionUri],
+    };
+    panel.webview.html = renderHtml(panel.webview, this.extensionUri);
+    const session = new SessionViewSession(this.pool);
+    session.bind(panel.webview);
+    this.editors.set(session, panel);
+    panel.onDidDispose(() => {
+      session.dispose();
+      this.editors.delete(session);
+    });
+    return session;
+  }
+
   /** Finds another live session (sidebar or an editor tab) already showing
    *  `target`, so the caller can seed from it instead of reloading. */
   private findPeer = (target: SessionTarget, exclude?: SessionViewSession) =>
-    [this.sidebar, ...this.editors].find(
+    [this.sidebar, ...this.editors.keys()].find(
       session => session !== exclude && session.matches(target),
     );
 
+  /** A deleted session shouldn't keep showing stale content: reset the
+   *  sidebar to "no session" if it was showing this one, and close (not just
+   *  clear) any editor tab showing it — those are actual closeable tabs, so
+   *  leaving an empty one open would be more confusing than useful. */
+  closeSession(target: Pick<SessionTarget, "agentName" | "sessionId">): void {
+    if (this.sidebar.matches(target)) {
+      this.sidebar.clear();
+    }
+    const panelsToClose = [...this.editors]
+      .filter(([session]) => session.matches(target))
+      .map(([, panel]) => panel);
+    for (const panel of panelsToClose) {
+      panel.dispose();
+    }
+  }
+
   dispose = (): void =>
-    [this.sidebar, ...this.editors].forEach(d => d.dispose());
+    [this.sidebar, ...this.editors.keys()].forEach(d => d.dispose());
 }
