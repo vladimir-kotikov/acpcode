@@ -7,13 +7,20 @@ import type {
 } from "../shared/sessionViewProtocol.ts";
 import { initialState, reduce, Transcript, type Action } from "./transcript.ts";
 
+// Meta half is handed to WebviewPanelSerializer.deserializeWebviewPanel's
+// `state` param — the only way an editor tab (not the sidebar, which the
+// host itself keeps alive) can know which session to re-attach to after a
+// reload. draftText rides along so an unsent in-progress message survives
+// the same reload instead of silently vanishing.
+interface PersistedState {
+  meta: SessionViewMeta;
+  draftText: string;
+}
+
 declare function acquireVsCodeApi(): {
   postMessage(message: SessionViewToHostMessage): void;
-  // Persisted by VS Code across a window reload and handed back to
-  // WebviewPanelSerializer.deserializeWebviewPanel's `state` param — the
-  // only way an editor tab (not the sidebar, which the host itself keeps
-  // alive) can know which session to re-attach to after a reload.
-  setState(state: SessionViewMeta): void;
+  getState(): PersistedState | undefined;
+  setState(state: PersistedState): void;
 };
 
 const vscode = acquireVsCodeApi();
@@ -25,15 +32,27 @@ function Root() {
   const dispatchRef = useRef(dispatch);
   dispatchRef.current = dispatch;
 
+  // Single spot persisting both halves of PersistedState — covers both the
+  // session-changed case (meta updates on "loading") and every keystroke in
+  // the composer (draftText updates), so a reload mid-typing doesn't lose it.
+  useEffect(() => {
+    if (state.meta) {
+      vscode.setState({ meta: state.meta, draftText: state.draftText });
+    }
+  }, [state.meta, state.draftText]);
+
   useEffect(() => {
     const listener = (event: MessageEvent<HostToSessionViewMessage>) => {
       const message = event.data;
       let action: Action;
       switch (message.type) {
-        case "loading":
-          action = { type: "loading", meta: message.meta };
-          vscode.setState(message.meta);
+        case "loading": {
+          const persisted = vscode.getState();
+          const restoredDraftText =
+            persisted?.meta.sessionId === message.meta.sessionId ? persisted.draftText : undefined;
+          action = { type: "loading", meta: message.meta, restoredDraftText };
           break;
+        }
         case "update":
           action = {
             type: "sessionUpdate",

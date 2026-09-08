@@ -146,7 +146,11 @@ export const initialState: ViewState = {
 };
 
 export type Action =
-  | { type: "loading"; meta: SessionViewMeta }
+  // `restoredDraftText`: an in-progress draft recovered from vscode.setState
+  // (see sessionView.ts) — only meaningful the first time a freshly-mounted
+  // webview loads, when the in-memory `drafts` map below is still empty and
+  // has nothing of its own to offer for this session.
+  | { type: "loading"; meta: SessionViewMeta; restoredDraftText?: string }
   | { type: "sessionUpdate"; sessionId: SessionId; update: SessionUpdate }
   | {
       type: "replayBatch";
@@ -377,7 +381,7 @@ export function reduce(state: ViewState, action: Action): ViewState {
         blocks: [],
         busy: false,
         loading: true,
-        draftText: drafts.get(action.meta.sessionId) ?? "",
+        draftText: drafts.get(action.meta.sessionId) ?? action.restoredDraftText ?? "",
         drafts,
         statusText: undefined,
         availableCommands: [],
