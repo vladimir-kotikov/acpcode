@@ -52,7 +52,9 @@ function Root() {
         case "loading": {
           const persisted = vscode.getState();
           const restoredDraftText =
-            persisted?.meta.sessionId === message.meta.sessionId ? persisted.draftText : undefined;
+            persisted?.meta.sessionId === message.meta.sessionId
+              ? persisted.draftText
+              : undefined;
           action = { type: "loading", meta: message.meta, restoredDraftText };
           break;
         }

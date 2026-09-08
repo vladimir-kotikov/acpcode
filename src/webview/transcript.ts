@@ -52,9 +52,8 @@ const TOOL_KIND_LABELS: Record<ToolKind, string> = {
 // "Edit package.json"); others don't (e.g. web search titled with just the
 // query). Only show the separate kind-label span when the title doesn't
 // already start with it, to avoid "Edit Edit package.json".
-function showsOwnKindLabel(kind: ToolKind, title: string): boolean {
-  return title.toLowerCase().startsWith(TOOL_KIND_LABELS[kind].toLowerCase());
-}
+const showsOwnKindLabel = (kind: ToolKind, title: string): boolean =>
+  title.toLowerCase().startsWith(TOOL_KIND_LABELS[kind].toLowerCase());
 
 // ---------------------------------------------------------------------------
 // State
@@ -1004,13 +1003,12 @@ function TurnBlockView({
         onRespond=${onRespond}
       />`;
     }
+
+    const groupTitle = `Completed ${group.items.length} step${group.items.length === 1 ? "" : "s"}`;
     return html`
       <details class="tool-card tool-chain" key="${group.items[0].id}-fold">
         <summary class="tool-card-header">
-          <span class="tool-card-title"
-            >Completed ${group.items.length}
-            step${group.items.length === 1 ? "" : "s"}</span
-          >
+          <span class="tool-card-title">${groupTitle}</span>
         </summary>
         <div class="tool-chain-body">
           ${group.items.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} />`)}

@@ -292,12 +292,21 @@ code {
 .bubble-agent pre,
 .bubble-thought pre {
   /* Fenced code blocks scroll horizontally instead of wrapping — matches the
-   * native chat view and keeps indentation/alignment in code intact. */
+   * native chat view and keeps indentation/alignment in code intact.
+   * `margin: 0` because the default UA stylesheet's `pre { margin: 1em 0 }`
+   * otherwise leaves a visible gap of the card's own background between
+   * adjacent blocks (e.g. two short snippets back to back) — reads as a
+   * "striped" card. `.code-block` (added by addCopyButton, below) owns the
+   * actual spacing/border/background as the visual container; `max-width`
+   * is belt-and-suspenders against an unbreakable line forcing the bubble
+   * (and the page) wider instead of scrolling within this element. */
   white-space: pre;
+  margin: 0;
   background: var(--vscode-textCodeBlock-background);
   padding: var(--vscode-spacing-size40, 4px) var(--vscode-spacing-size60, 6px);
   border-radius: var(--vscode-cornerRadius-small, 4px);
   overflow-x: auto;
+  max-width: 100%;
 }
 
 /* Inline `code` uses the textPreformat tokens (lighter, translucent);
@@ -326,6 +335,13 @@ code {
 
 .code-block {
   position: relative;
+  margin: var(--vscode-spacing-size60, 6px) 0;
+  border: 1px solid var(--vscode-sideBarSectionHeader-border, currentColor);
+  border-radius: var(--vscode-cornerRadius-small, 4px);
+  /* Clips the inner <pre>'s square corners to this container's rounding, and
+   * stops its margin (already 0, but future-proofing) from collapsing
+   * through into this box's own margin above. */
+  overflow: hidden;
 }
 
 .code-copy-btn {
