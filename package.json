@@ -6,6 +6,8 @@
   "engines": {
     "vscode": "^1.125.0"
   },
+  "repository": "https://github.com/vladimir.kotikov/acpcode.git",
+  "license": "MIT",
   "categories": [
     "Other"
   ],
