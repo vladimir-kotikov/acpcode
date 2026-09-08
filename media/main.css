@@ -128,12 +128,14 @@ code {
   margin-top: var(--vscode-spacing-size60, 6px);
 }
 
-.bubble-agent li {
+/* Shared by every MarkdownBody instance (agent/thought/user bubbles alike —
+ * see transcript.ts) so markdown structure only needs styling once instead
+ * of once per bubble variant it happens to render inside. */
+.markdown-body li {
   margin: 4px 0;
 }
 
-.bubble-agent blockquote,
-.bubble-thought blockquote {
+.markdown-body blockquote {
   margin: var(--vscode-spacing-size40, 4px) 0;
   padding: 0 var(--vscode-spacing-size80, 8px);
   border-left: 2px solid
@@ -142,8 +144,7 @@ code {
   color: var(--vscode-descriptionForeground);
 }
 
-.bubble-agent hr,
-.bubble-thought hr {
+.markdown-body hr {
   margin: var(--vscode-spacing-size60, 6px) 0;
   border: none;
   border-top: 1px solid
@@ -153,13 +154,11 @@ code {
     );
 }
 
-.bubble-agent p:last-child,
-.bubble-thought p:last-child {
+.markdown-body p:last-child {
   margin-bottom: 0;
 }
 
-.bubble-agent pre,
-.bubble-thought pre {
+.markdown-body pre {
   /* Fenced code blocks scroll horizontally instead of wrapping — matches the
    * native chat view and keeps indentation/alignment in code intact.
    * `margin: 0` because the default UA stylesheet's `pre { margin: 1em 0 }`
@@ -168,7 +167,11 @@ code {
    * "striped" card. `.code-block` (added by addCopyButton, below) owns the
    * actual spacing/border/background as the visual container; `max-width`
    * is belt-and-suspenders against an unbreakable line forcing the bubble
-   * (and the page) wider instead of scrolling within this element. */
+   * (and the page) wider instead of scrolling within this element.
+   * border-radius here is redundant with .code-block's own (they clip to
+   * the same rounding) except for the one frame between paint and
+   * addCopyButton's useEffect wrapping this <pre> — kept so that frame
+   * doesn't flash square corners. */
   white-space: pre;
   margin: 0;
   background: var(--vscode-textCodeBlock-background);
@@ -181,8 +184,7 @@ code {
 /* Inline `code` uses the textPreformat tokens (lighter, translucent);
  * textCodeBlock is for fenced ```blocks``` (.pre above) — two distinct
  * theme colors, not interchangeable despite the similar names. */
-.bubble-agent code,
-.bubble-thought code {
+.markdown-body code {
   background: var(
     --vscode-textPreformat-background,
     var(--vscode-textCodeBlock-background)
@@ -196,8 +198,7 @@ code {
   font-size: 0.9em;
 }
 
-.bubble-agent pre code,
-.bubble-thought pre code {
+.markdown-body pre code {
   background: none;
   padding: 0;
 }
@@ -251,19 +252,15 @@ code {
   background: var(--vscode-button-secondaryHoverBackground);
 }
 
-.bubble-agent ul,
-.bubble-thought ul,
-.bubble-agent ol,
-.bubble-thought ol {
+.markdown-body ul,
+.markdown-body ol {
   margin: 4px 0;
   padding-left: 1.4em;
 }
 
-.bubble-agent a,
-.bubble-thought a,
-.bubble-user a {
+.markdown-body a {
   color: var(--vscode-textLink-foreground);
-  text-decoration: var(--text-link-decoration, none);
+  text-decoration: none;
 }
 
 .tool-card {

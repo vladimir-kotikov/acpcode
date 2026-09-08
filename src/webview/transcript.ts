@@ -633,7 +633,7 @@ function MarkdownBody({
     }
   }, [rendered]);
   return html`<div
-    class=${className}
+    class="markdown-body ${className}"
     ref=${ref}
     title=${debug !== undefined ? debugTitle(debug) : undefined}
     dangerouslySetInnerHTML=${{ __html: rendered }}
