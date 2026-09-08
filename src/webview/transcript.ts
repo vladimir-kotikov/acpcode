@@ -20,7 +20,9 @@ import { diffLines } from "diff";
 import hljs from "highlight.js";
 import { html } from "htm/preact";
 import { marked } from "marked";
+import type { VNode } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
+import { match } from "ts-pattern";
 import type { SessionViewMeta } from "../shared/sessionViewProtocol.ts";
 
 marked.setOptions({ breaks: true });
@@ -179,9 +181,8 @@ function genId(): string {
   return `b${idCounter}`;
 }
 
-function lastBlock(blocks: Block[]): Block | undefined {
-  return blocks[blocks.length - 1];
-}
+const lastBlock = (blocks: Block[]): Block | undefined =>
+  blocks[blocks.length - 1];
 
 function pushToTurn(blocks: Block[], item: TurnItem): Block[] {
   const last = lastBlock(blocks);
@@ -192,39 +193,35 @@ function pushToTurn(blocks: Block[], item: TurnItem): Block[] {
   return [...blocks, { type: "turn", id: genId(), items: [item] }];
 }
 
-function replaceLastTurnItem(
+const replaceLastTurnItem = <T extends TurnItem>(
   blocks: Block[],
-  updater: (item: TurnItem) => TurnItem,
-): Block[] {
+  item: T,
+  updater: (item: T) => TurnItem,
+): Block[] => {
   const last = lastBlock(blocks);
   if (last?.type !== "turn") {
     return blocks;
   }
-  const items = last.items.slice();
-  items[items.length - 1] = updater(items[items.length - 1]);
+  const items = [...last.items.slice(0, -1), updater(item)];
   return [...blocks.slice(0, -1), { ...last, items }];
-}
+};
 
-function updateTurnItem(
+const updateTurnItem = <T extends TurnItem>(
   blocks: Block[],
-  predicate: (item: TurnItem) => boolean,
-  updater: (item: TurnItem) => TurnItem,
-): Block[] {
-  return blocks.map(block => {
+  predicate: (item: TurnItem) => item is T,
+  updater: (item: T) => TurnItem,
+): Block[] =>
+  blocks.map(block => {
     if (block.type !== "turn") {
       return block;
     }
-    let changed = false;
-    const items = block.items.map(item => {
-      if (predicate(item)) {
-        changed = true;
-        return updater(item);
-      }
-      return item;
-    });
-    return changed ? { ...block, items } : block;
+    const items = block.items.map(item =>
+      predicate(item) ? updater(item) : item,
+    );
+    return items.some((item, i) => item !== block.items[i])
+      ? { ...block, items }
+      : block;
   });
-}
 
 function appendUserChunk(blocks: Block[], text: string): Block[] {
   const last = lastBlock(blocks);
@@ -240,16 +237,13 @@ function appendText(
   text: string,
 ): Block[] {
   const last = lastBlock(blocks);
-  if (last?.type === "turn") {
-    const lastItem = last.items[last.items.length - 1];
-    if (lastItem?.type === "text" && lastItem.role === role) {
-      return replaceLastTurnItem(blocks, item => ({
-        ...(item as TextItem),
-        text: (item as TextItem).text + text,
-      }));
-    }
-  }
-  return pushToTurn(blocks, { type: "text", id: genId(), role, text });
+  const lastItem = last?.type === "turn" ? last.items.at(-1) : undefined;
+  return lastItem?.type === "text" && lastItem.role === role
+    ? replaceLastTurnItem(blocks, lastItem, item => ({
+        ...item,
+        text: item.text + text,
+      }))
+    : pushToTurn(blocks, { type: "text", id: genId(), role, text });
 }
 
 // Shared by tool_call(_update) SessionUpdates and permission requests — a
@@ -280,18 +274,16 @@ function upsertToolCall(
   if (exists) {
     return updateTurnItem(
       blocks,
-      item => item.type === "tool" && item.toolCallId === update.toolCallId,
-      item => {
-        const tool = item as ToolItem;
-        return {
-          ...tool,
-          title: update.title ?? tool.title,
-          kind: update.kind ?? tool.kind,
-          status: update.status ?? tool.status,
-          content: update.content ?? tool.content,
-          pendingPermission: pendingPermission ?? tool.pendingPermission,
-        };
-      },
+      (item): item is ToolItem =>
+        item.type === "tool" && item.toolCallId === update.toolCallId,
+      tool => ({
+        ...tool,
+        title: update.title ?? tool.title,
+        kind: update.kind ?? tool.kind,
+        status: update.status ?? tool.status,
+        content: update.content ?? tool.content,
+        pendingPermission: pendingPermission ?? tool.pendingPermission,
+      }),
     );
   }
   return pushToTurn(blocks, {
@@ -306,24 +298,31 @@ function upsertToolCall(
   });
 }
 
-function applySessionUpdate(blocks: Block[], update: SessionUpdate): Block[] {
-  switch (update.sessionUpdate) {
-    case "user_message_chunk":
-      return appendUserChunk(blocks, textOf(update.content));
-    case "agent_message_chunk":
-      return appendText(blocks, "agent", textOf(update.content));
-    case "agent_thought_chunk":
-      return appendText(blocks, "thought", textOf(update.content));
-    case "tool_call":
-    case "tool_call_update":
-      return upsertToolCall(blocks, update);
-    default:
-      // plan/plan_update/available_commands_update/current_mode_update/
-      // config_option_update/usage_update/session_info_update — not
-      // rendered yet, no-op.
-      return blocks;
-  }
-}
+const applySessionUpdate = (blocks: Block[], update: SessionUpdate): Block[] =>
+  match(update)
+    .returnType<Block[]>()
+    .with({ sessionUpdate: "user_message_chunk" }, u =>
+      appendUserChunk(blocks, textOf(u.content)),
+    )
+    .with({ sessionUpdate: "agent_message_chunk" }, u =>
+      appendText(blocks, "agent", textOf(u.content)),
+    )
+    .with({ sessionUpdate: "agent_thought_chunk" }, u =>
+      appendText(blocks, "thought", textOf(u.content)),
+    )
+    .with(
+      { sessionUpdate: "tool_call" },
+      { sessionUpdate: "tool_call_update" },
+      u => upsertToolCall(blocks, u),
+    )
+    .otherwise(
+      // plan/plan_update/current_mode_update/config_option_update/
+      // usage_update — not rendered yet, no-op. available_commands_update
+      // and session_info_update ARE handled, just not here — by
+      // extractAvailableCommands/extractSessionFailure in the reducer cases
+      // that call this function.
+      () => blocks,
+    );
 
 function readNested(value: unknown, ...keys: string[]): unknown {
   let current = value;
@@ -380,9 +379,67 @@ function extractAvailableCommands(
     : undefined;
 }
 
-export function reduce(state: ViewState, action: Action): ViewState {
-  switch (action.type) {
-    case "loading": {
+// The slice of ViewState that one SessionUpdate can touch — shared by
+// "sessionUpdate" (one live update) and "replayBatch" (folded over N
+// replayed updates) so the two paths can't silently drift apart on what
+// counts as a failure note vs. a transient status line.
+interface UpdateResult {
+  blocks: Block[];
+  statusText: string | undefined;
+  availableCommands: AvailableCommand[];
+}
+
+const applyOneUpdate = (
+  prev: UpdateResult,
+  update: SessionUpdate,
+): UpdateResult => {
+  const blocks = applySessionUpdate(prev.blocks, update);
+  const failure = extractSessionFailure(update);
+  const withFailureNote: Block[] =
+    failure?.severity === "error"
+      ? [
+          ...blocks,
+          { type: "note", id: genId(), kind: "error", text: failure.title },
+        ]
+      : blocks;
+  return {
+    blocks: withFailureNote,
+    statusText:
+      failure && failure.severity !== "error"
+        ? failure.title
+        : withFailureNote !== prev.blocks
+          ? undefined
+          : prev.statusText,
+    availableCommands:
+      extractAvailableCommands(update) ?? prev.availableCommands,
+  };
+};
+
+const resolvePendingPermission = (
+  blocks: Block[],
+  requestId: string,
+  resolvedOptionId: string | null,
+  { onlyIfPending }: { onlyIfPending: boolean },
+): Block[] =>
+  updateTurnItem(
+    blocks,
+    (item): item is ToolItem =>
+      item.type === "tool" &&
+      item.pendingPermission?.requestId === requestId &&
+      (!onlyIfPending || item.pendingPermission.resolvedOptionId === undefined),
+    tool => ({
+      ...tool,
+      pendingPermission: tool.pendingPermission && {
+        ...tool.pendingPermission,
+        resolvedOptionId,
+      },
+    }),
+  );
+
+export const reduce = (state: ViewState, action: Action): ViewState =>
+  match(action)
+    .returnType<ViewState>()
+    .with({ type: "loading" }, action => {
       const drafts = new Map(state.drafts);
       if (state.meta) {
         if (state.draftText) {
@@ -402,164 +459,105 @@ export function reduce(state: ViewState, action: Action): ViewState {
         statusText: undefined,
         availableCommands: [],
       };
-    }
-    case "error":
-      return {
-        ...state,
-        blocks: [
-          ...state.blocks,
-          {
-            type: "note",
-            id: genId(),
-            kind: "error",
-            text: action.text,
-            forkable: action.forkable,
-          },
-        ],
-        busy: false,
-        loading: false,
-        statusText: undefined,
-      };
-    case "sendStart":
-      return { ...state, busy: true, statusText: undefined };
-    case "promptStopped":
-      return action.sessionId === state.meta?.sessionId
+    })
+    .with({ type: "error" }, action => ({
+      ...state,
+      blocks: [
+        ...state.blocks,
+        {
+          type: "note",
+          id: genId(),
+          kind: "error",
+          text: action.text,
+          forkable: action.forkable,
+        },
+      ],
+      busy: false,
+      loading: false,
+      statusText: undefined,
+    }))
+    .with({ type: "sendStart" }, () => ({
+      ...state,
+      busy: true,
+      statusText: undefined,
+    }))
+    .with({ type: "promptStopped" }, action =>
+      action.sessionId === state.meta?.sessionId
         ? { ...state, busy: false, statusText: undefined }
-        : state;
+        : state,
+    )
     // The user bubble itself now always arrives through "sessionUpdate" (see
     // AgentClient.echoUserMessage) so every view showing this session gets
     // it, not just whichever one sent it — this action only clears the
     // composer, dispatched locally for instant feedback on click.
-    case "draftSent": {
+    .with({ type: "draftSent" }, () => {
       const drafts = new Map(state.drafts);
       if (state.meta) {
         drafts.delete(state.meta.sessionId);
       }
       return { ...state, draftText: "", drafts };
-    }
-    case "draftChanged":
-      return { ...state, draftText: action.text };
-    case "sessionUpdate": {
-      if (action.sessionId !== state.meta?.sessionId) {
-        return state;
-      }
-      let blocks = applySessionUpdate(state.blocks, action.update);
-      const failure = extractSessionFailure(action.update);
-      if (failure?.severity === "error") {
-        blocks = [
-          ...blocks,
-          { type: "note", id: genId(), kind: "error", text: failure.title },
-        ];
-      }
-      const commands = extractAvailableCommands(action.update);
-      return {
-        ...state,
-        blocks,
-        loading: false,
-        statusText:
-          failure && failure.severity !== "error"
-            ? failure.title
-            : blocks !== state.blocks
-              ? undefined
-              : state.statusText,
-        availableCommands: commands ?? state.availableCommands,
-      };
-    }
-    case "replayBatch": {
-      if (action.sessionId !== state.meta?.sessionId) {
-        return state;
-      }
-      let blocks = state.blocks;
-      let statusText = state.statusText;
-      let availableCommands = state.availableCommands;
-      for (const update of action.updates) {
-        const before = blocks;
-        blocks = applySessionUpdate(blocks, update);
-        const failure = extractSessionFailure(update);
-        if (failure?.severity === "error") {
-          blocks = [
-            ...blocks,
-            { type: "note", id: genId(), kind: "error", text: failure.title },
-          ];
-          statusText = undefined;
-        } else if (failure) {
-          statusText = failure.title;
-        } else if (blocks !== before) {
-          statusText = undefined;
-        }
-        availableCommands =
-          extractAvailableCommands(update) ?? availableCommands;
-      }
-      return {
-        ...state,
-        availableCommands,
-        blocks,
-        loading: false,
-        busy: action.busy,
-        statusText,
-      };
-    }
-    case "permissionRequest": {
-      if (action.sessionId !== state.meta?.sessionId) {
-        return state;
-      }
-      return {
-        ...state,
-        blocks: upsertToolCall(state.blocks, action.toolCall, {
-          requestId: action.requestId,
-          options: action.options,
-          resolvedOptionId: undefined,
-        }),
-        loading: false,
-      };
-    }
-    case "localPermissionResponse":
-      return {
-        ...state,
-        blocks: updateTurnItem(
-          state.blocks,
-          item =>
-            item.type === "tool" &&
-            item.pendingPermission?.requestId === action.requestId,
-          item => {
-            const tool = item as ToolItem;
-            return {
-              ...tool,
-              pendingPermission: tool.pendingPermission && {
-                ...tool.pendingPermission,
-                resolvedOptionId: action.optionId,
-              },
-            };
+    })
+    .with({ type: "draftChanged" }, action => ({
+      ...state,
+      draftText: action.text,
+    }))
+    .with({ type: "sessionUpdate" }, action =>
+      action.sessionId === state.meta?.sessionId
+        ? {
+            ...state,
+            ...applyOneUpdate(state, action.update),
+            loading: false,
+          }
+        : state,
+    )
+    .with({ type: "replayBatch" }, action =>
+      action.sessionId === state.meta?.sessionId
+        ? {
+            ...state,
+            ...action.updates.reduce<UpdateResult>(applyOneUpdate, state),
+            loading: false,
+            busy: action.busy,
+          }
+        : state,
+    )
+    .with({ type: "permissionRequest" }, action =>
+      action.sessionId !== state.meta?.sessionId
+        ? state
+        : {
+            ...state,
+            blocks: upsertToolCall(state.blocks, action.toolCall, {
+              requestId: action.requestId,
+              options: action.options,
+              resolvedOptionId: undefined,
+            }),
+            loading: false,
           },
-        ),
-      };
-    case "permissionResolved":
-      return {
-        ...state,
-        blocks: updateTurnItem(
-          state.blocks,
-          item =>
-            item.type === "tool" &&
-            item.pendingPermission?.requestId === action.requestId &&
-            item.pendingPermission.resolvedOptionId === undefined,
-          item => {
-            const tool = item as ToolItem;
-            return {
-              ...tool,
-              pendingPermission: tool.pendingPermission && {
-                ...tool.pendingPermission,
-                resolvedOptionId: null,
-              },
-            };
-          },
-        ),
-      };
-    case "closed":
-      return { ...initialState, drafts: new Map() };
-    default:
-      return state;
-  }
-}
+    )
+    // The click resolves this view's own copy instantly and always wins —
+    // it's the freshest information there is, so no "already resolved"
+    // guard is needed here (contrast permissionResolved below).
+    .with({ type: "localPermissionResponse" }, action => ({
+      ...state,
+      blocks: resolvePendingPermission(
+        state.blocks,
+        action.requestId,
+        action.optionId,
+        { onlyIfPending: false },
+      ),
+    }))
+    // The server-side echo of a resolution — sent to every view sharing the
+    // connection, not just whichever one the click happened in — carries no
+    // optionId (`null` here just means "no longer pending"), so it must not
+    // clobber a `resolvedOptionId` a local click already recorded for this
+    // same request; onlyIfPending skips items that are already resolved.
+    .with({ type: "permissionResolved" }, action => ({
+      ...state,
+      blocks: resolvePendingPermission(state.blocks, action.requestId, null, {
+        onlyIfPending: true,
+      }),
+    }))
+    .with({ type: "closed" }, () => ({ ...initialState, drafts: new Map() }))
+    .exhaustive();
 
 // ---------------------------------------------------------------------------
 // Rendering
@@ -640,20 +638,42 @@ function MarkdownBody({
   ></div>`;
 }
 
-/** `<details>` has no reactive "open" prop — it's a one-time initial value,
- *  set imperatively so a later re-render (e.g. the status text updating)
- *  doesn't fight a user who's manually collapsed it back. Used to default
- *  the currently in-progress step of a live turn open, so there's visible
- *  progress instead of every step looking collapsed the instant it appears. */
-function useOpenOnMount(defaultOpen: boolean | undefined) {
+/** Shared `<details class="tool-card">`/`<summary>` scaffold for tool cards,
+ *  thought cards, and folded "Completed N steps" groups — the one part of
+ *  each that isn't specific to what's inside.
+ *
+ *  `defaultOpen` has no reactive "open" prop to bind to — it's a one-time
+ *  initial value, set imperatively so a later re-render (e.g. the status
+ *  text updating) doesn't fight a user who's manually collapsed it back.
+ *  Used to default the currently in-progress step of a live turn open, so
+ *  there's visible progress instead of every step looking collapsed the
+ *  instant it appears. */
+const CollapsibleCard = ({
+  class: className = "",
+  defaultOpen,
+  titleAttr,
+  summary,
+  children,
+}: {
+  class?: string;
+  defaultOpen?: boolean;
+  titleAttr?: string;
+  summary: VNode | string;
+  children: VNode | (VNode | null)[];
+}) => {
   const ref = useRef<HTMLDetailsElement>(null);
   useEffect(() => {
     if (defaultOpen && ref.current) {
       ref.current.open = true;
     }
   }, []);
-  return ref;
-}
+  return html`
+    <details class="tool-card ${className}" ref=${ref} title=${titleAttr}>
+      <summary class="tool-card-header">${summary}</summary>
+      ${children}
+    </details>
+  `;
+};
 
 // Full tool output (a whole file's contents, a long command's stdout) can run
 // to thousands of lines — collapse past this many by default with a "Show
@@ -680,7 +700,7 @@ function TruncatedPre({
       ${
         isLong
           ? html`<button
-              class="permission-btn tool-content-expand-btn"
+              class="permission-btn"
               onClick=${() => setExpanded(!expanded)}
             >
               ${expanded ? "Show less" : "Show more"}
@@ -874,45 +894,45 @@ function ToolCardView({
   const pendingApproval =
     item.pendingPermission?.resolvedOptionId === undefined &&
     !!item.pendingPermission;
-  const ref = useOpenOnMount(pendingApproval);
-  return html`
-    <details class="tool-card" ref=${ref} title=${debugTitle(item)}>
-      <summary class="tool-card-header">
-        ${
-          !showsOwnKindLabel(item.kind, item.title)
-            ? html`<span class="tool-card-kind"
-                >${TOOL_KIND_LABELS[item.kind]}</span
-              >`
-            : null
-        }
-        <span class="tool-card-title">${item.title}</span>
-        <span class="tool-card-status">${item.status}</span>
-      </summary>
-      <div class="tool-card-body">
-        <${ToolCallContentView} content=${item.content} />
-        ${
-          item.pendingPermission
-            ? html`<${PendingPermissionView}
-                pendingPermission=${item.pendingPermission}
-                onRespond=${onRespond}
-              />`
-            : null
-        }
-      </div>
-    </details>
-  `;
+  return html`<${CollapsibleCard}
+    defaultOpen=${pendingApproval}
+    titleAttr=${debugTitle(item)}
+    summary=${html`
+      ${
+        !showsOwnKindLabel(item.kind, item.title)
+          ? html`<span class="tool-card-kind"
+              >${TOOL_KIND_LABELS[item.kind]}</span
+            >`
+          : null
+      }
+      <span class="tool-card-title">${item.title}</span>
+      <span class="tool-card-status">${item.status}</span>
+    `}
+  >
+    <div class="tool-card-body">
+      <${ToolCallContentView} content=${item.content} />
+      ${
+        item.pendingPermission
+          ? html`<${PendingPermissionView}
+              pendingPermission=${item.pendingPermission}
+              onRespond=${onRespond}
+            />`
+          : null
+      }
+    </div>
+  <//>`;
 }
 
 // Reasoning/scratch output — collapsed by default like a tool call, never
 // forced open (thoughts don't need approval).
-function ThoughtCardView({ item }: { item: TextItem }) {
-  return html`
-    <details class="tool-card thought-card" title=${debugTitle(item)}>
-      <summary class="tool-card-header">Thought</summary>
-      <${MarkdownBody} text=${item.text} class="bubble bubble-thought" />
-    </details>
-  `;
-}
+const ThoughtCardView = ({ item }: { item: TextItem }) =>
+  html`<${CollapsibleCard}
+    class="thought-card"
+    titleAttr=${debugTitle(item)}
+    summary="Thought"
+  >
+    <${MarkdownBody} text=${item.text} class="bubble bubble-thought" />
+  <//>`;
 
 function TurnItemView({
   item,
@@ -987,15 +1007,14 @@ function groupTurnItems(items: TurnItem[]): RenderGroup[] {
 /** Everything the agent produces between two user messages is one turn. No
  *  duration in the "Completed…" label: ACP doesn't carry per-update
  *  timestamps, so there's no real elapsed time to report. */
-function TurnBlockView({
+const TurnBlockView = ({
   turn,
   onRespond,
 }: {
   turn: TurnBlock;
   onRespond: (requestId: string, optionId: string) => void;
-}) {
-  const groups = groupTurnItems(turn.items);
-  return groups.map(group => {
+}) =>
+  groupTurnItems(turn.items).map(group => {
     if (group.kind === "standalone") {
       return html`<${TurnItemView}
         key=${group.item.id}
@@ -1005,18 +1024,17 @@ function TurnBlockView({
     }
 
     const groupTitle = `Completed ${group.items.length} step${group.items.length === 1 ? "" : "s"}`;
-    return html`
-      <details class="tool-card tool-chain" key="${group.items[0].id}-fold">
-        <summary class="tool-card-header">
-          <span class="tool-card-title">${groupTitle}</span>
-        </summary>
-        <div class="tool-chain-body">
-          ${group.items.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} />`)}
-        </div>
-      </details>
-    `;
+    return html`<${CollapsibleCard}
+      class="tool-chain"
+      key="${group.items[0].id}-fold"
+      summary=${html`<span class="tool-card-title">${groupTitle}</span>`}
+    >
+      <div class="tool-chain-body">
+        ${group.items.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} />`)}
+      </div>
+      ;
+    <//>`;
   });
-}
 
 function NoteView({ block, onFork }: { block: NoteBlock; onFork: () => void }) {
   return html`

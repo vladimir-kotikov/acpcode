@@ -12,8 +12,9 @@ body {
   line-height: 1.5;
 }
 
+pre,
 code {
-  font-size: var(--vscode-bodyFontSize-small);
+  font-size: var(--vscode-fontSize-body2, 0.85em);
 }
 
 #root {
@@ -93,7 +94,7 @@ code {
 
 .system-note {
   align-self: center;
-  font-size: var(--vscode-fontSize-body2, 0.8em);
+  font-size: var(--vscode-fontSize-body2, 0.85em);
   color: var(--vscode-descriptionForeground);
 }
 
@@ -206,7 +207,7 @@ code {
 .code-block {
   position: relative;
   margin: var(--vscode-spacing-size60, 6px) 0;
-  border: 1px solid var(--vscode-sideBarSectionHeader-border, currentColor);
+  border: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
   border-radius: var(--vscode-cornerRadius-small, 4px);
   /* Clips the inner <pre>'s square corners to this container's rounding, and
    * stops its margin (already 0, but future-proofing) from collapsing
@@ -264,7 +265,7 @@ code {
 }
 
 .tool-card {
-  border: 1px solid var(--vscode-sideBarSectionHeader-border, currentColor);
+  border: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
   border-radius: var(--vscode-cornerRadius-medium, 6px);
   overflow: hidden;
   background: var(--vscode-editor-background);
@@ -354,27 +355,28 @@ code {
   color: var(--vscode-descriptionForeground);
 }
 
-.tool-content-text {
-  white-space: pre-wrap;
+.tool-content-text,
+.tool-content-other,
+.tool-diff-path {
   margin: var(--vscode-spacing-size40, 4px) 0;
   font-size: var(--vscode-fontSize-body2, 0.85em);
 }
 
-.tool-content-expand-btn {
-  font-size: var(--vscode-fontSize-body2, 0.85em);
+.tool-content-text {
+  white-space: pre-wrap;
+}
+
+.tool-content-other,
+.tool-diff-path {
+  color: var(--vscode-descriptionForeground);
 }
 
 .tool-content-other {
-  font-size: var(--vscode-fontSize-body2, 0.85em);
   font-style: italic;
-  color: var(--vscode-descriptionForeground);
-  margin: var(--vscode-spacing-size40, 4px) 0;
 }
 
 .tool-diff-path {
-  font-size: var(--vscode-fontSize-body2, 0.85em);
-  color: var(--vscode-descriptionForeground);
-  margin: var(--vscode-spacing-size40, 4px) 0 2px;
+  margin-bottom: 2px;
 }
 
 .diff-lines {
@@ -405,27 +407,22 @@ code {
 .permission-card {
   border: 1px solid var(--vscode-inputValidation-warningBorder);
   background: var(--vscode-inputValidation-warningBackground);
-  border-radius: 6px;
-  padding: 6px 8px;
-}
-
-.permission-title {
-  font-size: 0.85em;
-  margin-bottom: 6px;
+  border-radius: var(--vscode-cornerRadius-medium, 6px);
+  padding: var(--vscode-spacing-size60, 6px) var(--vscode-spacing-size80, 8px);
 }
 
 .permission-buttons {
   display: flex;
-  gap: 6px;
+  gap: var(--vscode-spacing-size60, 6px);
   flex-wrap: wrap;
 }
 
 .permission-btn {
   border: none;
-  border-radius: 3px;
-  padding: 3px 8px;
+  border-radius: var(--vscode-cornerRadius-xSmall, 3px);
+  padding: 3px var(--vscode-spacing-size80, 8px);
   cursor: pointer;
-  font-size: 0.85em;
+  font-size: var(--vscode-fontSize-body2, 0.85em);
   background: var(--vscode-button-secondaryBackground);
   color: var(--vscode-button-secondaryForeground);
 }
@@ -445,17 +442,17 @@ code {
   position: relative;
   display: flex;
   align-items: flex-end;
-  gap: 6px;
-  padding: 8px;
+  gap: var(--vscode-spacing-size60, 6px);
+  padding: var(--vscode-spacing-size80, 8px);
   border-top: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
 }
 
 .slash-menu {
   position: absolute;
   bottom: 100%;
-  left: 8px;
-  right: 8px;
-  margin-bottom: 4px;
+  left: var(--vscode-spacing-size80, 8px);
+  right: var(--vscode-spacing-size80, 8px);
+  margin-bottom: var(--vscode-spacing-size40, 4px);
   max-height: 240px;
   overflow-y: auto;
   display: flex;
@@ -467,7 +464,7 @@ code {
   border: 1px solid
     var(--vscode-dropdown-border, var(--vscode-sideBarSectionHeader-border));
   border-radius: var(--vscode-cornerRadius-medium, 6px);
-  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 -2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.2));
 }
 
 .slash-menu-item {
@@ -523,8 +520,8 @@ code {
   background: var(--vscode-button-background);
   color: var(--vscode-button-foreground);
   border: none;
-  border-radius: 3px;
-  padding: 4px 12px;
+  border-radius: var(--vscode-cornerRadius-xSmall, 3px);
+  padding: var(--vscode-spacing-size40, 4px) 12px;
   cursor: pointer;
 }
 
