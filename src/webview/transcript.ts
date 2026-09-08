@@ -1033,6 +1033,14 @@ function SlashCommandMenu({
   `;
 }
 
+function SendIcon() {
+  return html`<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 2 13 8H10V14H6V8H3Z" /></svg>`;
+}
+
+function StopIcon() {
+  return html`<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5" /></svg>`;
+}
+
 function Composer({
   state,
   onSend,
@@ -1149,18 +1157,22 @@ function Composer({
           }
         }}
       ></textarea>
-      ${
-        !steeringBlocked
-          ? html`<button
-              class="send-btn"
-              disabled=${disabled || !state.draftText.trim()}
-              onClick=${submit}
-            >
-              Send
-            </button>`
-          : null
-      }
-      ${state.busy ? html`<button class="send-btn cancel-btn" onClick=${onCancel}>Stop</button>` : null}
+      ${(() => {
+        // One button instead of two: while busy, it's "Send" (steering)
+        // whenever there's actually something typed to inject, otherwise
+        // there's nothing useful Send could do — "Stop" is the only
+        // meaningful action, so that's what takes over the slot.
+        const canSend = !disabled && !steeringBlocked && !!state.draftText.trim();
+        const showStop = state.busy && !canSend;
+        return html`<button
+          class="send-btn ${showStop ? "cancel-btn" : ""}"
+          disabled=${!showStop && !canSend}
+          onClick=${() => (showStop ? onCancel() : submit())}
+        >
+          ${showStop ? html`<${StopIcon} />` : html`<${SendIcon} />`}
+          ${showStop ? "Stop" : "Send"}
+        </button>`;
+      })()}
     </div>
   `;
 }

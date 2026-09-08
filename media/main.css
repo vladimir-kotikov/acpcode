@@ -631,12 +631,19 @@ code {
 }
 
 .send-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--vscode-spacing-size40, 4px);
   background: var(--vscode-button-background);
   color: var(--vscode-button-foreground);
   border: none;
   border-radius: 3px;
   padding: 4px 12px;
   cursor: pointer;
+}
+
+.send-btn svg {
+  flex-shrink: 0;
 }
 
 .send-btn:disabled {
