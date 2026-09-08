@@ -625,9 +625,9 @@ function useOpenOnMount(defaultOpen: boolean | undefined) {
 }
 
 // Full tool output (a whole file's contents, a long command's stdout) can run
-// to tens of thousands of characters — collapse past this length by default
-// with a "Show more" toggle, same idea as the tool card itself being collapsed.
-const TOOL_CONTENT_TRUNCATE_LENGTH = 2000;
+// to thousands of lines — collapse past this many by default with a "Show
+// more" toggle, same idea as the tool card itself being collapsed.
+const TOOL_CONTENT_TRUNCATE_LINES = 20;
 
 function TruncatedPre({
   text,
@@ -637,12 +637,15 @@ function TruncatedPre({
   class: string;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const isLong = text.length > TOOL_CONTENT_TRUNCATE_LENGTH;
+  const lines = text.split("\n");
+  const isLong = lines.length > TOOL_CONTENT_TRUNCATE_LINES;
   const shown =
-    expanded || !isLong ? text : text.slice(0, TOOL_CONTENT_TRUNCATE_LENGTH);
+    expanded || !isLong
+      ? text
+      : lines.slice(0, TOOL_CONTENT_TRUNCATE_LINES).join("\n");
   return html`
     <div>
-      <pre class=${className}>${shown}${!expanded && isLong ? "…" : ""}</pre>
+      <pre class=${className}>${shown}${!expanded && isLong ? "\n…" : ""}</pre>
       ${
         isLong
           ? html`<button
@@ -829,19 +832,18 @@ function PendingPermissionView({
 
 function ToolCardView({
   item,
-  defaultOpen,
   onRespond,
 }: {
   item: ToolItem;
-  defaultOpen?: boolean;
   onRespond: (requestId: string, optionId: string) => void;
 }) {
-  // A pending approval needs to actually be visible, not hidden behind a
-  // collapsed card the user has to think to expand.
+  // Collapsed by default, always — except a pending approval, which needs to
+  // actually be visible (not hidden behind a card the user has to think to
+  // expand) until it's resolved, at which point it collapses like any other.
   const pendingApproval =
     item.pendingPermission?.resolvedOptionId === undefined &&
     !!item.pendingPermission;
-  const ref = useOpenOnMount(defaultOpen || pendingApproval);
+  const ref = useOpenOnMount(pendingApproval);
   return html`
     <details class="tool-card" ref=${ref} title=${debugTitle(item)}>
       <summary class="tool-card-header">
@@ -870,20 +872,11 @@ function ToolCardView({
   `;
 }
 
-function ThoughtCardView({
-  item,
-  defaultOpen,
-}: {
-  item: TextItem;
-  defaultOpen?: boolean;
-}) {
-  const ref = useOpenOnMount(defaultOpen);
+// Reasoning/scratch output — collapsed by default like a tool call, never
+// forced open (thoughts don't need approval).
+function ThoughtCardView({ item }: { item: TextItem }) {
   return html`
-    <details
-      class="tool-card thought-card"
-      ref=${ref}
-      title=${debugTitle(item)}
-    >
+    <details class="tool-card thought-card" title=${debugTitle(item)}>
       <summary class="tool-card-header">Thought</summary>
       <${MarkdownBody} text=${item.text} class="bubble bubble-thought" />
     </details>
@@ -893,81 +886,106 @@ function ThoughtCardView({
 function TurnItemView({
   item,
   onRespond,
-  defaultOpen,
 }: {
   item: TurnItem;
   onRespond: (requestId: string, optionId: string) => void;
-  defaultOpen?: boolean;
 }) {
   if (item.type === "text") {
     if (item.role === "thought") {
-      return html`<${ThoughtCardView}
-        item=${item}
-        defaultOpen=${defaultOpen}
-      />`;
+      return html`<${ThoughtCardView} item=${item} />`;
     }
+    // The agent's own reply text — never collapsed, never folded into a
+    // "Completed N steps" group, regardless of its position in the turn.
     return html`<${MarkdownBody}
       text=${item.text}
       class="bubble bubble-agent"
       debug=${item}
     />`;
   }
-  return html`<${ToolCardView}
-    item=${item}
-    defaultOpen=${defaultOpen}
-    onRespond=${onRespond}
-  />`;
+  return html`<${ToolCardView} item=${item} onRespond=${onRespond} />`;
 }
 
-/** Everything the agent produces between two user messages is one turn: only
- *  the most recent item stays visible at the top level, every earlier item
- *  folds into a collapsible "Completed N steps" wrapper — matches VS Code's
- *  own chat view. No duration in the label: ACP doesn't carry per-update
+// A tool/thought item is "foldable" (collapsed by default, eligible to join
+// a "Completed N steps" group) unless it's a permission request still
+// waiting on the user — that one needs to stand out on its own until
+// resolved. Agent reply text is never foldable at all.
+function isFoldable(item: TurnItem): boolean {
+  if (item.type === "text") {
+    return item.role === "thought";
+  }
+  return !(
+    item.pendingPermission &&
+    item.pendingPermission.resolvedOptionId === undefined
+  );
+}
+
+type RenderGroup =
+  | { kind: "standalone"; item: TurnItem }
+  | { kind: "folded"; items: TurnItem[] };
+
+/** Groups consecutive foldable items into one "Completed N steps" wrapper;
+ *  a non-foldable item (agent text, or a still-pending permission request)
+ *  breaks the run and stands on its own, so e.g. 5 collapsed calls, an agent
+ *  message, then 3 more collapsed calls renders as two separate "Completed…"
+ *  groups either side of the visible message, not one covering everything. A
+ *  run of exactly one foldable item doesn't get an extra wrapper around the
+ *  single already-collapsed card. */
+function groupTurnItems(items: TurnItem[]): RenderGroup[] {
+  const groups: RenderGroup[] = [];
+  let run: TurnItem[] = [];
+  const flush = () => {
+    if (run.length === 1) {
+      groups.push({ kind: "standalone", item: run[0] });
+    } else if (run.length > 1) {
+      groups.push({ kind: "folded", items: run });
+    }
+    run = [];
+  };
+  for (const item of items) {
+    if (isFoldable(item)) {
+      run.push(item);
+    } else {
+      flush();
+      groups.push({ kind: "standalone", item });
+    }
+  }
+  flush();
+  return groups;
+}
+
+/** Everything the agent produces between two user messages is one turn. No
+ *  duration in the "Completed…" label: ACP doesn't carry per-update
  *  timestamps, so there's no real elapsed time to report. */
 function TurnBlockView({
   turn,
   onRespond,
-  live,
 }: {
   turn: TurnBlock;
   onRespond: (requestId: string, optionId: string) => void;
-  live: boolean;
 }) {
-  const items = turn.items;
-  if (items.length <= 1) {
-    return items.map(
-      item =>
-        html`<${TurnItemView}
-          key=${item.id}
-          item=${item}
+  const groups = groupTurnItems(turn.items);
+  return groups.map(group => {
+    if (group.kind === "standalone") {
+      return html`<${TurnItemView}
+        key=${group.item.id}
+        item=${group.item}
           onRespond=${onRespond}
-          defaultOpen=${live}
-        />`,
-    );
+      />`;
   }
-  const folded = items.slice(0, -1);
-  const last = items[items.length - 1];
-  return [
-    html`
-      <details class="tool-card tool-chain" key="${turn.id}-chain">
+    return html`
+      <details class="tool-card tool-chain" key="${group.items[0].id}-fold">
         <summary class="tool-card-header">
           <span class="tool-card-title"
-            >Completed ${folded.length}
-            step${folded.length === 1 ? "" : "s"}</span
+            >Completed ${group.items.length}
+            step${group.items.length === 1 ? "" : "s"}</span
           >
         </summary>
         <div class="tool-chain-body">
-          ${folded.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} />`)}
+          ${group.items.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} />`)}
         </div>
       </details>
-    `,
-    html`<${TurnItemView}
-      key=${last.id}
-      item=${last}
-      onRespond=${onRespond}
-      defaultOpen=${live}
-    />`,
-  ];
+    `;
+  });
 }
 
 function NoteView({ block, onFork }: { block: NoteBlock; onFork: () => void }) {
@@ -992,14 +1010,12 @@ function BlocksView({
   blocks,
   onRespond,
   onFork,
-  busy,
 }: {
   blocks: Block[];
   onRespond: (requestId: string, optionId: string) => void;
   onFork: () => void;
-  busy: boolean;
 }) {
-  return blocks.map((block, index) => {
+  return blocks.map(block => {
     if (block.type === "note") {
       return html`<${NoteView}
         key=${block.id}
@@ -1015,12 +1031,10 @@ function BlocksView({
         debug=${block}
       />`;
     }
-    const live = busy && index === blocks.length - 1;
     return html`<${TurnBlockView}
       key=${block.id}
       turn=${block}
       onRespond=${onRespond}
-      live=${live}
     />`;
   });
 }
@@ -1300,7 +1314,6 @@ export function Transcript({
         blocks=${state.blocks}
         onRespond=${onRespond}
         onFork=${onFork}
-        busy=${state.busy}
       />
       ${state.busy ? html`<div class="system-note working-note">${state.statusText ?? "Working…"}</div>` : null}
     </div>
