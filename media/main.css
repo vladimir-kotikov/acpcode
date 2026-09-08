@@ -155,11 +155,25 @@ code {
 
 .chat-log {
   flex: 1;
+  /* Flex items default to min-width:auto (won't shrink below their content's
+   * intrinsic width) — without this, a wide unwrapped child (a long diff
+   * line, a long code line) forces .chat-log, and everything above it up to
+   * #root, wider than the viewport instead of scrolling internally at the
+   * child's own overflow-x:auto. */
+  min-width: 0;
   overflow-y: auto;
   padding: var(--vscode-spacing-size80, 8px);
   display: flex;
   flex-direction: column;
   gap: var(--vscode-spacing-size60, 6px);
+}
+
+/* Same min-width:auto trap one level down: .chat-log's own direct children
+ * (bubbles, tool cards, notes) need to be allowed to shrink too, or their
+ * wide content forces .chat-log wider before the child's own overflow-x
+ * ever gets a chance to kick in. */
+.chat-log > * {
+  min-width: 0;
 }
 
 .session-header {
