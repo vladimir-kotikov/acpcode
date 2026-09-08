@@ -65,6 +65,14 @@ interface TextItem {
   text: string;
 }
 
+interface PendingPermission {
+  requestId: string;
+  options: PermissionOption[];
+  // undefined = pending, null = resolved without knowing which option (e.g.
+  // the request was aborted host-side), string = the clicked option's id.
+  resolvedOptionId: string | null | undefined;
+}
+
 interface ToolItem {
   type: "tool";
   id: string;
@@ -73,21 +81,14 @@ interface ToolItem {
   kind: ToolKind;
   status: string;
   content: ToolCallUpdate["content"];
+  // A permission request always references a toolCallId a tool_call
+  // (update) already uses or will use — kept on the tool item itself rather
+  // than as a separate turn item so approval UI always renders right next to
+  // the change it's asking about, not as a disconnected card elsewhere.
+  pendingPermission?: PendingPermission;
 }
 
-interface PermissionItem {
-  type: "permission";
-  id: string;
-  requestId: string;
-  title: string;
-  kind: ToolKind;
-  options: PermissionOption[];
-  // undefined = pending, null = resolved without knowing which option (e.g.
-  // the request was aborted host-side), string = the clicked option's id.
-  resolvedOptionId: string | null | undefined;
-}
-
-type TurnItem = TextItem | ToolItem | PermissionItem;
+type TurnItem = TextItem | ToolItem;
 
 interface TurnBlock {
   type: "turn";
@@ -247,6 +248,13 @@ function appendText(
   return pushToTurn(blocks, { type: "text", id: genId(), role, text });
 }
 
+// Shared by tool_call(_update) SessionUpdates and permission requests — a
+// permission request always references a toolCallId that a tool_call already
+// uses or will use, and both need the same find-or-create-by-toolCallId
+// logic. Passing `pendingPermission` attaches/updates it in place; omitting
+// it leaves whatever the item already had untouched (a later tool_call_update
+// for the same call, e.g. status flipping to "completed", shouldn't erase a
+// still-pending — or already-resolved — permission record).
 function upsertToolCall(
   blocks: Block[],
   update: {
@@ -256,6 +264,7 @@ function upsertToolCall(
     status?: string | null;
     content?: ToolCallUpdate["content"];
   },
+  pendingPermission?: PendingPermission,
 ): Block[] {
   const exists = blocks.some(
     block =>
@@ -276,6 +285,7 @@ function upsertToolCall(
           kind: update.kind ?? tool.kind,
           status: update.status ?? tool.status,
           content: update.content ?? tool.content,
+          pendingPermission: pendingPermission ?? tool.pendingPermission,
         };
       },
     );
@@ -288,6 +298,7 @@ function upsertToolCall(
     kind: update.kind ?? "other",
     status: update.status ?? "pending",
     content: update.content,
+    pendingPermission,
   });
 }
 
@@ -456,18 +467,13 @@ export function reduce(state: ViewState, action: Action): ViewState {
       if (action.sessionId !== state.meta?.sessionId) {
         return state;
       }
-      const item: PermissionItem = {
-        type: "permission",
-        id: genId(),
-        requestId: action.requestId,
-        title: action.toolCall.title ?? "Permission requested",
-        kind: action.toolCall.kind ?? "other",
-        options: action.options,
-        resolvedOptionId: undefined,
-      };
       return {
         ...state,
-        blocks: pushToTurn(state.blocks, item),
+        blocks: upsertToolCall(state.blocks, action.toolCall, {
+        requestId: action.requestId,
+        options: action.options,
+        resolvedOptionId: undefined,
+        }),
         loading: false,
       };
     }
@@ -476,12 +482,17 @@ export function reduce(state: ViewState, action: Action): ViewState {
         ...state,
         blocks: updateTurnItem(
           state.blocks,
-          item =>
-            item.type === "permission" && item.requestId === action.requestId,
-          item => ({
-            ...(item as PermissionItem),
+          item => item.type === "tool" && item.pendingPermission?.requestId === action.requestId,
+          item => {
+            const tool = item as ToolItem;
+            return {
+              ...tool,
+              pendingPermission: tool.pendingPermission && {
+                ...tool.pendingPermission,
             resolvedOptionId: action.optionId,
-          }),
+              },
+            };
+          },
         ),
       };
     case "permissionResolved":
@@ -490,10 +501,19 @@ export function reduce(state: ViewState, action: Action): ViewState {
         blocks: updateTurnItem(
           state.blocks,
           item =>
-            item.type === "permission" &&
-            item.requestId === action.requestId &&
-            item.resolvedOptionId === undefined,
-          item => ({ ...(item as PermissionItem), resolvedOptionId: null }),
+            item.type === "tool" &&
+            item.pendingPermission?.requestId === action.requestId &&
+            item.pendingPermission.resolvedOptionId === undefined,
+          item => {
+            const tool = item as ToolItem;
+            return {
+              ...tool,
+              pendingPermission: tool.pendingPermission && {
+                ...tool.pendingPermission,
+                resolvedOptionId: null,
+              },
+            };
+          },
         ),
       };
     case "closed":
@@ -690,14 +710,50 @@ function ToolCallContentView({
   });
 }
 
+// Rendered inside a tool card's body, right below its diff/content, instead
+// of as a separate card elsewhere — the whole point is the user can see the
+// actual change next to the buttons approving it.
+function PendingPermissionView({
+  pendingPermission,
+  onRespond,
+}: {
+  pendingPermission: PendingPermission;
+  onRespond: (requestId: string, optionId: string) => void;
+}) {
+  const resolved = pendingPermission.resolvedOptionId !== undefined;
+  return html`
+    <div class="permission-card ${resolved ? "permission-resolved" : ""}">
+      <div class="permission-buttons">
+        ${pendingPermission.options.map(
+          option => html`
+            <button
+              key=${option.optionId}
+              class="permission-btn permission-${option.kind}"
+              disabled=${resolved}
+              onClick=${() => onRespond(pendingPermission.requestId, option.optionId)}
+            >
+              ${option.name}
+            </button>
+          `,
+        )}
+      </div>
+    </div>
+  `;
+}
+
 function ToolCardView({
   item,
   defaultOpen,
+  onRespond,
 }: {
   item: ToolItem;
   defaultOpen?: boolean;
+  onRespond: (requestId: string, optionId: string) => void;
 }) {
-  const ref = useOpenOnMount(defaultOpen);
+  // A pending approval needs to actually be visible, not hidden behind a
+  // collapsed card the user has to think to expand.
+  const pendingApproval = item.pendingPermission?.resolvedOptionId === undefined && !!item.pendingPermission;
+  const ref = useOpenOnMount(defaultOpen || pendingApproval);
   return html`
     <details class="tool-card" ref=${ref} title=${debugTitle(item)}>
       <summary class="tool-card-header">
@@ -713,42 +769,11 @@ function ToolCardView({
       </summary>
       <div class="tool-card-body">
         <${ToolCallContentView} content=${item.content} />
+        ${item.pendingPermission
+          ? html`<${PendingPermissionView} pendingPermission=${item.pendingPermission} onRespond=${onRespond} />`
+          : null}
       </div>
     </details>
-  `;
-}
-
-function PermissionCardView({
-  item,
-  onRespond,
-}: {
-  item: PermissionItem;
-  onRespond: (requestId: string, optionId: string) => void;
-}) {
-  const resolved = item.resolvedOptionId !== undefined;
-  return html`
-    <div
-      class="permission-card ${resolved ? "permission-resolved" : ""}"
-      title=${debugTitle(item)}
-    >
-      <div class="permission-title">
-        ${!showsOwnKindLabel(item.kind, item.title) ? `${TOOL_KIND_LABELS[item.kind]}: ` : ""}${item.title}
-      </div>
-      <div class="permission-buttons">
-        ${item.options.map(
-          option => html`
-            <button
-              key=${option.optionId}
-              class="permission-btn permission-${option.kind}"
-              disabled=${resolved}
-              onClick=${() => onRespond(item.requestId, option.optionId)}
-            >
-              ${option.name}
-            </button>
-          `,
-        )}
-      </div>
-    </div>
   `;
 }
 
@@ -794,10 +819,7 @@ function TurnItemView({
       debug=${item}
     />`;
   }
-  if (item.type === "tool") {
-    return html`<${ToolCardView} item=${item} defaultOpen=${defaultOpen} />`;
-  }
-  return html`<${PermissionCardView} item=${item} onRespond=${onRespond} />`;
+  return html`<${ToolCardView} item=${item} defaultOpen=${defaultOpen} onRespond=${onRespond} />`;
 }
 
 /** Everything the agent produces between two user messages is one turn: only
