@@ -161,12 +161,12 @@ export class SessionsTreeProvider
     const cwd = node.cwd ?? resolveCwd();
     const client = await this.pool.connect(agent, cwd);
     const response = await client.newSession(cwd);
-    this.refresh();
     await this.sessionViewProvider.openSession({
       agentName: agent.name,
       sessionId: response.sessionId,
       cwd,
     });
+    this.refresh();
   };
 
   getTreeItem = (node: TreeNode): vscode.TreeItem =>
