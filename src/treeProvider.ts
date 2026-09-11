@@ -90,6 +90,7 @@ export class SessionsTreeProvider
     TreeNode | undefined | void
   >();
   private readonly configListener: vscode.Disposable;
+  private readonly workspaceFoldersListener: vscode.Disposable;
 
   readonly onDidChangeTreeData = this.changeEmitter.event;
 
@@ -110,6 +111,13 @@ export class SessionsTreeProvider
         this.changeEmitter.fire();
       }
     });
+    // Adding/removing a folder changes what `getChildren`'s cwdGroup union
+    // (open folders + cwds with sessions) should show, but touches neither
+    // "acpcode.agents" nor "acpcode.groupSessionsByCwd" — without this the
+    // tree never learns a folder was added until something else (e.g. an
+    // agent reconnect) happens to trigger a refresh.
+    this.workspaceFoldersListener =
+      vscode.workspace.onDidChangeWorkspaceFolders(() => this.refresh());
   }
 
   /** Re-renders without touching existing connections — a live session
@@ -290,5 +298,8 @@ export class SessionsTreeProvider
     ).then(sessions => uniq(sessions.flat(), s => s.sessionId));
   };
 
-  dispose = () => this.configListener.dispose();
+  dispose = () => {
+    this.configListener.dispose();
+    this.workspaceFoldersListener.dispose();
+  };
 }
