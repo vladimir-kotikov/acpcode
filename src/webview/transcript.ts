@@ -524,7 +524,6 @@ const TurnBlockView = ({
       <div class="tool-chain-body">
         ${group.items.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} />`)}
       </div>
-      ;
     <//>`;
   });
 
@@ -835,12 +834,27 @@ export function Transcript({
     node.addEventListener("scroll", onScroll);
     return () => node.removeEventListener("scroll", onScroll);
   }, []);
+  // Scoped to what actually changes .chat-log's content height — NOT every
+  // render. With no dependency array this used to also fire on every
+  // composer keystroke (draftText changes), and since typing while scrolled
+  // within 48px of the bottom leaves atBottomRef true, it would yank the
+  // view back down on the very next character, reading as "scroll doesn't
+  // work" while composing a reply.
   useEffect(() => {
     const node = logRef.current;
-    if (node && atBottomRef.current) {
-      node.scrollTop = node.scrollHeight;
+    if (!node || !atBottomRef.current) {
+      return;
     }
-  });
+    node.scrollTop = node.scrollHeight;
+    // A reply's height can still settle a frame after this runs (e.g.
+    // MarkdownBody's own effect wrapping a <pre> in .code-block after this
+    // commit) — re-snap once more post-paint so a fast-arriving message
+    // doesn't land a line or two short of the true bottom.
+    const raf = requestAnimationFrame(() => {
+      node.scrollTop = node.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [state.blocks, state.loading, state.busy, state.statusText]);
 
   const title = state.meta
     ? `${state.meta.agentName} — ${state.meta.title ?? state.meta.sessionId}`
