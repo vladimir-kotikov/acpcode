@@ -5,7 +5,8 @@ import type {
   SessionViewMeta,
   SessionViewToHostMessage,
 } from "../shared/sessionViewProtocol.ts";
-import { initialState, reduce, Transcript, type Action } from "./transcript.ts";
+import { initialState, reduce, type Action } from "./state.ts";
+import { Transcript } from "./transcript.ts";
 
 // Meta half is handed to WebviewPanelSerializer.deserializeWebviewPanel's
 // `state` param — the only way an editor tab (not the sidebar, which the
