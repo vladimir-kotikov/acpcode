@@ -101,6 +101,7 @@ class SessionViewSession implements vscode.Disposable {
   private readonly pool: AgentConnectionPool;
   private webview?: vscode.Webview;
   private ready = false;
+  private readyWaiters: (() => void)[] = [];
   current?: SessionTarget;
   private buffer: SessionUpdate[] = [];
   private subscription?: vscode.Disposable;
@@ -151,6 +152,51 @@ class SessionViewSession implements vscode.Disposable {
       : undefined;
   }
 
+  /** Resolves once this webview's own JS has mounted and posted back
+   *  "ready" — i.e. once `post()` will actually deliver instead of silently
+   *  dropping. Callers that are about to `attachSession()` on a webview that
+   *  may have *just* been created (e.g. the sidebar's very first reveal in
+   *  this window) should await this first: without it, the initial
+   *  "loading"/"replayBatch" posts race the webview's bundle loading and can
+   *  both be dropped before it's ready to receive them, leaving the view
+   *  stuck showing "No session selected" until something else happens to
+   *  call `replay()` again.
+   *
+   *  Bounded, not a bare wait: `resolveWebviewView` is documented to fire
+   *  again on a plain hide/show of an already-resolved view, and `bind()`
+   *  (called from there) unconditionally resets `ready` to false — but a
+   *  *retained* webview's JS context survives that and never re-runs its
+   *  mount effect, so it never re-sends "ready" either. Without a bound,
+   *  that combination hangs this forever and every future attachSession on
+   *  this view along with it. After the timeout, fall back to the old
+   *  behavior: proceed anyway — `post()` may drop the next couple of
+   *  messages, but `replay()` still self-heals correctly whenever "ready"
+   *  (from whichever cause) eventually does arrive, since `current` is set
+   *  before attachSession posts anything. */
+  waitUntilReady = (): Promise<this> =>
+    this.ready
+      ? Promise.resolve(this)
+      : new Promise(resolve => {
+          const timer = setTimeout(() => resolve(this), 2000);
+          this.readyWaiters.push(() => {
+            clearTimeout(timer);
+            resolve(this);
+          });
+        });
+
+  /** True when `webview` is the exact instance already bound — lets the
+   *  caller skip re-resolving. See `bind()`'s doc comment for why that
+   *  matters. */
+  isBoundTo(webview: vscode.Webview): boolean {
+    return this.webview === webview;
+  }
+
+  /** Resets `ready` and rewires the message listener for a genuinely new
+   *  webview instance. Callers must check `isBoundTo()` first when the
+   *  webview may be the SAME one as before (e.g. `resolveWebviewView`, which
+   *  VS Code can call again on a plain hide/show, not just first creation) —
+   *  a retained webview's JS never re-runs its mount effect on such a
+   *  re-resolve, so it will never send another "ready" to undo the reset. */
   bind(webview: vscode.Webview): void {
     this.webview = webview;
     this.ready = false;
@@ -158,6 +204,7 @@ class SessionViewSession implements vscode.Disposable {
       switch (message.type) {
         case "ready":
           this.ready = true;
+          this.readyWaiters.splice(0).forEach(resolve => resolve());
           this.replay();
           break;
         case "sendPrompt":
@@ -442,6 +489,14 @@ export class SessionViewProvider
   }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
+    // VS Code calls this again on a plain hide/show of an already-resolved
+    // view, not just on first creation — re-running the body below would
+    // reset .html (forcing a reload) and ready-state for a webview whose JS
+    // context is actually still alive and retained, with nothing left to
+    // ever send a fresh "ready" and undo that reset.
+    if (this.sidebar.isBoundTo(webviewView.webview)) {
+      return;
+    }
     webviewView.webview.options = {
       enableScripts: true,
       localResourceRoots: [this.extensionUri],
@@ -453,20 +508,28 @@ export class SessionViewProvider
     this.sidebar.bind(webviewView.webview);
   }
 
-  async openSession(target: SessionTarget): Promise<void> {
-    await vscode.commands.executeCommand("acpcode.sessionView.focus");
-    await this.sidebar.attachSession(
-      target,
-      this.findPeer(target, this.sidebar)?.snapshot(),
+  openSession = (target: SessionTarget) =>
+    vscode.commands.executeCommand("acpcode.sessionView.focus").then(() =>
+      // .focus() only guarantees the view container is revealed, not that the
+      // webview's own JS has finished loading — on the sidebar's very first
+      // reveal in this window, attachSession's posts below would otherwise
+      // race that and can get silently dropped (see waitUntilReady's comment).
+      this.sidebar
+        .waitUntilReady()
+        .then(sidebar =>
+          sidebar.attachSession(
+            target,
+            this.findPeer(target, this.sidebar)?.snapshot(),
+          ),
+        ),
     );
-  }
 
   /** Opens a session in a full editor tab, independent from the sidebar and
    *  any other editor tab from this point on. Passing `target` (e.g. from a
    *  tree item's context menu/inline button) opens that session directly;
    *  with no argument (the sessionView's own title-bar button) it seeds the
    *  new tab from whatever the sidebar currently shows. */
-  openInEditor = async (target?: SessionTarget): Promise<void> => {
+  openInEditor = async (target?: SessionTarget) => {
     const resolvedTarget = target ?? this.sidebar.current;
     if (!resolvedTarget) {
       void vscode.window.showInformationMessage("Open a session first.");
@@ -481,11 +544,14 @@ export class SessionViewProvider
       // say: VS Code already decided it when it reconstructed the panel.
       { retainContextWhenHidden: true },
     );
-    const session = this.bindPanel(panel);
-    await session.attachSession(
-      resolvedTarget,
-      this.findPeer(resolvedTarget)?.snapshot(),
-    );
+    return this.bindPanel(panel)
+      .waitUntilReady()
+      .then(session =>
+        session.attachSession(
+          resolvedTarget,
+          this.findPeer(resolvedTarget, session)?.snapshot(),
+        ),
+      );
   };
 
   /** `WebviewPanelSerializer` for `"acpcode.sessionViewEditor"` (registered in
@@ -496,7 +562,7 @@ export class SessionViewProvider
   deserializeWebviewPanel = async (
     panel: vscode.WebviewPanel,
     state: SessionViewMeta | undefined,
-  ): Promise<void> => {
+  ) => {
     const session = this.bindPanel(panel);
     if (!state) {
       return;
@@ -507,10 +573,14 @@ export class SessionViewProvider
       cwd: state.cwd,
       title: state.title,
     };
-    await session.attachSession(
-      target,
-      this.findPeer(target, session)?.snapshot(),
-    );
+    return session
+      .waitUntilReady()
+      .then(session =>
+        session.attachSession(
+          target,
+          this.findPeer(target, session)?.snapshot(),
+        ),
+      );
   };
 
   private bindPanel(panel: vscode.WebviewPanel): SessionViewSession {
