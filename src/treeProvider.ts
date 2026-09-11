@@ -214,8 +214,33 @@ export class SessionsTreeProvider
         this.pool
           .connect(agent, resolveCwd())
           .then(client => this.listSessionsForScope(client))
-          .then(sessions =>
-            sessions.length === 0
+          .then(sessions => {
+            if (!getGroupSessionsByCwd()) {
+              return sessions.length === 0
+                ? [
+                    {
+                      kind: "message" as const,
+                      text: "No sessions",
+                      isError: false,
+                    },
+                  ]
+                : sessions.sort(bySessionRecency).map(session => ({
+                    kind: "session" as const,
+                    agent,
+                    session,
+                  }));
+            }
+            // Every currently open folder gets a group even with zero
+            // sessions yet — otherwise there's no row to hang the "New
+            // Session" inline button off, and no way to create the first
+            // session for a folder through the tree at all. Session-only
+            // cwds (a folder that's since been closed) are appended after,
+            // so they don't disappear from history either.
+            const openFolderCwds = (
+              vscode.workspace.workspaceFolders ?? []
+            ).map(folder => folder.uri.fsPath);
+            const cwds = uniq([...openFolderCwds, ...sessions.map(s => s.cwd)]);
+            return cwds.length === 0
               ? [
                   {
                     kind: "message" as const,
@@ -223,18 +248,8 @@ export class SessionsTreeProvider
                     isError: false,
                   },
                 ]
-              : getGroupSessionsByCwd()
-                ? uniq<string, string>(sessions.map(s => s.cwd)).map(cwd => ({
-                    kind: "cwdGroup" as const,
-                    agent,
-                    cwd,
-                  }))
-                : sessions.sort(bySessionRecency).map(session => ({
-                    kind: "session" as const,
-                    agent,
-                    session,
-                  })),
-          )
+              : cwds.map(cwd => ({ kind: "cwdGroup" as const, agent, cwd }));
+          })
           .catch(err => {
             this.pool.disconnect(agent.name);
             return [
