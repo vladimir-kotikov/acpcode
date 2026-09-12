@@ -28,7 +28,7 @@ export type Action =
       updates: SessionUpdate[];
       busy: boolean;
     }
-  | { type: "error"; text: string; forkable?: boolean }
+  | { type: "error"; message: string; forkable?: boolean }
   | { type: "sendStart" }
   | { type: "promptStopped"; sessionId: SessionId; stopReason: StopReason }
   // `pendingSteerText`: set only when this send is a steer (busy + canSteer)
@@ -214,7 +214,7 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
           type: "note",
           id: genId(),
           kind: "error",
-          text: action.text,
+          text: action.message,
           forkable: action.forkable,
         },
       ],
