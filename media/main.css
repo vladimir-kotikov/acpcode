@@ -427,8 +427,7 @@ code {
 }
 
 .tool-content-text,
-.tool-content-other,
-.tool-diff-path {
+.tool-content-other {
   margin: var(--vscode-spacing-size40, 4px) 0;
   font-size: var(--vscode-fontSize-body2, 0.85em);
 }
@@ -437,17 +436,9 @@ code {
   white-space: pre-wrap;
 }
 
-.tool-content-other,
-.tool-diff-path {
-  color: var(--vscode-descriptionForeground);
-}
-
 .tool-content-other {
+  color: var(--vscode-descriptionForeground);
   font-style: italic;
-}
-
-.tool-diff-path {
-  margin-bottom: 2px;
 }
 
 .diff-lines {
