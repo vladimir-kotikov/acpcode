@@ -30,7 +30,16 @@ type TreeNode =
   | { kind: "session"; agent: AgentConfig; session: SessionInfo }
   | { kind: "message"; text: string; isError: boolean };
 
+// `id` on every non-leaf item is load-bearing, not cosmetic: without a
+// stable id, firing onDidChangeTreeData can't tell VS Code which freshly
+// returned node is "the same" one that's currently expanded (our TreeNodes
+// are plain objects, freshly created on every getChildren call, so object
+// identity never matches across a refresh) — so a refresh silently fails to
+// cascade into already-expanded children, and the tree only catches up on a
+// full reload, which rebuilds everything from scratch with no stale state
+// to reconcile against.
 const agentTreeItem = (agent: AgentConfig) => ({
+  id: agent.name,
   label: agent.name,
   collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
   iconPath: new vscode.ThemeIcon("robot"),
@@ -38,7 +47,8 @@ const agentTreeItem = (agent: AgentConfig) => ({
   contextValue: "acpcode.agent",
 });
 
-const cwdTreeItem = (cwd: string) => ({
+const cwdTreeItem = (agent: AgentConfig, cwd: string) => ({
+  id: `${agent.name}:${cwd}`,
   label: path.basename(cwd) || cwd,
   collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
   iconPath: new vscode.ThemeIcon("folder"),
@@ -47,6 +57,7 @@ const cwdTreeItem = (cwd: string) => ({
 });
 
 const sessionTreeItem = (session: SessionInfo, agent: AgentConfig) => ({
+  id: `${agent.name}:${session.sessionId}`,
   label: session.title ?? session.sessionId,
   collapsibleState: vscode.TreeItemCollapsibleState.None,
   iconPath: new vscode.ThemeIcon("comment-discussion"),
@@ -180,7 +191,7 @@ export class SessionsTreeProvider
   getTreeItem = (node: TreeNode): vscode.TreeItem =>
     match(node)
       .with({ kind: "agent" }, ({ agent }) => agentTreeItem(agent))
-      .with({ kind: "cwdGroup" }, ({ cwd }) => cwdTreeItem(cwd))
+      .with({ kind: "cwdGroup" }, ({ agent, cwd }) => cwdTreeItem(agent, cwd))
       .with({ kind: "session" }, ({ session, agent }) =>
         sessionTreeItem(session, agent),
       )
