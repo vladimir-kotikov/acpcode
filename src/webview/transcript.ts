@@ -896,6 +896,14 @@ export function Transcript({
         onRespond=${onRespond}
         onFork=${onFork}
       />
+              ${
+                state.pendingSteerText !== undefined
+                  ? html`<${MarkdownBody}
+                      text=${state.pendingSteerText}
+                      class="bubble bubble-user bubble-pending"
+                    />`
+                  : null
+              }
       ${state.busy ? html`<div class="system-note working-note">${state.statusText ?? "Working…"}</div>` : null}
             `
       }

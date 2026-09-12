@@ -360,13 +360,21 @@ export class AgentClient implements vscode.Disposable {
    *  it interrupts" behavior) — `_session/steering` is the purpose-built
    *  method that instead marks the message so the SDK folds it into the
    *  active turn. Only call this when `canSteer()` is true and the caller
-   *  already knows (client-side) that a turn is genuinely in flight. */
+   *  already knows (client-side) that a turn is genuinely in flight.
+   *
+   *  Echoes only after the request succeeds — unlike `prompt()`'s
+   *  optimistic-before-the-call echo — because the webview shows a steer as a
+   *  dimmed provisional bubble until acknowledged (see
+   *  SessionViewSession.sendPrompt's steering branch and the reducer's
+   *  `pendingSteerText`), which becomes the real transcript entry only once
+   *  this echo fires. Echoing before the request, like `prompt()` does, would
+   *  leave a permanent bubble behind even if the injection itself failed. */
   async steer(sessionId: SessionId, text: string): Promise<void> {
-    this.echoUserMessage(sessionId, text);
     await this.requireAgent().request("_session/steering", {
       sessionId,
       prompt: [{ type: "text", text }],
     });
+    this.echoUserMessage(sessionId, text);
   }
 
   /** ACP doesn't echo a prompt you send back as a `user_message_chunk` (that

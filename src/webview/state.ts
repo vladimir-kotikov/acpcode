@@ -29,7 +29,12 @@ export type Action =
   | { type: "error"; text: string; forkable?: boolean }
   | { type: "sendStart" }
   | { type: "promptStopped"; sessionId: SessionId; stopReason: StopReason }
-  | { type: "draftSent" }
+  // `pendingSteerText`: set only when this send is a steer (busy + canSteer)
+  // — shown as a dimmed provisional bubble until the real echo arrives (see
+  // ViewState.pendingSteerText). A plain send needs no provisional bubble:
+  // its real echo lands the instant `prompt()` is called, host-side, well
+  // before any reply — see AgentClient.echoUserMessage's comment.
+  | { type: "draftSent"; pendingSteerText?: string }
   | {
       type: "permissionRequest";
       requestId: string;
@@ -108,6 +113,11 @@ export interface ViewState {
   // `loading`, which only starts once a connection exists. Lets the empty
   // state distinguish "no session chosen" from "one's on its way."
   connecting: boolean;
+  // A steer send shows here — dimmed, at the bottom of the transcript —
+  // until AgentClient.steer's post-request echo comes back around as a real
+  // "sessionUpdate"/"replayBatch" (cleared there; see the reducer). Unset for
+  // a plain (non-steering) send, which never has a provisional phase.
+  pendingSteerText: string | undefined;
   // Text currently typed in the composer, plus every other session's typed
   // text this webview has seen — swapped in/out on session switch so a draft
   // never lingers to be sent to the wrong session, and isn't lost either.
@@ -138,6 +148,7 @@ export const initialState: ViewState = {
   busy: false,
   loading: false,
   connecting: false,
+  pendingSteerText: undefined,
   draftText: "",
   drafts: new Map(),
   statusText: undefined,
@@ -167,6 +178,7 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
         busy: false,
         loading: true,
         connecting: false,
+        pendingSteerText: undefined,
         draftText:
           drafts.get(action.meta.sessionId) ?? action.restoredDraftText ?? "",
         drafts,
@@ -189,6 +201,7 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
       busy: false,
       loading: false,
       connecting: false,
+      pendingSteerText: undefined,
       statusText: undefined,
     }))
     .with({ type: "sendStart" }, () => ({
@@ -205,12 +218,17 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
     // AgentClient.echoUserMessage) so every view showing this session gets
     // it, not just whichever one sent it — this action only clears the
     // composer, dispatched locally for instant feedback on click.
-    .with({ type: "draftSent" }, () => {
+    .with({ type: "draftSent" }, action => {
       const drafts = new Map(state.drafts);
       if (state.meta) {
         drafts.delete(state.meta.sessionId);
       }
-      return { ...state, draftText: "", drafts };
+      return {
+        ...state,
+        draftText: "",
+        drafts,
+        pendingSteerText: action.pendingSteerText,
+      };
     })
     .with({ type: "draftChanged" }, action => ({
       ...state,
@@ -222,6 +240,11 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
             ...state,
             ...applyOneUpdate(state, action.update),
             loading: false,
+            // Any real content for this session is the earliest point a
+            // pending steer can have landed for real (AgentClient.steer only
+            // echoes after its request resolves) — clear the provisional
+            // bubble so it doesn't sit duplicated alongside the real one.
+            pendingSteerText: undefined,
           }
         : state,
     )
@@ -229,6 +252,7 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
       action.sessionId === state.meta?.sessionId
         ? {
             ...state,
+            pendingSteerText: undefined,
             ...action.updates.reduce<UpdateResult>(applyOneUpdate, state),
             loading: false,
             busy: action.busy,

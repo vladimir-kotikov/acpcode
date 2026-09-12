@@ -106,7 +106,15 @@ function Root() {
 
   function onSend(text: string): void {
     atBottomRef.current = true;
-    dispatch({ type: "draftSent" });
+    // Matches Composer's own steeringBlocked/canSend condition: a send while
+    // already busy only reaches here at all when the agent supports
+    // steering (Composer disables the button otherwise) — that's exactly
+    // the case needing the provisional bubble.
+    const isSteering = state.busy && !!state.meta?.canSteer;
+    dispatch({
+      type: "draftSent",
+      pendingSteerText: isSteering ? text : undefined,
+    });
     dispatch({ type: "sendStart" });
     vscode.postMessage({ type: "sendPrompt", text });
   }

@@ -101,6 +101,13 @@ code {
   color: var(--vscode-foreground);
 }
 
+/* Provisional steer bubble — same spot/shape a real one lands in, dimmed
+ * until AgentClient.steer's post-request echo replaces it with the genuine
+ * article (see the "sessionUpdate"/"replayBatch" reducer cases). */
+.bubble-pending {
+  opacity: 0.55;
+}
+
 .bubble-agent {
   align-self: flex-start;
   background: var(--vscode-editorWidget-background);
