@@ -120,6 +120,19 @@ class SessionViewSession implements vscode.Disposable {
   // comment), leaving the bridge with no record of the session at all and
   // every later `prompt`/`steer` failing with "Session not found".
   private loaded = false;
+  // Fired once (per attachSession target — reset alongside `loaded`/`buffer`
+  // below) when a prompt settles (success or failure) — the tree needs this
+  // because the agent doesn't list a brand new session until it has at
+  // least one message in it, so a tree refresh fired at session-creation
+  // time alone can't show it; refreshing again once the first prompt
+  // actually completes is the earliest point it's genuinely listable. Only
+  // the first firing matters for that, so subsequent prompts in the same
+  // session (already listable) don't cause a pointless refresh on every
+  // single message.
+  private readonly promptSettledEmitter =
+    new vscode.EventEmitter<SessionTarget>();
+  readonly onPromptSettled = this.promptSettledEmitter.event;
+  private firstPromptSettled = false;
 
   constructor(pool: AgentConnectionPool) {
     this.pool = pool;
@@ -287,6 +300,7 @@ class SessionViewSession implements vscode.Disposable {
     this.current = target;
     this.buffer = [];
     this.loaded = false;
+    this.firstPromptSettled = false;
     this.post({
       type: "loading",
       meta: {
@@ -406,6 +420,10 @@ class SessionViewSession implements vscode.Disposable {
       this.post({ type: "error", message: describeError(err) });
     } finally {
       this.pendingPrompts -= 1;
+      if (!this.firstPromptSettled) {
+        this.firstPromptSettled = true;
+        this.promptSettledEmitter.fire(target);
+      }
     }
   }
 
@@ -460,7 +478,10 @@ class SessionViewSession implements vscode.Disposable {
     }
   };
 
-  dispose = () => this.subscription?.dispose();
+  dispose = () => {
+    this.subscription?.dispose();
+    this.promptSettledEmitter.dispose();
+  };
 }
 
 /** Session transcript viewer with a live composer (send/cancel a prompt,
@@ -481,11 +502,21 @@ export class SessionViewProvider
   // Keyed by session (not panel) so closeSession can look up which panel to
   // dispose for a given target without a separate parallel structure.
   private readonly editors = new Map<SessionViewSession, vscode.WebviewPanel>();
+  // Aggregates every SessionViewSession's own onPromptSettled (sidebar plus
+  // every editor tab) into one event so treeProvider can subscribe once
+  // instead of per-view — see SessionViewSession.promptSettledEmitter's
+  // comment for why the tree needs this at all.
+  private readonly promptSettledEmitter =
+    new vscode.EventEmitter<SessionTarget>();
+  readonly onPromptSettled = this.promptSettledEmitter.event;
 
   constructor(extensionUri: vscode.Uri, pool: AgentConnectionPool) {
     this.extensionUri = extensionUri;
     this.pool = pool;
     this.sidebar = new SessionViewSession(pool);
+    this.sidebar.onPromptSettled(target =>
+      this.promptSettledEmitter.fire(target),
+    );
   }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -592,6 +623,7 @@ export class SessionViewProvider
     panel.webview.html = renderHtml(panel.webview, this.extensionUri);
     const session = new SessionViewSession(this.pool);
     session.bind(panel.webview);
+    session.onPromptSettled(target => this.promptSettledEmitter.fire(target));
     this.editors.set(session, panel);
     panel.onDidDispose(() => {
       session.dispose();
@@ -623,6 +655,8 @@ export class SessionViewProvider
     }
   }
 
-  dispose = (): void =>
+  dispose = (): void => {
+    this.promptSettledEmitter.dispose();
     [this.sidebar, ...this.editors.keys()].forEach(d => d.dispose());
+  };
 }
