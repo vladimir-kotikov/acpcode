@@ -20,10 +20,11 @@ function expandHome(value: string): string {
   return value;
 }
 
-export function getAgents(): AgentConfig[] {
-  const config = vscode.workspace.getConfiguration("acpcode");
-  return config.get<AgentConfig[]>("agents", []);
-}
+export const getAgents = (): AgentConfig[] =>
+  vscode.workspace.getConfiguration("acpcode").get<AgentConfig[]>("agents", []);
+
+export const getAgent = (name: string): AgentConfig | undefined =>
+  getAgents().find(agent => agent.name === name);
 
 export async function saveAgents(agents: AgentConfig[]): Promise<void> {
   const config = vscode.workspace.getConfiguration("acpcode");

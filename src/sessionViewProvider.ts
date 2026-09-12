@@ -1,8 +1,9 @@
 import { RequestError, type SessionUpdate } from "@agentclientprotocol/sdk";
 import * as crypto from "node:crypto";
+import { match } from "ts-pattern";
 import * as vscode from "vscode";
 import type { AgentConnectionPool } from "./acp/agentPool.ts";
-import { getAgents } from "./acp/agents/config.ts";
+import { getAgent } from "./acp/agents/config.ts";
 import type {
   HostToSessionViewMessage,
   SessionViewPersistedState,
@@ -210,31 +211,26 @@ class SessionViewSession implements vscode.Disposable {
    *  VS Code can call again on a plain hide/show, not just first creation) —
    *  a retained webview's JS never re-runs its mount effect on such a
    *  re-resolve, so it will never send another "ready" to undo the reset. */
-  bind(webview: vscode.Webview): void {
+  bind = (webview: vscode.Webview): this => {
     this.webview = webview;
     this.ready = false;
-    webview.onDidReceiveMessage((message: SessionViewToHostMessage) => {
-      switch (message.type) {
-        case "ready":
+    webview.onDidReceiveMessage((message: SessionViewToHostMessage) =>
+      match(message)
+        .with({ type: "ready" }, () => {
           this.ready = true;
           this.readyWaiters.splice(0).forEach(resolve => resolve());
           this.replay();
-          break;
-        case "sendPrompt":
-          void this.sendPrompt(message.text);
-          break;
-        case "cancelPrompt":
-          this.cancelPrompt();
-          break;
-        case "permissionResponse":
-          this.respondToPermission(message.requestId, message.optionId);
-          break;
-        case "forkSession":
-          void this.forkSession();
-          break;
-      }
-    });
-  }
+        })
+        .with({ type: "sendPrompt" }, message => this.sendPrompt(message.text))
+        .with({ type: "cancelPrompt" }, this.cancelPrompt)
+        .with({ type: "permissionResponse" }, ({ requestId, optionId }) =>
+          this.respondToPermission(requestId, optionId),
+        )
+        .with({ type: "forkSession" }, this.forkSession)
+        .exhaustive(),
+    );
+    return this;
+  };
 
   /** `seed`, when given, means another view already has this exact session
    *  loaded: copy its buffer instead of calling `client.loadSession()`
@@ -250,9 +246,7 @@ class SessionViewSession implements vscode.Disposable {
     target: SessionTarget,
     seed?: SessionSnapshot,
   ): Promise<void> {
-    const agent = getAgents().find(
-      candidate => candidate.name === target.agentName,
-    );
+    const agent = getAgent(target.agentName);
     if (!agent) {
       this.post({
         type: "error",
@@ -354,9 +348,7 @@ class SessionViewSession implements vscode.Disposable {
       return;
     }
     const target = this.current;
-    const agent = getAgents().find(
-      candidate => candidate.name === target.agentName,
-    );
+    const agent = getAgent(target.agentName);
     if (!agent) {
       this.post({
         type: "error",
@@ -383,9 +375,7 @@ class SessionViewSession implements vscode.Disposable {
       return;
     }
     const target = this.current;
-    const agent = getAgents().find(
-      candidate => candidate.name === target.agentName,
-    );
+    const agent = getAgent(target.agentName);
     if (!agent) {
       this.post({
         type: "error",
@@ -560,7 +550,7 @@ export class SessionViewProvider
    *  tree item's context menu/inline button) opens that session directly;
    *  with no argument (the sessionView's own title-bar button) it seeds the
    *  new tab from whatever the sidebar currently shows. */
-  openInEditor = async (target?: SessionTarget) => {
+  openInEditor = (target?: SessionTarget) => {
     const resolvedTarget = target ?? this.sidebar.current;
     if (!resolvedTarget) {
       void vscode.window.showInformationMessage("Open a session first.");
@@ -575,7 +565,7 @@ export class SessionViewProvider
       // say: VS Code already decided it when it reconstructed the panel.
       { retainContextWhenHidden: true },
     );
-    return this.bindPanel(panel)
+    return this.newSessionForPanel(panel)
       .waitUntilReady()
       .then(session =>
         session.attachSession(
@@ -595,16 +585,11 @@ export class SessionViewProvider
     panel: vscode.WebviewPanel,
     state: SessionViewPersistedState | undefined,
   ) => {
-    const session = this.bindPanel(panel);
+    const session = this.newSessionForPanel(panel);
     if (!state) {
       return;
     }
-    const target: SessionTarget = {
-      agentName: state.meta.agentName,
-      sessionId: state.meta.sessionId,
-      cwd: state.meta.cwd,
-      title: state.meta.title,
-    };
+    const target: SessionTarget = { ...state.meta };
     return session
       .waitUntilReady()
       .then(session =>
@@ -615,15 +600,16 @@ export class SessionViewProvider
       );
   };
 
-  private bindPanel(panel: vscode.WebviewPanel): SessionViewSession {
+  private newSessionForPanel(panel: vscode.WebviewPanel): SessionViewSession {
     panel.webview.options = {
       enableScripts: true,
       localResourceRoots: [this.extensionUri],
     };
     panel.webview.html = renderHtml(panel.webview, this.extensionUri);
     const session = new SessionViewSession(this.pool);
-    session.bind(panel.webview);
-    session.onPromptSettled(target => this.promptSettledEmitter.fire(target));
+    session
+      .bind(panel.webview)
+      .onPromptSettled(target => this.promptSettledEmitter.fire(target));
     this.editors.set(session, panel);
     panel.onDidDispose(() => {
       session.dispose();

@@ -4,7 +4,7 @@ import { match } from "ts-pattern";
 import * as vscode from "vscode";
 import type { AgentClient } from "./acp/agentClient.ts";
 import type { AgentConnectionPool } from "./acp/agentPool.ts";
-import { getAgents, type AgentConfig } from "./acp/agents/config.ts";
+import { getAgent, getAgents, type AgentConfig } from "./acp/agents/config.ts";
 import type { SessionViewProvider } from "./sessionViewProvider.ts";
 import { getGroupSessionsByCwd } from "./settings.ts";
 import { resolveCwd } from "./workspaceUtils.ts";
@@ -19,15 +19,27 @@ const uniq = <T, K = T>(
 ): T[] =>
   Object.values(Object.fromEntries(arr.map(item => [keyFn(item), item])));
 
+type SessionTreeNode = {
+  kind: "session";
+  agent: AgentConfig;
+  session: SessionInfo;
+};
+
+type CwdTreeNode = {
+  kind: "cwdGroup";
+  agent: AgentConfig;
+  cwd: string;
+};
+
+type AgentTreeNode = {
+  kind: "agent";
+  agent: AgentConfig;
+};
+
 type TreeNode =
-  | { kind: "agent"; agent: AgentConfig }
-  | {
-      kind: "cwdGroup";
-      agent: AgentConfig;
-      cwd: string;
-      // sessions: SessionInfo[];
-    }
-  | { kind: "session"; agent: AgentConfig; session: SessionInfo }
+  | AgentTreeNode
+  | CwdTreeNode
+  | SessionTreeNode
   | { kind: "message"; text: string; isError: boolean };
 
 // `id` on every non-leaf item is load-bearing, not cosmetic: without a
@@ -80,10 +92,16 @@ const sessionTreeItem = (session: SessionInfo, agent: AgentConfig) => ({
   },
 });
 
-const messageTreeNode = (label: string, isError: boolean) => ({
+const messageTreeItem = (label: string, isError: boolean = false) => ({
   label,
   collapsibleState: vscode.TreeItemCollapsibleState.None,
   iconPath: new vscode.ThemeIcon(isError ? "error" : "info"),
+});
+
+const messageTreeNode = (text: string, isError: boolean = false) => ({
+  kind: "message" as const,
+  text,
+  isError,
 });
 
 const bySessionRecency = (a: SessionInfo, b: SessionInfo) =>
@@ -143,12 +161,14 @@ export class SessionsTreeProvider
    *  viewer stays connected across a plain "Refresh Sessions" click. */
   refresh = () => this.changeEmitter.fire();
 
+  private closeSession = (agentName: string, sessionId: string) => {
+    this.sessionViewProvider.closeSession({ agentName, sessionId });
+    this.refresh();
+  };
+
   /** Invoked from a session row's context menu/inline button, which VS Code
    *  calls with the raw tree node (not a vscode.TreeItem) as the arg. */
-  deleteSession = async (node: {
-    agent: { name: string };
-    session: { sessionId: string; cwd: string; title?: string | null };
-  }): Promise<void> => {
+  deleteSession = async (node: SessionTreeNode): Promise<void> => {
     const label = node.session.title ?? node.session.sessionId;
     const confirmed = await vscode.window.showWarningMessage(
       `Delete session "${label}"? This can't be undone.`,
@@ -158,34 +178,25 @@ export class SessionsTreeProvider
     if (confirmed !== "Delete") {
       return;
     }
-    const agent = getAgents().find(
-      candidate => candidate.name === node.agent.name,
-    );
+    const agent = getAgent(node.agent.name);
     if (!agent) {
       return;
     }
-    const client = await this.pool.connect(agent, resolveCwd());
-    await client.deleteSession(node.session.sessionId);
-    this.sessionViewProvider.closeSession({
-      agentName: node.agent.name,
-      sessionId: node.session.sessionId,
-    });
-    this.refresh();
+
+    return this.pool
+      .connect(agent, resolveCwd())
+      .then(client => client.deleteSession(node.session.sessionId))
+      .then(() => this.closeSession(node.agent.name, node.session.sessionId));
   };
 
   /** Invoked from a cwd-group row (with that cwd) or an agent row (falls back
    *  to the workspace cwd, matching how the ungrouped list is scoped). */
-  newSession = async (node: {
-    agent: { name: string };
-    cwd?: string;
-  }): Promise<void> => {
-    const agent = getAgents().find(
-      candidate => candidate.name === node.agent.name,
-    );
+  newSession = async (node: CwdTreeNode | AgentTreeNode): Promise<void> => {
+    const agent = getAgent(node.agent.name);
     if (!agent) {
       return;
     }
-    const cwd = node.cwd ?? resolveCwd();
+    const cwd = node.kind === "cwdGroup" ? node.cwd : resolveCwd();
     const client = await this.pool.connect(agent, cwd);
     const response = await client.newSession(cwd);
     // Refresh doesn't show the new session yet — the agent doesn't list a
@@ -209,7 +220,7 @@ export class SessionsTreeProvider
         sessionTreeItem(session, agent),
       )
       .with({ kind: "message" }, ({ text, isError }) =>
-        messageTreeNode(text, isError),
+        messageTreeItem(text, isError),
       )
       .exhaustive();
 
@@ -224,13 +235,7 @@ export class SessionsTreeProvider
           .then(client => this.listSessionsForScope(client, cwd))
           .then(sessions =>
             sessions.length === 0
-              ? [
-                  {
-                    kind: "message" as const,
-                    text: "No sessions",
-                    isError: false,
-                  },
-                ]
+              ? [messageTreeNode("No sessions")]
               : sessions.sort(bySessionRecency).map(session => ({
                   kind: "session" as const,
                   agent,
@@ -239,7 +244,7 @@ export class SessionsTreeProvider
           )
           .catch(err => {
             this.pool.disconnect(agent.name);
-            return [{ kind: "message", text: String(err), isError: true }];
+            return [messageTreeNode(String(err), true)];
           }),
       )
       .with({ kind: "agent" }, async ({ agent }) =>
@@ -249,13 +254,7 @@ export class SessionsTreeProvider
           .then(sessions => {
             if (!getGroupSessionsByCwd()) {
               return sessions.length === 0
-                ? [
-                    {
-                      kind: "message" as const,
-                      text: "No sessions",
-                      isError: false,
-                    },
-                  ]
+                ? [messageTreeNode("No sessions")]
                 : sessions.sort(bySessionRecency).map(session => ({
                     kind: "session" as const,
                     agent,
@@ -273,20 +272,12 @@ export class SessionsTreeProvider
             ).map(folder => folder.uri.fsPath);
             const cwds = uniq([...openFolderCwds, ...sessions.map(s => s.cwd)]);
             return cwds.length === 0
-              ? [
-                  {
-                    kind: "message" as const,
-                    text: "No sessions",
-                    isError: false,
-                  },
-                ]
+              ? [messageTreeNode("No sessions")]
               : cwds.map(cwd => ({ kind: "cwdGroup" as const, agent, cwd }));
           })
           .catch(err => {
             this.pool.disconnect(agent.name);
-            return [
-              { kind: "message" as const, text: String(err), isError: true },
-            ];
+            return [messageTreeNode(String(err), true)];
           }),
       )
       .with(undefined, () => {
