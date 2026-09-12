@@ -2,26 +2,16 @@ import { html, render } from "htm/preact";
 import { useEffect, useReducer, useRef } from "preact/hooks";
 import type {
   HostToSessionViewMessage,
-  SessionViewMeta,
+  SessionViewPersistedState,
   SessionViewToHostMessage,
 } from "../shared/sessionViewProtocol.ts";
 import { initialState, reduce, type Action } from "./state.ts";
 import { Transcript } from "./transcript.ts";
 
-// Meta half is handed to WebviewPanelSerializer.deserializeWebviewPanel's
-// `state` param — the only way an editor tab (not the sidebar, which the
-// host itself keeps alive) can know which session to re-attach to after a
-// reload. draftText rides along so an unsent in-progress message survives
-// the same reload instead of silently vanishing.
-interface PersistedState {
-  meta: SessionViewMeta;
-  draftText: string;
-}
-
 declare function acquireVsCodeApi(): {
   postMessage(message: SessionViewToHostMessage): void;
-  getState(): PersistedState | undefined;
-  setState(state: PersistedState): void;
+  getState(): SessionViewPersistedState | undefined;
+  setState(state: SessionViewPersistedState): void;
 };
 
 const vscode = acquireVsCodeApi();
@@ -53,7 +43,7 @@ function Root() {
         case "loading": {
           const persisted = vscode.getState();
           const restoredDraftText =
-            persisted?.meta.sessionId === message.meta.sessionId
+            persisted?.meta?.sessionId === message.meta.sessionId
               ? persisted.draftText
               : undefined;
           action = { type: "loading", meta: message.meta, restoredDraftText };

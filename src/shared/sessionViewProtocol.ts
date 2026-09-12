@@ -24,6 +24,17 @@ export interface SessionViewMeta {
   canSteer: boolean;
 }
 
+// What the webview persists via `vscode.setState()`/`vscode.getState()` (see
+// sessionView.ts) and what `WebviewPanelSerializer.deserializeWebviewPanel`
+// (sessionViewProvider.ts) receives back for a restored editor tab — shared
+// so the two sides can't drift out of sync on the shape again (they did:
+// deserializeWebviewPanel was reading fields directly off this object as if
+// it *were* a SessionViewMeta, instead of off its nested `.meta`).
+export interface SessionViewPersistedState {
+  meta: SessionViewMeta;
+  draftText: string;
+}
+
 export type HostToSessionViewMessage =
   | { type: "loading"; meta: SessionViewMeta }
   // The session this view was showing was deleted — reset to "no session".

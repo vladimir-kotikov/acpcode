@@ -5,7 +5,7 @@ import type { AgentConnectionPool } from "./acp/agentPool.ts";
 import { getAgents } from "./acp/agents/config.ts";
 import type {
   HostToSessionViewMessage,
-  SessionViewMeta,
+  SessionViewPersistedState,
   SessionViewToHostMessage,
 } from "./shared/sessionViewProtocol.ts";
 import { resolveCwd } from "./workspaceUtils.ts";
@@ -472,7 +472,7 @@ class SessionViewSession implements vscode.Disposable {
 export class SessionViewProvider
   implements
     vscode.WebviewViewProvider,
-    vscode.WebviewPanelSerializer<SessionViewMeta | undefined>,
+    vscode.WebviewPanelSerializer<SessionViewPersistedState | undefined>,
     vscode.Disposable
 {
   private readonly extensionUri: vscode.Uri;
@@ -558,20 +558,21 @@ export class SessionViewProvider
    *  extension.ts) — without one, VS Code doesn't attempt to restore these
    *  tabs across a window reload at all, it just drops them. `state` is
    *  whatever the webview last passed to its own `vscode.setState()` (see
-   *  sessionView.ts): the `SessionViewMeta` of the session it was showing. */
+   *  sessionView.ts): a `SessionViewPersistedState` (`{meta, draftText}`),
+   *  NOT a bare `SessionViewMeta` — read `state.meta.*`, not `state.*`. */
   deserializeWebviewPanel = async (
     panel: vscode.WebviewPanel,
-    state: SessionViewMeta | undefined,
+    state: SessionViewPersistedState | undefined,
   ) => {
     const session = this.bindPanel(panel);
     if (!state) {
       return;
     }
     const target: SessionTarget = {
-      agentName: state.agentName,
-      sessionId: state.sessionId,
-      cwd: state.cwd,
-      title: state.title,
+      agentName: state.meta.agentName,
+      sessionId: state.meta.sessionId,
+      cwd: state.meta.cwd,
+      title: state.meta.title,
     };
     return session
       .waitUntilReady()
