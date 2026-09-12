@@ -5,10 +5,12 @@ import {
   ToolKind,
   type AvailableCommand,
   type PermissionOption,
+  type SessionConfigOption,
   type SessionId,
   type SessionUpdate,
   type StopReason,
   type ToolCallUpdate,
+  type UsageUpdate,
 } from "@agentclientprotocol/sdk";
 import type { SessionViewMeta } from "../shared/sessionViewProtocol.ts";
 
@@ -130,6 +132,18 @@ export interface ViewState {
   // Slash commands the agent advertised for this session, for the
   // composer's completion popup. Empty until the agent sends one.
   availableCommands: AvailableCommand[];
+  // Model/effort/mode selectors the agent exposes for this session (category
+  // "model" | "thought_level" | "mode" | ...). Seeded from `loadSession`'s
+  // response by sessionViewProvider.ts (synthesized as a leading
+  // config_option_update in the replay buffer, since ACP has no dedicated
+  // "loading" field for it) and kept current by later live
+  // config_option_update notifications (e.g. the user runs `/model`).
+  configOptions: SessionConfigOption[];
+  // Context-window usage for this session. Unlike configOptions, ACP has no
+  // initial snapshot for this — the bridge only emits usage_update live, as
+  // part of a turn's streaming response — so this stays undefined for a
+  // freshly reopened session until the next prompt actually runs.
+  usage: UsageUpdate | undefined;
 }
 
 // The slice of ViewState that one SessionUpdate can touch — shared by
@@ -140,6 +154,8 @@ interface UpdateResult {
   blocks: Block[];
   statusText: string | undefined;
   availableCommands: AvailableCommand[];
+  configOptions: SessionConfigOption[];
+  usage: UsageUpdate | undefined;
 }
 
 export const initialState: ViewState = {
@@ -153,6 +169,8 @@ export const initialState: ViewState = {
   drafts: new Map(),
   statusText: undefined,
   availableCommands: [],
+  configOptions: [],
+  usage: undefined,
 };
 
 export const reduce = (state: ViewState, action: Action): ViewState =>
@@ -184,6 +202,8 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
         drafts,
         statusText: undefined,
         availableCommands: [],
+        configOptions: [],
+        usage: undefined,
       };
     })
     .with({ type: "error" }, action => ({
@@ -316,11 +336,11 @@ const applySessionUpdate = (blocks: Block[], update: SessionUpdate): Block[] =>
       u => upsertToolCall(blocks, u),
     )
     .otherwise(
-      // plan/plan_update/current_mode_update/config_option_update/
-      // usage_update — not rendered yet, no-op. available_commands_update
-      // and session_info_update ARE handled, just not here — by
-      // extractAvailableCommands/extractSessionFailure in the reducer cases
-      // that call this function.
+      // plan/plan_update/current_mode_update — not rendered yet, no-op.
+      // available_commands_update, session_info_update, config_option_update,
+      // and usage_update ARE handled, just not here — by
+      // extractAvailableCommands/extractSessionFailure/extractConfigOptions/
+      // extractUsage in the reducer cases that call this function.
       () => blocks,
     );
 
@@ -347,6 +367,8 @@ const applyOneUpdate = (
           : prev.statusText,
     availableCommands:
       extractAvailableCommands(update) ?? prev.availableCommands,
+    configOptions: extractConfigOptions(update) ?? prev.configOptions,
+    usage: extractUsage(update) ?? prev.usage,
   };
 };
 
@@ -548,3 +570,11 @@ const extractAvailableCommands = (update: SessionUpdate) =>
   update.sessionUpdate === "available_commands_update"
     ? update.availableCommands
     : undefined;
+
+const extractConfigOptions = (update: SessionUpdate) =>
+  update.sessionUpdate === "config_option_update"
+    ? update.configOptions
+    : undefined;
+
+const extractUsage = (update: SessionUpdate): UsageUpdate | undefined =>
+  update.sessionUpdate === "usage_update" ? update : undefined;

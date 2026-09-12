@@ -328,9 +328,20 @@ class SessionViewSession implements vscode.Disposable {
 
     this.replayingHistory = true;
     try {
-      await client.loadSession(target.sessionId, target.cwd);
+      const response = await client.loadSession(target.sessionId, target.cwd);
       this.replayingHistory = false;
       this.loaded = true;
+      // loadSession's response carries the session's current model/effort/mode
+      // selectors, but only here — a live config_option_update only fires on
+      // a later *change*, never as an initial snapshot. Fold it into the
+      // buffer as a synthetic update so it rides the existing generic
+      // update/replayBatch pipeline instead of needing its own message type.
+      if (response?.configOptions) {
+        this.buffer.push({
+          sessionUpdate: "config_option_update",
+          configOptions: response.configOptions,
+        });
+      }
       this.post({
         type: "replayBatch",
         sessionId: target.sessionId,
