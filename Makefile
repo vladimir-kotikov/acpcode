@@ -1,10 +1,13 @@
-.PHONY: vsix install-vsix lint
+.PHONY: vsix install lint deps
 
-lint:
-	npm run lint
-
-vsix:
+vsix: deps
 	npx @vscode/vsce package
 
-install-vsix: vsix
+deps:
+	@npm install
+
+lint: deps
+	npm run lint
+
+install: vsix
 	code --install-extension $$(ls -t *.vsix | head -1)
