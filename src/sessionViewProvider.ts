@@ -2,6 +2,7 @@ import { RequestError, type SessionUpdate } from "@agentclientprotocol/sdk";
 import * as crypto from "node:crypto";
 import { match } from "ts-pattern";
 import * as vscode from "vscode";
+import type { AgentClient } from "./acp/agentClient.ts";
 import type { AgentConnectionPool } from "./acp/agentPool.ts";
 import { getAgent } from "./acp/agents/config.ts";
 import type {
@@ -255,7 +256,14 @@ class SessionViewSession implements vscode.Disposable {
       return;
     }
 
-    const client = await this.pool.connect(agent, resolveCwd());
+    this.post({ type: "connecting" });
+    let client: AgentClient;
+    try {
+      client = await this.pool.connect(agent, resolveCwd());
+    } catch (err) {
+      this.post({ type: "error", message: describeError(err) });
+      return;
+    }
 
     if (this.current?.agentName !== target.agentName) {
       this.subscription?.dispose();

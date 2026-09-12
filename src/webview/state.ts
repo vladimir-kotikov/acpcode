@@ -17,6 +17,7 @@ export type Action =
   // (see sessionView.ts) — only meaningful the first time a freshly-mounted
   // webview loads, when the in-memory `drafts` map below is still empty and
   // has nothing of its own to offer for this session.
+  | { type: "connecting" }
   | { type: "loading"; meta: SessionViewMeta; restoredDraftText?: string }
   | { type: "sessionUpdate"; sessionId: SessionId; update: SessionUpdate }
   | {
@@ -102,6 +103,11 @@ export interface ViewState {
   blocks: Block[];
   busy: boolean;
   loading: boolean;
+  // True from `attachSession`'s very first line until the agent connection
+  // resolves (may mean spawning a fresh subprocess) — distinct from
+  // `loading`, which only starts once a connection exists. Lets the empty
+  // state distinguish "no session chosen" from "one's on its way."
+  connecting: boolean;
   // Text currently typed in the composer, plus every other session's typed
   // text this webview has seen — swapped in/out on session switch so a draft
   // never lingers to be sent to the wrong session, and isn't lost either.
@@ -131,6 +137,7 @@ export const initialState: ViewState = {
   blocks: [],
   busy: false,
   loading: false,
+  connecting: false,
   draftText: "",
   drafts: new Map(),
   statusText: undefined,
@@ -140,6 +147,11 @@ export const initialState: ViewState = {
 export const reduce = (state: ViewState, action: Action): ViewState =>
   match(action)
     .returnType<ViewState>()
+    // Deliberately leaves `meta`/`blocks` untouched — a re-attach that's
+    // still waiting on `pool.connect()` shouldn't blank out whatever the
+    // view was showing before; `connecting` alone drives the centered
+    // spinner (see Transcript), layered over whatever's still there.
+    .with({ type: "connecting" }, () => ({ ...state, connecting: true }))
     .with({ type: "loading" }, action => {
       const drafts = new Map(state.drafts);
       if (state.meta) {
@@ -154,6 +166,7 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
         blocks: [],
         busy: false,
         loading: true,
+        connecting: false,
         draftText:
           drafts.get(action.meta.sessionId) ?? action.restoredDraftText ?? "",
         drafts,
@@ -175,6 +188,7 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
       ],
       busy: false,
       loading: false,
+      connecting: false,
       statusText: undefined,
     }))
     .with({ type: "sendStart" }, () => ({

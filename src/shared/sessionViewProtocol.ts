@@ -36,6 +36,12 @@ export interface SessionViewPersistedState {
 }
 
 export type HostToSessionViewMessage =
+  // Sent the moment attachSession starts, before the agent connection (which
+  // may mean spawning a fresh subprocess) has even resolved — lets the
+  // webview show a "Starting bridge…" spinner instead of sitting blank for
+  // however long that cold start takes. `loading` (below) follows once a
+  // connection exists and carries the real session meta.
+  | { type: "connecting" }
   | { type: "loading"; meta: SessionViewMeta }
   // The session this view was showing was deleted — reset to "no session".
   | { type: "closed" }

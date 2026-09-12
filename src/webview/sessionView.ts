@@ -40,6 +40,9 @@ function Root() {
       const message = event.data;
       let action: Action;
       switch (message.type) {
+        case "connecting":
+          action = { type: "connecting" };
+          break;
         case "loading": {
           const persisted = vscode.getState();
           const restoredDraftText =

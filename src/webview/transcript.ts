@@ -854,11 +854,28 @@ export function Transcript({
       node.scrollTop = node.scrollHeight;
     });
     return () => cancelAnimationFrame(raf);
-  }, [state.blocks, state.loading, state.busy, state.statusText]);
+  }, [
+    state.blocks,
+    state.loading,
+    state.busy,
+    state.statusText,
+    state.pendingSteerText,
+  ]);
 
-  const title = state.meta
-    ? `${state.meta.agentName} — ${state.meta.title ?? state.meta.sessionId}`
-    : "No session selected";
+  // Covers every "there's nothing real to show yet" phase in one place —
+  // connecting (agent connection, possibly a fresh subprocess, still being
+  // established), loading (connected, history replay in flight), and the
+  // genuine idle state (no session chosen at all) — each centered in the
+  // viewport rather than left as a blank pane or squeezed into the header
+  // bar, so there's always a reason visible for why the transcript is empty.
+  const centerStatus = state.connecting
+    ? "Starting bridge…"
+    : !state.meta
+      ? "No session selected"
+      : state.loading
+        ? "Loading session…"
+        : undefined;
+  const showSpinner = state.connecting || (!!state.meta && state.loading);
 
   return html`
     <div
@@ -867,13 +884,21 @@ export function Transcript({
       ${title}
     </div>
     <div class="chat-log session-log" ref=${logRef}>
-      ${state.loading ? html`<div class="system-note">Loading…</div>` : null}
+      ${
+        centerStatus
+          ? html`<div class="center-status">
+              ${showSpinner ? html`<div class="spinner"></div>` : null}
+              <div>${centerStatus}</div>
+            </div>`
+          : html`
       <${BlocksView}
         blocks=${state.blocks}
         onRespond=${onRespond}
         onFork=${onFork}
       />
       ${state.busy ? html`<div class="system-note working-note">${state.statusText ?? "Working…"}</div>` : null}
+            `
+      }
     </div>
     <${Composer}
       state=${state}

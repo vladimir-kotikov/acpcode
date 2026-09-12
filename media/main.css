@@ -56,10 +56,31 @@ code {
   word-break: break-word;
 }
 
-.session-header-placeholder {
-  font-weight: 400;
-  font-style: italic;
+.center-status {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--vscode-spacing-size60, 6px);
   color: var(--vscode-descriptionForeground);
+  font-size: var(--vscode-fontSize-body2, 0.85em);
+  font-style: italic;
+}
+
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--vscode-descriptionForeground);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .bubble {
