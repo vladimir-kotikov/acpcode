@@ -133,16 +133,9 @@ export class SessionsTreeProvider
     // The agent doesn't list a session until it has at least one message —
     // a tree refresh fired at creation time can't show one yet, so refresh
     // again whenever any prompt (in any view: sidebar or an editor tab)
-    // settles, targeting just the node that session belongs to.
-    this.promptSettledListener = this.sessionViewProvider.onPromptSettled(
-      target => {
-        const agent = getAgents().find(
-          candidate => candidate.name === target.agentName,
-        );
-        if (agent) {
-          this.changeEmitter.fire(this.affectedNode(agent, target.cwd));
-        }
-      },
+    // settles.
+    this.promptSettledListener = this.sessionViewProvider.onPromptSettled(() =>
+      this.refresh(),
     );
   }
 
@@ -177,19 +170,8 @@ export class SessionsTreeProvider
       agentName: node.agent.name,
       sessionId: node.session.sessionId,
     });
-    // Whole-tree fires (see newSession's comment) don't reliably cascade
-    // into an already-expanded cwdGroup, so target the specific node the
-    // deleted session belonged to instead.
-    this.changeEmitter.fire(this.affectedNode(agent, node.session.cwd));
+    this.refresh();
   };
-
-  /** The specific node whose children a session-list change under `cwd`
-   *  should be signaled through — a cwdGroup one level down when grouping is
-   *  on, the agent itself (which lists sessions directly) when it's off. */
-  private affectedNode = (agent: AgentConfig, cwd: string): TreeNode =>
-    getGroupSessionsByCwd()
-      ? { kind: "cwdGroup", agent, cwd }
-      : { kind: "agent", agent };
 
   /** Invoked from a cwd-group row (with that cwd) or an agent row (falls back
    *  to the workspace cwd, matching how the ungrouped list is scoped). */
@@ -206,18 +188,12 @@ export class SessionsTreeProvider
     const cwd = node.cwd ?? resolveCwd();
     const client = await this.pool.connect(agent, cwd);
     const response = await client.newSession(cwd);
-    // Fired once BEFORE stealing focus to the session view below (see
-    // deleteSession's comment on targeted vs. whole-tree refresh —
-    // deleteSession, which never steals focus, refreshed fine even with a
-    // whole-tree fire; creating a session didn't, and even broke later
-    // unrelated manual refreshes until a reload — pointing at the .focus()
-    // call below, into the same view container as this tree, disrupting
-    // VS Code's tree reconciliation when a refresh landed around the same
-    // time). This alone is NOT sufficient — the agent doesn't actually list
-    // a brand new session until it has at least one message in it — see the
-    // onPromptSettled subscription in the constructor for the fire that
-    // actually catches that.
-    this.changeEmitter.fire(this.affectedNode(agent, cwd));
+    // Refresh doesn't show the new session yet — the agent doesn't list a
+    // brand new session until it has at least one message in it — but it
+    // does need to run so the tree isn't left in a stale-but-not-obviously
+    // wrong state, and the onPromptSettled subscription in the constructor
+    // fires the real one once the session's first message actually lands.
+    this.refresh();
     await this.sessionViewProvider.openSession({
       agentName: agent.name,
       sessionId: response.sessionId,
