@@ -290,6 +290,31 @@ function PendingPermissionView({
   `;
 }
 
+/** Copy-to-clipboard for a shell tool card's command — reuses `.code-copy-btn`'s
+ *  icon/hover styling (see `addCopyButton` above) but stays a plain flex item
+ *  in the header row instead of an absolutely-positioned overlay, so it tracks
+ *  the header's own top-right corner even once the title wraps to multiple
+ *  lines. Lives inside a `<summary>`, so its click must be stopped from
+ *  reaching the native toggle-on-click behavior that would otherwise
+ *  collapse/expand the card. */
+function ToolCopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return html`<button
+    type="button"
+    class="code-copy-btn tool-card-copy-btn ${copied ? "copied" : ""}"
+    aria-label="Copy command"
+    onClick=${(event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void navigator.clipboard.writeText(text).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      });
+    }}
+    dangerouslySetInnerHTML=${{ __html: COPY_ICON_SVG + CHECK_ICON_SVG }}
+  ></button>`;
+}
+
 // Shown in place of a `read` call's dumped file content: opens the file in
 // the current window's editor area instead. Filename-only (full path lives
 // in the `title` attribute as a hover) since the header above already shows
@@ -365,6 +390,7 @@ function ToolCardView({
         class="tool-card-status ${rejected ? "tool-card-status-rejected" : ""}"
         >${statusText}</span
       >
+      ${item.kind === "execute" ? html`<${ToolCopyButton} text=${item.title} />` : null}
     `}
   >
     <div class="tool-card-body">

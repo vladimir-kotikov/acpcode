@@ -397,6 +397,16 @@ code {
   white-space: nowrap;
 }
 
+.tool-card-copy-btn {
+  position: static;
+  flex-shrink: 0;
+}
+
+.tool-card-header:hover .tool-card-copy-btn,
+.tool-card-copy-btn:focus-visible {
+  opacity: 1;
+}
+
 .tool-card-status {
   color: var(--vscode-descriptionForeground);
   font-weight: 400;
