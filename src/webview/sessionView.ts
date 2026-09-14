@@ -85,6 +85,10 @@ function Root() {
     vscode.postMessage({ type: "permissionResponse", requestId, optionId });
   };
 
+  const onOpenFile = (path: string, line?: number): void => {
+    vscode.postMessage({ type: "openFile", path, line });
+  };
+
   return html`<${Transcript}
     state=${state}
     atBottomRef=${atBottomRef}
@@ -92,6 +96,7 @@ function Root() {
     onCancel=${() => vscode.postMessage({ type: "cancelPrompt" })}
     onRespond=${onRespond}
     onFork=${() => vscode.postMessage({ type: "forkSession" })}
+    onOpenFile=${onOpenFile}
     onDraftChange=${(text: string) => dispatch({ type: "draftChanged", text })}
   />`;
 }

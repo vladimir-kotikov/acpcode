@@ -441,6 +441,18 @@ code {
   font-style: italic;
 }
 
+.tool-file-link {
+  display: inline-block;
+  margin: var(--vscode-spacing-size40, 4px) 0;
+  color: var(--vscode-textLink-foreground);
+  font-size: var(--vscode-fontSize-body2, 0.85em);
+  text-decoration: none;
+}
+
+.tool-file-link:hover {
+  text-decoration: underline;
+}
+
 .diff-lines {
   margin: 2px 0;
   font-size: var(--vscode-fontSize-body2, 0.85em);

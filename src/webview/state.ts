@@ -77,6 +77,11 @@ export interface ToolItem {
   // than as a separate turn item so approval UI always renders right next to
   // the change it's asking about, not as a disconnected card elsewhere.
   pendingPermission?: PendingPermission;
+  // Derived from the update's `locations` (ACP's own "follow-along" field) —
+  // `line`/`endLine` span every entry sharing the first entry's path, since
+  // a ranged read (offset/limit) reports one `ToolCallLocation` per line
+  // covered rather than a single start/end pair.
+  location?: { path: string; line?: number; };
 }
 
 export type TurnItem = TextItem | ToolItem;
@@ -471,6 +476,25 @@ function appendText(
 // it leaves whatever the item already had untouched (a later tool_call_update
 // for the same call, e.g. status flipping to "completed", shouldn't erase a
 // still-pending — or already-resolved — permission record).
+function primaryLocation(
+  locations: ToolCallUpdate["locations"],
+): { path: string; line?: number; } | undefined {
+  const first = locations?.[0];
+  if (!first) {
+    return undefined;
+  }
+  const lineNumbers = (locations ?? [])
+    .filter(
+      (loc): loc is typeof loc & { line: number } =>
+        loc.path === first.path && loc.line != null,
+    )
+    .map(loc => loc.line);
+  return {
+    path: first.path,
+    line: lineNumbers.length ? Math.min(...lineNumbers) : undefined,
+  };
+}
+
 function upsertToolCall(
   blocks: Block[],
   update: {
@@ -479,6 +503,7 @@ function upsertToolCall(
     kind?: ToolKind | null;
     status?: string | null;
     content?: ToolCallUpdate["content"];
+    locations?: ToolCallUpdate["locations"];
   },
   pendingPermission?: PendingPermission,
 ): Block[] {
@@ -501,6 +526,7 @@ function upsertToolCall(
         status: update.status ?? tool.status,
         content: update.content ?? tool.content,
         pendingPermission: pendingPermission ?? tool.pendingPermission,
+        location: primaryLocation(update.locations) ?? tool.location,
       }),
     );
   }
@@ -513,6 +539,7 @@ function upsertToolCall(
     status: update.status ?? "pending",
     content: update.content,
     pendingPermission,
+    location: primaryLocation(update.locations),
   });
 }
 

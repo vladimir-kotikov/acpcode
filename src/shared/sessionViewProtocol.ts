@@ -77,4 +77,7 @@ export type SessionViewToHostMessage =
   | { type: "sendPrompt"; text: string }
   | { type: "cancelPrompt" }
   | { type: "permissionResponse"; requestId: string; optionId: string | null }
-  | { type: "forkSession" };
+  | { type: "forkSession" }
+  // A `read` tool card's file link — opens `path` in the current window's
+  // editor area rather than in the webview, which has no editor of its own.
+  | { type: "openFile"; path: string; line?: number };

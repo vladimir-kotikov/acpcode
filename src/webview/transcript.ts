@@ -290,12 +290,44 @@ function PendingPermissionView({
   `;
 }
 
+// Shown in place of a `read` call's dumped file content: opens the file in
+// the current window's editor area instead. Filename-only (full path lives
+// in the `title` attribute as a hover) since the header above already shows
+// the agent's own title for the call — repeating the full path here would
+// just be noise.
+function ToolFileLink({
+  location,
+  onOpenFile,
+}: {
+  location: { path: string; line?: number; endLine?: number };
+  onOpenFile: (path: string, line?: number, endLine?: number) => void;
+}) {
+  const fileName = location.path.split(/[\\/]/).pop() ?? location.path;
+  const label = location.endLine
+    ? `${fileName}:${location.line}-${location.endLine}`
+    : location.line
+      ? `${fileName}:${location.line}`
+      : fileName;
+  return html`<a
+    href="#"
+    class="tool-file-link"
+    title=${location.path}
+    onClick=${(event: MouseEvent) => {
+      event.preventDefault();
+      onOpenFile(location.path, location.line, location.endLine);
+    }}
+    >${label}</a
+  >`;
+}
+
 function ToolCardView({
   item,
   onRespond,
+  onOpenFile,
 }: {
   item: ToolItem;
   onRespond: (requestId: string, optionId: string) => void;
+  onOpenFile: (path: string, line?: number) => void;
 }) {
   // Collapsed by default, always — except a pending approval, which needs to
   // actually be visible (not hidden behind a card the user has to think to
@@ -336,7 +368,14 @@ function ToolCardView({
     `}
   >
     <div class="tool-card-body">
-      <${ToolCallContentView} content=${item.content} />
+      ${
+        item.kind === "read" && item.location
+          ? html`<${ToolFileLink}
+              location=${item.location}
+              onOpenFile=${onOpenFile}
+            />`
+          : html`<${ToolCallContentView} content=${item.content} />`
+      }
       ${
         pendingApproval
           ? html`<${PendingPermissionView}
@@ -363,9 +402,11 @@ const ThoughtCardView = ({ item }: { item: TextItem }) =>
 function TurnItemView({
   item,
   onRespond,
+  onOpenFile,
 }: {
   item: TurnItem;
   onRespond: (requestId: string, optionId: string) => void;
+  onOpenFile: (path: string, line?: number) => void;
 }) {
   if (item.type === "text") {
     if (item.role === "thought") {
@@ -379,7 +420,11 @@ function TurnItemView({
       debug=${item}
     />`;
   }
-  return html`<${ToolCardView} item=${item} onRespond=${onRespond} />`;
+  return html`<${ToolCardView}
+    item=${item}
+    onRespond=${onRespond}
+    onOpenFile=${onOpenFile}
+  />`;
 }
 
 // A tool/thought item is "foldable" (collapsed by default, eligible to join
@@ -436,9 +481,11 @@ function groupTurnItems(items: TurnItem[]): RenderGroup[] {
 const TurnBlockView = ({
   turn,
   onRespond,
+  onOpenFile,
 }: {
   turn: TurnBlock;
   onRespond: (requestId: string, optionId: string) => void;
+  onOpenFile: (path: string, line?: number) => void;
 }) =>
   groupTurnItems(turn.items).map(group => {
     if (group.kind === "standalone") {
@@ -446,6 +493,7 @@ const TurnBlockView = ({
         key=${group.item.id}
         item=${group.item}
         onRespond=${onRespond}
+        onOpenFile=${onOpenFile}
       />`;
     }
 
@@ -456,7 +504,7 @@ const TurnBlockView = ({
       summary=${html`<span class="tool-card-title">${groupTitle}</span>`}
     >
       <div class="tool-chain-body">
-        ${group.items.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} />`)}
+        ${group.items.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} onOpenFile=${onOpenFile} />`)}
       </div>
     <//>`;
   });
@@ -483,10 +531,12 @@ function BlocksView({
   blocks,
   onRespond,
   onFork,
+  onOpenFile,
 }: {
   blocks: Block[];
   onRespond: (requestId: string, optionId: string) => void;
   onFork: () => void;
+  onOpenFile: (path: string, line?: number) => void;
 }) {
   return blocks.map(block => {
     if (block.type === "note") {
@@ -508,6 +558,7 @@ function BlocksView({
       key=${block.id}
       turn=${block}
       onRespond=${onRespond}
+      onOpenFile=${onOpenFile}
     />`;
   });
 }
@@ -816,6 +867,7 @@ export function Transcript({
   onCancel,
   onRespond,
   onFork,
+  onOpenFile,
   onDraftChange,
 }: {
   state: ViewState;
@@ -824,6 +876,7 @@ export function Transcript({
   onCancel: () => void;
   onRespond: (requestId: string, optionId: string) => void;
   onFork: () => void;
+  onOpenFile: (path: string, line?: number) => void;
   onDraftChange: (text: string) => void;
 }) {
   const logRef = useRef<HTMLDivElement>(null);
@@ -914,6 +967,7 @@ export function Transcript({
                 blocks=${state.blocks}
                 onRespond=${onRespond}
                 onFork=${onFork}
+                onOpenFile=${onOpenFile}
               />
               ${
                 state.pendingSteerText !== undefined

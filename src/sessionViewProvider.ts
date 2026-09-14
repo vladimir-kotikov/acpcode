@@ -228,6 +228,7 @@ class SessionViewSession implements vscode.Disposable {
           this.respondToPermission(requestId, optionId),
         )
         .with({ type: "forkSession" }, this.forkSession)
+        .with({ type: "openFile" }, ({ path, line }) => this.openFile(path, line))
         .exhaustive(),
     );
     return this;
@@ -441,6 +442,37 @@ class SessionViewSession implements vscode.Disposable {
       return;
     }
     this.pool.get(this.current.agentName)?.cancelPrompt(this.current.sessionId);
+  }
+
+  /** A `read` tool card's file link — opens in the current window's active
+   *  editor group, same as clicking a file in the built-in chat view. No
+   *  `cwd`-relative resolution needed: ACP's `ToolCallLocation.path` is
+   *  already absolute. `endLine` beyond `line` selects the whole ranged-read
+   *  span instead of just placing the cursor at its start. */
+  private async openFile(
+    path: string,
+    line?: number,
+    endLine?: number,
+  ): Promise<void> {
+    try {
+      const doc = await vscode.workspace.openTextDocument(
+        vscode.Uri.file(path),
+      );
+      const editor = await vscode.window.showTextDocument(doc, {
+        preview: true,
+      });
+      if (line) {
+        const start = new vscode.Position(Math.max(0, line - 1), 0);
+        const end =
+          endLine && endLine > line
+            ? doc.lineAt(Math.min(endLine, doc.lineCount) - 1).range.end
+            : start;
+        editor.selection = new vscode.Selection(start, end);
+        editor.revealRange(new vscode.Range(start, end));
+      }
+    } catch (err) {
+      this.post({ type: "error", message: describeError(err) });
+    }
   }
 
   private respondToPermission(
