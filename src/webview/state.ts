@@ -81,7 +81,7 @@ export interface ToolItem {
   // `line`/`endLine` span every entry sharing the first entry's path, since
   // a ranged read (offset/limit) reports one `ToolCallLocation` per line
   // covered rather than a single start/end pair.
-  location?: { path: string; line?: number; };
+  location?: { path: string; line?: number };
 }
 
 export type TurnItem = TextItem | ToolItem;
@@ -478,7 +478,7 @@ function appendText(
 // still-pending — or already-resolved — permission record).
 function primaryLocation(
   locations: ToolCallUpdate["locations"],
-): { path: string; line?: number; } | undefined {
+): { path: string; line?: number } | undefined {
   const first = locations?.[0];
   if (!first) {
     return undefined;
@@ -486,7 +486,7 @@ function primaryLocation(
   const lineNumbers = (locations ?? [])
     .filter(
       (loc): loc is typeof loc & { line: number } =>
-        loc.path === first.path && loc.line != null,
+        loc.path === first.path && loc.line !== null && loc.line !== undefined,
     )
     .map(loc => loc.line);
   return {

@@ -228,7 +228,9 @@ class SessionViewSession implements vscode.Disposable {
           this.respondToPermission(requestId, optionId),
         )
         .with({ type: "forkSession" }, this.forkSession)
-        .with({ type: "openFile" }, ({ path, line }) => this.openFile(path, line))
+        .with({ type: "openFile" }, ({ path, line }) =>
+          this.openFile(path, line),
+        )
         .exhaustive(),
     );
     return this;

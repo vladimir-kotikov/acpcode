@@ -290,29 +290,27 @@ function PendingPermissionView({
   `;
 }
 
-/** Copy-to-clipboard for a shell tool card's command — reuses `.code-copy-btn`'s
- *  icon/hover styling (see `addCopyButton` above) but stays a plain flex item
- *  in the header row instead of an absolutely-positioned overlay, so it tracks
- *  the header's own top-right corner even once the title wraps to multiple
- *  lines. Lives inside a `<summary>`, so its click must be stopped from
- *  reaching the native toggle-on-click behavior that would otherwise
- *  collapse/expand the card. */
-function ToolCopyButton({ text }: { text: string }) {
+/** A shell tool call's full command, in the card body next to its output —
+ *  same `.code-block`/`.code-copy-btn` hover-reveal treatment as a markdown
+ *  fenced code block (see `addCopyButton` above), just built declaratively
+ *  since this renders straight from `item.title` instead of parsed HTML. */
+function ToolCommandPre({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
-  return html`<button
-    type="button"
-    class="code-copy-btn tool-card-copy-btn ${copied ? "copied" : ""}"
-    aria-label="Copy command"
-    onClick=${(event: MouseEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
-      void navigator.clipboard.writeText(text).then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1200);
-      });
-    }}
-    dangerouslySetInnerHTML=${{ __html: COPY_ICON_SVG + CHECK_ICON_SVG }}
-  ></button>`;
+  return html`<div class="code-block">
+    <pre class="tool-content-text">${text}</pre>
+    <button
+      type="button"
+      class="code-copy-btn ${copied ? "copied" : ""}"
+      aria-label="Copy command"
+      onClick=${() => {
+        void navigator.clipboard.writeText(text).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1200);
+        });
+      }}
+      dangerouslySetInnerHTML=${{ __html: COPY_ICON_SVG + CHECK_ICON_SVG }}
+    ></button>
+  </div>`;
 }
 
 // Shown in place of a `read` call's dumped file content: opens the file in
@@ -390,10 +388,10 @@ function ToolCardView({
         class="tool-card-status ${rejected ? "tool-card-status-rejected" : ""}"
         >${statusText}</span
       >
-      ${item.kind === "execute" ? html`<${ToolCopyButton} text=${item.title} />` : null}
     `}
   >
     <div class="tool-card-body">
+      ${item.kind === "execute" ? html`<${ToolCommandPre} text=${item.title} />` : null}
       ${
         item.kind === "read" && item.location
           ? html`<${ToolFileLink}
