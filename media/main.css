@@ -140,7 +140,6 @@ code {
     --vscode-chat-requestBubbleBackground,
     var(--vscode-badge-background)
   );
-  border: 1px solid var(--vscode-chat-requestBorder, transparent);
   color: var(--vscode-foreground);
 }
 
@@ -153,7 +152,6 @@ code {
 
 .bubble-agent {
   align-self: flex-start;
-  background: var(--vscode-editorWidget-background);
 }
 
 /* Nested inside a collapsible .thought-card (see .tool-card) rather than a
@@ -224,6 +222,10 @@ code {
       --vscode-textSeparator-foreground,
       var(--vscode-sideBarSectionHeader-border, currentColor)
     );
+}
+
+.markdown-body p:first-child {
+  margin-top: 0;
 }
 
 .markdown-body p:last-child {
@@ -336,10 +338,7 @@ code {
 }
 
 .tool-card {
-  border: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
-  border-radius: var(--vscode-cornerRadius-medium, 6px);
   overflow: hidden;
-  background: var(--vscode-editor-background);
   flex-shrink: 0;
 }
 
@@ -348,7 +347,6 @@ code {
   align-items: center;
   gap: var(--vscode-spacing-size60, 6px);
   padding: var(--vscode-spacing-size40, 4px) var(--vscode-spacing-size80, 8px);
-  background: var(--vscode-editorWidget-background);
   font-size: var(--vscode-fontSize-body2, 0.85em);
   font-weight: var(--vscode-fontWeight-semiBold, 600);
   cursor: pointer;
