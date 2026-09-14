@@ -138,12 +138,18 @@ function MarkdownBody({
  *  thought cards, and folded "Completed N steps" groups — the one part of
  *  each that isn't specific to what's inside.
  *
- *  `defaultOpen` has no reactive "open" prop to bind to — it's a one-time
- *  initial value, set imperatively so a later re-render (e.g. the status
- *  text updating) doesn't fight a user who's manually collapsed it back.
- *  Used to default the currently in-progress step of a live turn open, so
- *  there's visible progress instead of every step looking collapsed the
- *  instant it appears. */
+ *  `defaultOpen` forces the card open on the transition into `true`, but
+ *  never forces it closed again on the transition back to `false` — so a
+ *  user who's manually collapsed it back doesn't get fought on every
+ *  unrelated re-render (e.g. the status text updating). This only re-fires
+ *  on an actual `true`/`false` flip, not every render, which matters
+ *  because the item behind a tool card is a stable, in-place-updated
+ *  object: a card can mount standalone *before* its permission request
+ *  exists (`pendingApproval` false at mount, e.g. it has no foldable
+ *  siblings to be grouped with) and then have one attached later via the
+ *  same key/tree position — no remount, so a mount-only effect would never
+ *  see that transition and the card would stay collapsed with its prompt
+ *  hidden. */
 const CollapsibleCard = ({
   class: className = "",
   defaultOpen,
@@ -162,7 +168,7 @@ const CollapsibleCard = ({
     if (defaultOpen && ref.current) {
       ref.current.open = true;
     }
-  }, []);
+  }, [defaultOpen]);
   return html`
     <details class="tool-card ${className}" ref=${ref} title=${titleAttr}>
       <summary class="tool-card-header">${summary}</summary>
@@ -253,7 +259,11 @@ function ToolCallContentView({
 
 // Rendered inside a tool card's body, right below its diff/content, instead
 // of as a separate card elsewhere — the whole point is the user can see the
-// actual change next to the buttons approving it.
+// actual change next to the buttons approving it. Only ever mounted while
+// still unresolved — see ToolCardView's `pendingApproval` gate — so there's
+// no resolved/disabled state to render here anymore; once answered, the
+// chosen option's name takes over the header's status slot instead (see
+// `statusText` below).
 function PendingPermissionView({
   pendingPermission,
   onRespond,
@@ -261,16 +271,14 @@ function PendingPermissionView({
   pendingPermission: PendingPermission;
   onRespond: (requestId: string, optionId: string) => void;
 }) {
-  const resolved = pendingPermission.resolvedOptionId !== undefined;
   return html`
-    <div class="permission-card ${resolved ? "permission-resolved" : ""}">
+    <div class="permission-card">
       <div class="permission-buttons">
         ${pendingPermission.options.map(
           option => html`
             <button
               key=${option.optionId}
               class="permission-btn permission-${option.kind}"
-              disabled=${resolved}
               onClick=${() => onRespond(pendingPermission.requestId, option.optionId)}
             >
               ${option.name}
@@ -295,6 +303,20 @@ function ToolCardView({
   const pendingApproval =
     item.pendingPermission?.resolvedOptionId === undefined &&
     !!item.pendingPermission;
+  // Once a permission request is resolved to a known option, that option's
+  // own label (e.g. "Reject", "Always Allow") replaces the tool's own status
+  // text — more useful than whatever generic status the tool call itself
+  // carries (which a rejection may leave stuck at "pending"/"in_progress"
+  // forever, since the tool never actually ran). `resolvedOptionId: null`
+  // (resolved without knowing which option — see PendingPermission's own
+  // doc comment) has no option to name, so status text is left alone.
+  const resolvedOption = item.pendingPermission?.resolvedOptionId
+    ? item.pendingPermission.options.find(
+        option => option.optionId === item.pendingPermission?.resolvedOptionId,
+      )
+    : undefined;
+  const statusText = resolvedOption?.name ?? item.status;
+  const rejected = resolvedOption?.kind.startsWith("reject") ?? false;
   return html`<${CollapsibleCard}
     defaultOpen=${pendingApproval}
     titleAttr=${debugTitle(item)}
@@ -307,13 +329,16 @@ function ToolCardView({
           : null
       }
       <span class="tool-card-title">${item.title}</span>
-      <span class="tool-card-status">${item.status}</span>
+      <span
+        class="tool-card-status ${rejected ? "tool-card-status-rejected" : ""}"
+        >${statusText}</span
+      >
     `}
   >
     <div class="tool-card-body">
       <${ToolCallContentView} content=${item.content} />
       ${
-        item.pendingPermission
+        pendingApproval
           ? html`<${PendingPermissionView}
               pendingPermission=${item.pendingPermission}
               onRespond=${onRespond}
