@@ -7,7 +7,7 @@ import * as vscode from "vscode";
 export interface AgentConfig {
   name: string;
   kind: "claude" | "codex";
-  env: Record<string, string>;
+  env?: Record<string, string>;
 }
 
 function expandHome(value: string): string {
@@ -35,7 +35,7 @@ export async function saveAgents(agents: AgentConfig[]): Promise<void> {
  *  `~` in values the way a shell would (mirrors `CLAUDE_CONFIG_DIR=~/.claude-personal`). */
 export function agentEnv(agent: AgentConfig): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(agent.env)) {
+  for (const [key, value] of Object.entries(agent.env ?? {})) {
     env[key] = expandHome(value);
   }
   return env;
