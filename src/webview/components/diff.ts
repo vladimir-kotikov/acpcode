@@ -76,7 +76,7 @@ function windowDiffContext(
   return result;
 }
 
-export const DiffView = ({ oldText, newText }: DiffViewProps) => {
+export const Diff = ({ oldText, newText }: DiffViewProps) => {
   const lines = windowDiffContext(toDiffLines(oldText, newText));
   // No whitespace between <pre> and the mapped lines: <pre> preserves it
   // literally, and a stray indentation/newline text node here would show up
