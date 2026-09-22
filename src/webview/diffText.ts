@@ -1,17 +1,10 @@
 import { diffLines } from "diff";
-import { html } from "htm/preact";
 
 type DiffLineKind = "add" | "remove" | "context";
 
 interface DiffLine {
   text: string;
   kind: DiffLineKind;
-}
-
-interface DiffViewProps {
-  path: string;
-  oldText: string;
-  newText: string;
 }
 
 // Real diffs collapse long unchanged spans to a few lines of surrounding
@@ -76,20 +69,15 @@ function windowDiffContext(
   return result;
 }
 
-export const Diff = ({ oldText, newText }: DiffViewProps) => {
-  const lines = windowDiffContext(toDiffLines(oldText, newText));
-  // No whitespace between <pre> and the mapped lines: <pre> preserves it
-  // literally, and a stray indentation/newline text node here would show up
-  // as a visible blank line.
-  return html`<div class="tool-diff">
-    <pre class="diff-lines">
-      ${lines.map((line, index) =>
-        line.kind === "ellipsis"
-          ? html`<div class="diff-line diff-line-ellipsis" key=${index}>⋯</div>`
-          : html`<div class="diff-line diff-line-${line.kind}" key=${index}>
-              ${DIFF_LINE_PREFIX[line.kind]}${line.text}
-            </div>`,
-      )}
-  </pre>
-  </div>`;
-};
+/** Unified-diff *text* (the "+ "/"- "/"  " prefixes hljs's `diff` grammar
+ *  keys off), context-windowed like `git diff -U3` — not a component, just
+ * string-building, so it lives outside components/ and feeds straight into
+ *  PreBlock's `syntaxLanguage="diff"` wherever a diff needs rendering. */
+export const buildDiffText = (oldText: string, newText: string): string =>
+  windowDiffContext(toDiffLines(oldText, newText))
+    .map(line =>
+      line.kind === "ellipsis"
+        ? "..."
+        : `${DIFF_LINE_PREFIX[line.kind]}${line.text}`,
+    )
+    .join("\n");

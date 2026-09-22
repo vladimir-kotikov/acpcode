@@ -154,7 +154,7 @@ code {
   align-self: flex-start;
 }
 
-/* Nested inside a collapsible .thought-card (see .tool-card) rather than a
+/* Nested inside a collapsible .step-thought (see .step) rather than a
  * standalone bubble, so it gets no border/background of its own here. */
 .bubble-thought {
   font-style: italic;
@@ -194,7 +194,7 @@ code {
   word-break: break-word;
 }
 
-.system-note-error .permission-btn {
+.system-note-error .btn-secondary {
   margin-top: var(--vscode-spacing-size60, 6px);
 }
 
@@ -232,20 +232,24 @@ code {
   margin-bottom: 0;
 }
 
-.markdown-body pre {
+/* Shared by every boxed monospace block — a markdown fence (addCopyButton
+ * wraps it in .code-block below) and PreBlock's own copy-enabled <pre>
+ * (shell commands, diffs) alike, so there's one definition of "what a boxed
+ * code block looks like" instead of two that happen to agree by accident. */
+.markdown-body pre,
+.code-block pre {
   /* Fenced code blocks scroll horizontally instead of wrapping — matches the
    * native chat view and keeps indentation/alignment in code intact.
    * `margin: 0` because the default UA stylesheet's `pre { margin: 1em 0 }`
    * otherwise leaves a visible gap of the card's own background between
    * adjacent blocks (e.g. two short snippets back to back) — reads as a
-   * "striped" card. `.code-block` (added by addCopyButton, below) owns the
-   * actual spacing/border/background as the visual container; `max-width`
-   * is belt-and-suspenders against an unbreakable line forcing the bubble
-   * (and the page) wider instead of scrolling within this element.
-   * border-radius here is redundant with .code-block's own (they clip to
-   * the same rounding) except for the one frame between paint and
-   * addCopyButton's useEffect wrapping this <pre> — kept so that frame
-   * doesn't flash square corners. */
+   * "striped" card. `.code-block` owns the actual spacing/border/background
+   * as the visual container; `max-width` is belt-and-suspenders against an
+   * unbreakable line forcing the bubble (and the page) wider instead of
+   * scrolling within this element. border-radius here is redundant with
+   * .code-block's own (they clip to the same rounding) except for the one
+   * frame between paint and addCopyButton's useEffect wrapping a markdown
+   * <pre> — kept so that frame doesn't flash square corners. */
   white-space: pre;
   margin: 0;
   background: var(--vscode-textCodeBlock-background);
@@ -286,6 +290,14 @@ code {
    * stops its margin (already 0, but future-proofing) from collapsing
    * through into this box's own margin above. */
   overflow: hidden;
+}
+
+/* PreBlock's truncation toggle — the ellipsis (or "Show less" once
+ * expanded) is itself the click target, inline at the end of the text. */
+.pre-toggle {
+  cursor: pointer;
+  color: var(--vscode-textLink-foreground);
+  text-decoration: underline;
 }
 
 .code-copy-btn {
@@ -337,31 +349,38 @@ code {
   text-decoration: none;
 }
 
-.tool-card {
+/* .step is the outer element of every transcript step — a CollapsibleStep's
+ * <details>, or a StaticStep's single header div carrying both this and
+ * .step-header at once (see staticStep.ts's own comment on why it's one
+ * element, not a wrapper around a separate header). */
+.step {
   overflow: hidden;
   flex-shrink: 0;
 }
 
-.tool-card-header {
+.step-header {
+  position: relative; /* .step-title-link's stretched hit-area anchors against this */
   display: flex;
   align-items: center;
   gap: var(--vscode-spacing-size60, 6px);
   padding: var(--vscode-spacing-size40, 4px) var(--vscode-spacing-size80, 8px);
-  font-size: var(--vscode-fontSize-body2, 0.85em);
-  font-weight: var(--vscode-fontWeight-semiBold, 600);
   cursor: pointer;
   user-select: none;
 }
 
-.tool-card-header:hover {
+.step-header:hover {
   background: var(--vscode-list-hoverBackground);
 }
 
-.tool-card-header::-webkit-details-marker {
+.step-header::-webkit-details-marker {
   display: none;
 }
 
-.tool-card-header::before {
+/* Tag-qualified to a real <details>/<summary> pair: StaticStep shares
+ * .step/.step-header for the same look but is never a <details>, so both
+ * this and the dimming rule below no-op for it without needing an opt-out
+ * marker class — it simply never matches either selector. */
+details.step > summary.step-header::before {
   content: "";
   flex-shrink: 0;
   width: 0;
@@ -373,23 +392,36 @@ code {
   transition: transform 0.1s ease;
 }
 
-.tool-card[open] > .tool-card-header::before {
+details.step[open] > summary.step-header::before {
   transform: rotate(90deg);
 }
 
-.thought-card .tool-card-header {
-  font-style: italic;
-  font-weight: 400;
+/* A collapsed step's header dims to hint there's more hidden inside. */
+details.step:not([open]) > .step-header {
   color: var(--vscode-descriptionForeground);
 }
 
-.tool-card-kind {
-  flex-shrink: 0;
+.step-thought > .step-header {
+  font-style: italic;
+  font-weight: var(--vscode-fontWeight-regular, 400);
+  color: var(--vscode-descriptionForeground);
+}
+
+.step-kind,
+.step-status {
   color: var(--vscode-descriptionForeground);
   font-weight: var(--vscode-fontWeight-regular, 400);
 }
 
-.tool-card-title {
+.step-kind {
+  flex-shrink: 0;
+}
+
+.step-status {
+  white-space: nowrap;
+}
+
+.step-title {
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -397,25 +429,28 @@ code {
   white-space: nowrap;
 }
 
-.tool-card-status {
-  color: var(--vscode-descriptionForeground);
-  font-weight: 400;
-  white-space: nowrap;
+/* A real <a> (keyboard-focusable/activatable, unlike a div with an onClick)
+ * — dashed decoration marks it as a link without the fully-underlined look
+ * of an inline one. Its ::after is stretched to cover the whole header (see
+ * .step-header's position:relative above), so the entire row is clickable
+ * through this one real link rather than a synthetic handler on a
+ * non-interactive container. */
+.step-title-link {
+  text-decoration: underline dashed;
+  text-underline-offset: 2px;
 }
 
-.tool-card-body {
+.step-title-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.step-body {
   padding: var(--vscode-spacing-size40, 4px) var(--vscode-spacing-size80, 8px);
 }
 
-.tool-chain-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--vscode-spacing-size60, 6px);
-  padding: var(--vscode-spacing-size60, 6px);
-  border-top: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
-}
-
-.tool-card-body:empty::before {
+.step-body:empty::before {
   content: "No output";
   display: block;
   padding: 2px 0;
@@ -424,22 +459,22 @@ code {
   color: var(--vscode-descriptionForeground);
 }
 
-.tool-content-text,
-.tool-content-other {
+.step-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--vscode-spacing-size60, 6px);
+  padding: var(--vscode-spacing-size60, 6px);
+  padding-left: var(--vscode-spacing-size120, 12px);
+}
+
+.step-content-other {
   margin: var(--vscode-spacing-size40, 4px) 0;
   font-size: var(--vscode-fontSize-body2, 0.85em);
-}
-
-.tool-content-text {
-  white-space: pre-wrap;
-}
-
-.tool-content-other {
   color: var(--vscode-descriptionForeground);
   font-style: italic;
 }
 
-.tool-file-link {
+.step-file-link {
   display: inline-block;
   margin: var(--vscode-spacing-size40, 4px) 0;
   color: var(--vscode-textLink-foreground);
@@ -447,33 +482,8 @@ code {
   text-decoration: none;
 }
 
-.tool-file-link:hover {
+.step-file-link:hover {
   text-decoration: underline;
-}
-
-.diff-lines {
-  margin: 2px 0;
-  font-size: var(--vscode-fontSize-body2, 0.85em);
-  overflow-x: auto;
-}
-
-.diff-line {
-  white-space: pre;
-  padding: 0 4px;
-}
-
-.diff-line-add {
-  background: var(--vscode-diffEditor-insertedTextBackground);
-}
-
-.diff-line-remove {
-  background: var(--vscode-diffEditor-removedTextBackground);
-}
-
-.diff-line-ellipsis {
-  padding: 2px 4px;
-  color: var(--vscode-descriptionForeground);
-  font-style: italic;
 }
 
 .permission-card {
@@ -489,7 +499,10 @@ code {
   flex-wrap: wrap;
 }
 
-.permission-btn {
+/* Generic small secondary-styled button — the permission-response buttons,
+ * "Fork session", and PreBlock's "Show more"/"Show less" toggle all just
+ * want this look, not a permission-specific one. */
+.btn-secondary {
   border: none;
   border-radius: var(--vscode-cornerRadius-xSmall, 3px);
   padding: 3px var(--vscode-spacing-size80, 8px);
@@ -505,7 +518,7 @@ code {
   color: var(--vscode-button-foreground);
 }
 
-.permission-resolved .permission-btn {
+.permission-resolved .btn-secondary {
   opacity: 0.5;
   cursor: default;
 }

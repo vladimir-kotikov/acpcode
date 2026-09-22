@@ -10,418 +10,20 @@ import type {
   SessionConfigOption,
   SessionConfigSelectGroup,
   SessionConfigSelectOption,
-  ToolCallUpdate,
-  ToolKind,
   UsageUpdate,
 } from "@agentclientprotocol/sdk";
-import hljs from "highlight.js";
 import { html } from "htm/preact";
-import { marked } from "marked";
-import type { RefObject, VNode } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import type { RefObject } from "preact";
+import { useEffect, useRef } from "preact/hooks";
 import { match } from "ts-pattern";
-import { Composer, Diff } from "./components/index.ts";
 import {
-  Block,
-  NoteBlock,
-  PendingPermission,
-  TextItem,
-  textOf,
-  ToolItem,
-  TurnBlock,
-  TurnItem,
-  ViewState,
-} from "./state.ts";
-
-marked.setOptions({ breaks: true });
-
-// Shown as a fixed prefix on every tool-call card regardless of what title
-// text the agent sends — some agents (e.g. web search) replace their title
-// with just the query once known, dropping the tool name entirely otherwise.
-const TOOL_KIND_LABELS: Record<ToolKind, string> = {
-  read: "Read",
-  edit: "Edit",
-  delete: "Delete",
-  move: "Move",
-  search: "Search",
-  execute: "Run",
-  think: "Think",
-  fetch: "Fetch",
-  switch_mode: "Switch Mode",
-  other: "Tool",
-};
-
-// Some agents already fold the verb into the title (e.g. edit calls titled
-// "Edit package.json"); others don't (e.g. web search titled with just the
-// query). Only show the separate kind-label span when the title doesn't
-// already start with it, to avoid "Edit Edit package.json".
-const showsOwnKindLabel = (kind: ToolKind, title: string): boolean =>
-  title.toLowerCase().startsWith(TOOL_KIND_LABELS[kind].toLowerCase());
-
-// Static, trusted markup (not derived from any agent/user data) — safe to
-// assign via innerHTML.
-const COPY_ICON_SVG = `<svg class="icon-copy" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M3.5 10.5V3a1 1 0 0 1 1-1H11"/></svg>`;
-const CHECK_ICON_SVG = `<svg class="icon-check" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3 3 7-7"/></svg>`;
-
-/** Wraps a rendered fenced code block with a hover-revealed copy button,
- *  matching the native chat view's code-block toolbar (minus run/insert,
- *  which need editor access this read-only viewer doesn't have). */
-function addCopyButton(pre: HTMLPreElement): void {
-  const wrapper = document.createElement("div");
-  wrapper.className = "code-block";
-  pre.replaceWith(wrapper);
-  wrapper.append(pre);
-  const button = document.createElement("button");
-  button.className = "code-copy-btn";
-  button.type = "button";
-  button.setAttribute("aria-label", "Copy code");
-  button.innerHTML = COPY_ICON_SVG + CHECK_ICON_SVG;
-  button.addEventListener("click", () => {
-    void navigator.clipboard.writeText(pre.textContent ?? "").then(() => {
-      button.classList.add("copied");
-      setTimeout(() => {
-        button.classList.remove("copied");
-      }, 1200);
-    });
-  });
-  wrapper.append(button);
-}
-
-/** Renders markdown for agent, thought, and user text alike; re-parses the
- *  full accumulated text on
- *  every chunk rather than appending incrementally, since a streamed chunk
- *  boundary can land mid-markdown-construct (e.g. inside a ```` ``` ````
- *  fence). Safe against injected HTML because the page's CSP has no
- *  `unsafe-inline` in `script-src`, so any `<script>`/`onerror=` markup
- *  `marked` emits is inert. hljs/copy-button setup runs as a DOM side effect
- *  after each render since it must mutate real nodes the innerHTML produced,
- *  which Preact's diffing doesn't reach into. */
-// Debugging aid: JSON.stringify the underlying data behind a block/item into
-// its `title` attribute, so hovering it shows the raw update(s) that produced
-// it as a native tooltip. Cheap, zero extra UI, easy to strip out later.
-function debugTitle(data: unknown): string {
-  return JSON.stringify(data, null, 2);
-}
-
-function MarkdownBody({
-  text,
-  class: className,
-  debug,
-}: {
-  text: string;
-  class: string;
-  debug?: unknown;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const rendered = marked.parse(text, { async: false }) as string;
-  useEffect(() => {
-    const node = ref.current;
-    if (!node) {
-      return;
-    }
-    for (const codeEl of node.querySelectorAll<HTMLElement>("pre code")) {
-      hljs.highlightElement(codeEl);
-    }
-    for (const pre of node.querySelectorAll<HTMLPreElement>("pre")) {
-      addCopyButton(pre);
-    }
-  }, [rendered]);
-  return html`<div
-    class="markdown-body ${className}"
-    ref=${ref}
-    title=${debug !== undefined ? debugTitle(debug) : undefined}
-    dangerouslySetInnerHTML=${{ __html: rendered }}
-  ></div>`;
-}
-
-/** Shared `<details class="tool-card">`/`<summary>` scaffold for tool cards,
- *  thought cards, and folded "Completed N steps" groups — the one part of
- *  each that isn't specific to what's inside.
- *
- *  `defaultOpen` forces the card open on the transition into `true`, but
- *  never forces it closed again on the transition back to `false` — so a
- *  user who's manually collapsed it back doesn't get fought on every
- *  unrelated re-render (e.g. the status text updating). This only re-fires
- *  on an actual `true`/`false` flip, not every render, which matters
- *  because the item behind a tool card is a stable, in-place-updated
- *  object: a card can mount standalone *before* its permission request
- *  exists (`pendingApproval` false at mount, e.g. it has no foldable
- *  siblings to be grouped with) and then have one attached later via the
- *  same key/tree position — no remount, so a mount-only effect would never
- *  see that transition and the card would stay collapsed with its prompt
- *  hidden. */
-const CollapsibleCard = ({
-  class: className = "",
-  defaultOpen,
-  titleAttr,
-  summary,
-  children,
-}: {
-  class?: string;
-  defaultOpen?: boolean;
-  titleAttr?: string;
-  summary: VNode | string;
-  children: VNode | (VNode | null)[];
-}) => {
-  const ref = useRef<HTMLDetailsElement>(null);
-  useEffect(() => {
-    if (defaultOpen && ref.current) {
-      ref.current.open = true;
-    }
-  }, [defaultOpen]);
-  return html`
-    <details class="tool-card ${className}" ref=${ref} title=${titleAttr}>
-      <summary class="tool-card-header">${summary}</summary>
-      ${children}
-    </details>
-  `;
-};
-
-// Full tool output (a whole file's contents, a long command's stdout) can run
-// to thousands of lines — collapse past this many by default with a "Show
-// more" toggle, same idea as the tool card itself being collapsed.
-const TOOL_CONTENT_TRUNCATE_LINES = 20;
-
-function TruncatedPre({
-  text,
-  class: className,
-}: {
-  text: string;
-  class: string;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const lines = text.split("\n");
-  const isLong = lines.length > TOOL_CONTENT_TRUNCATE_LINES;
-  const shown =
-    expanded || !isLong
-      ? text
-      : lines.slice(0, TOOL_CONTENT_TRUNCATE_LINES).join("\n");
-  return html`
-    <div>
-      <pre class=${className}>${shown}${!expanded && isLong ? "\n…" : ""}</pre>
-      ${
-        isLong
-          ? html`<button
-              class="permission-btn"
-              onClick=${() => setExpanded(!expanded)}
-            >
-              ${expanded ? "Show less" : "Show more"}
-            </button>`
-          : null
-      }
-    </div>
-  `;
-}
-
-// Shell/execute output routinely arrives already wrapped by the agent in a
-// markdown fence (e.g. ```console ... ```), formatted for a markdown-rendering
-// client. We render tool content as plain text on purpose (raw output can
-// contain its own literal markdown-looking characters that shouldn't be
-// reinterpreted), so an outer fence just shows up as literal backticks
-// instead of being stripped the way a markdown renderer would. The <pre>
-// styling already conveys "this is code" — unwrap a well-formed wrapping
-// fence rather than displaying its markers.
-function stripCodeFence(text: string): string {
-  const match = /^```[^\n]*\n([\s\S]*?)\n?```\s*$/.exec(text.trim());
-  return match ? match[1] : text;
-}
-
-function ToolCallContentView({
-  content,
-}: {
-  content: ToolCallUpdate["content"];
-}) {
-  if (!content || content.length === 0) {
-    return null;
-  }
-  return content.map((item, index) => {
-    if (item.type === "content") {
-      return html`<${TruncatedPre}
-        key=${index}
-        text=${stripCodeFence(textOf(item.content))}
-        class="tool-content-text"
-      />`;
-    }
-    if (item.type === "diff") {
-      // No extra <details> fold here — the tool card itself is already the
-      // one collapse point, matching plain content (Read) rendering directly.
-      return html`<${Diff}
-        key=${index}
-        oldText=${item.oldText ?? ""}
-        newText=${item.newText}
-      />`;
-    }
-    return html`<div class="tool-content-other" key=${index}>
-      [terminal output]
-    </div>`;
-  });
-}
-
-// Rendered inside a tool card's body, right below its diff/content, instead
-// of as a separate card elsewhere — the whole point is the user can see the
-// actual change next to the buttons approving it. Only ever mounted while
-// still unresolved — see ToolCardView's `pendingApproval` gate — so there's
-// no resolved/disabled state to render here anymore; once answered, the
-// chosen option's name takes over the header's status slot instead (see
-// `statusText` below).
-function PendingPermissionView({
-  pendingPermission,
-  onRespond,
-}: {
-  pendingPermission: PendingPermission;
-  onRespond: (requestId: string, optionId: string) => void;
-}) {
-  return html`
-    <div class="permission-card">
-      <div class="permission-buttons">
-        ${pendingPermission.options.map(
-          option => html`
-            <button
-              key=${option.optionId}
-              class="permission-btn permission-${option.kind}"
-              onClick=${() => onRespond(pendingPermission.requestId, option.optionId)}
-            >
-              ${option.name}
-            </button>
-          `,
-        )}
-      </div>
-    </div>
-  `;
-}
-
-/** A shell tool call's full command, in the card body next to its output —
- *  same `.code-block`/`.code-copy-btn` hover-reveal treatment as a markdown
- *  fenced code block (see `addCopyButton` above), just built declaratively
- *  since this renders straight from `item.title` instead of parsed HTML. */
-function ToolCommandPre({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  return html`<div class="code-block">
-    <pre class="tool-content-text">${text}</pre>
-    <button
-      type="button"
-      class="code-copy-btn ${copied ? "copied" : ""}"
-      aria-label="Copy command"
-      onClick=${() => {
-        void navigator.clipboard.writeText(text).then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1200);
-        });
-      }}
-      dangerouslySetInnerHTML=${{ __html: COPY_ICON_SVG + CHECK_ICON_SVG }}
-    ></button>
-  </div>`;
-}
-
-// Shown in place of a `read` call's dumped file content: opens the file in
-// the current window's editor area instead. Filename-only (full path lives
-// in the `title` attribute as a hover) since the header above already shows
-// the agent's own title for the call — repeating the full path here would
-// just be noise.
-function ToolFileLink({
-  location,
-  onOpenFile,
-}: {
-  location: { path: string; line?: number; endLine?: number };
-  onOpenFile: (path: string, line?: number, endLine?: number) => void;
-}) {
-  const fileName = location.path.split(/[\\/]/).pop() ?? location.path;
-  const label = location.endLine
-    ? `${fileName}:${location.line}-${location.endLine}`
-    : location.line
-      ? `${fileName}:${location.line}`
-      : fileName;
-  return html`<a
-    href="#"
-    class="tool-file-link"
-    title=${location.path}
-    onClick=${(event: MouseEvent) => {
-      event.preventDefault();
-      onOpenFile(location.path, location.line, location.endLine);
-    }}
-    >${label}</a
-  >`;
-}
-
-function ToolCardView({
-  item,
-  onRespond,
-  onOpenFile,
-}: {
-  item: ToolItem;
-  onRespond: (requestId: string, optionId: string) => void;
-  onOpenFile: (path: string, line?: number) => void;
-}) {
-  // Collapsed by default, always — except a pending approval, which needs to
-  // actually be visible (not hidden behind a card the user has to think to
-  // expand) until it's resolved, at which point it collapses like any other.
-  const pendingApproval =
-    item.pendingPermission?.resolvedOptionId === undefined &&
-    !!item.pendingPermission;
-  // Once a permission request is resolved to a known option, that option's
-  // own label (e.g. "Reject", "Always Allow") replaces the tool's own status
-  // text — more useful than whatever generic status the tool call itself
-  // carries (which a rejection may leave stuck at "pending"/"in_progress"
-  // forever, since the tool never actually ran). `resolvedOptionId: null`
-  // (resolved without knowing which option — see PendingPermission's own
-  // doc comment) has no option to name, so status text is left alone.
-  const resolvedOption = item.pendingPermission?.resolvedOptionId
-    ? item.pendingPermission.options.find(
-        option => option.optionId === item.pendingPermission?.resolvedOptionId,
-      )
-    : undefined;
-  const statusText = resolvedOption?.name ?? item.status;
-  const rejected = resolvedOption?.kind.startsWith("reject") ?? false;
-  return html`<${CollapsibleCard}
-    defaultOpen=${pendingApproval}
-    titleAttr=${debugTitle(item)}
-    summary=${html`
-      ${
-        !showsOwnKindLabel(item.kind, item.title)
-          ? html`<span class="tool-card-kind"
-              >${TOOL_KIND_LABELS[item.kind]}</span
-            >`
-          : null
-      }
-      <span class="tool-card-title">${item.title}</span>
-      <span
-        class="tool-card-status ${rejected ? "tool-card-status-rejected" : ""}"
-        >${statusText}</span
-      >
-    `}
-  >
-    <div class="tool-card-body">
-      ${item.kind === "execute" ? html`<${ToolCommandPre} text=${item.title} />` : null}
-      ${
-        item.kind === "read" && item.location
-          ? html`<${ToolFileLink}
-              location=${item.location}
-              onOpenFile=${onOpenFile}
-            />`
-          : html`<${ToolCallContentView} content=${item.content} />`
-      }
-      ${
-        pendingApproval
-          ? html`<${PendingPermissionView}
-              pendingPermission=${item.pendingPermission}
-              onRespond=${onRespond}
-            />`
-          : null
-      }
-    </div>
-  <//>`;
-}
-
-// Reasoning/scratch output — collapsed by default like a tool call, never
-// forced open (thoughts don't need approval).
-const ThoughtCardView = ({ item }: { item: TextItem }) =>
-  html`<${CollapsibleCard}
-    class="thought-card"
-    titleAttr=${debugTitle(item)}
-    summary="Thought"
-  >
-    <${MarkdownBody} text=${item.text} class="bubble bubble-thought" />
-  <//>`;
+  CollapsibleStep,
+  Composer,
+  MarkdownBody,
+  ThoughtStep,
+  ToolStep,
+} from "./components/index.ts";
+import { Block, NoteBlock, TurnBlock, TurnItem, ViewState } from "./state.ts";
 
 function TurnItemView({
   item,
@@ -434,17 +36,16 @@ function TurnItemView({
 }) {
   if (item.type === "text") {
     if (item.role === "thought") {
-      return html`<${ThoughtCardView} item=${item} />`;
+      return html`<${ThoughtStep} item=${item} />`;
     }
     // The agent's own reply text — never collapsed, never folded into a
     // "Completed N steps" group, regardless of its position in the turn.
     return html`<${MarkdownBody}
       text=${item.text}
       class="bubble bubble-agent"
-      debug=${item}
     />`;
   }
-  return html`<${ToolCardView}
+  return html`<${ToolStep}
     item=${item}
     onRespond=${onRespond}
     onOpenFile=${onOpenFile}
@@ -522,12 +123,12 @@ const TurnBlockView = ({
     }
 
     const groupTitle = `Completed ${group.items.length} step${group.items.length === 1 ? "" : "s"}`;
-    return html`<${CollapsibleCard}
-      class="tool-chain"
+    return html`<${CollapsibleStep}
+      class="step-group"
       key="${group.items[0].id}-fold"
-      summary=${html`<span class="tool-card-title">${groupTitle}</span>`}
+      header=${html`<span class="step-title">${groupTitle}</span>`}
     >
-      <div class="tool-chain-body">
+      <div class="step-group-body">
         ${group.items.map(item => html`<${TurnItemView} key=${item.id} item=${item} onRespond=${onRespond} onOpenFile=${onOpenFile} />`)}
       </div>
     <//>`;
@@ -535,14 +136,11 @@ const TurnBlockView = ({
 
 function NoteView({ block, onFork }: { block: NoteBlock; onFork: () => void }) {
   return html`
-    <div
-      class=${block.kind === "error" ? "system-note-error" : "system-note"}
-      title=${debugTitle(block)}
-    >
+    <div class=${block.kind === "error" ? "system-note-error" : "system-note"}>
       <div>${block.text}</div>
       ${
         block.forkable
-          ? html`<button class="permission-btn" onClick=${onFork}>
+          ? html`<button class="btn-secondary" onClick=${onFork}>
               Fork session
             </button>`
           : null
@@ -578,7 +176,6 @@ const BlocksView = ({
             key=${block.id}
             text=${block.text}
             class="bubble bubble-user"
-            debug=${block}
           />`,
       )
       .with(
