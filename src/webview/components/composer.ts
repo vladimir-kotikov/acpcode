@@ -212,6 +212,29 @@ export const Composer = ({
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [dismissed, setDismissed] = useState(false);
 
+  // Shell-style history recall (Up/Down): sourced straight from the
+  // transcript's own user blocks rather than a separately tracked list, so
+  // it can't drift from what was actually sent. `historyIndex` undefined
+  // means "not currently recalling" — `pendingDraft` is whatever was being
+  // typed right before the first ArrowUp, restored once Down walks back past
+  // the newest entry.
+  const promptHistory = state.blocks.flatMap(block =>
+    block.type === "user" ? [block.text] : [],
+  );
+  const [historyIndex, setHistoryIndex] = useState<number | undefined>(
+    undefined,
+  );
+  const [pendingDraft, setPendingDraft] = useState<string | undefined>(
+    undefined,
+  );
+  // A session switch invalidates both: `promptHistory` is now a different
+  // list entirely, and any `pendingDraft` belonged to the old session's
+  // composer.
+  useEffect(() => {
+    setHistoryIndex(undefined);
+    setPendingDraft(undefined);
+  }, [state.meta?.sessionId]);
+
   // <textarea> has no reactive "grow with content" CSS in this Chromium
   // build — recompute height from scrollHeight on every text change instead;
   // main.css caps it with max-height + overflow-y so it scrolls internally
@@ -253,11 +276,54 @@ export const Composer = ({
       return;
     }
     onSend(trimmed);
+    setHistoryIndex(undefined);
+    setPendingDraft(undefined);
   }
 
   function selectCommand(command: AvailableCommand): void {
     onDraftChange(`/${command.name} `);
     textareaRef.current?.focus();
+  }
+
+  // ArrowUp/Down walk `promptHistory` like a shell. Up only *starts* recall
+  // when the caret sits at the very beginning — anywhere else it's ordinary
+  // cursor movement (e.g. up a line in a multi-line draft); once recall is
+  // underway, further Up/Down ignores caret position, same simplification
+  // most chat composers make. Down past the newest entry restores whatever
+  // was being typed before Up was first pressed.
+  function recallHistory(direction: "older" | "newer"): boolean {
+    if (direction === "older") {
+      if (historyIndex === undefined) {
+        const el = textareaRef.current;
+        const atStart =
+          !!el && el.selectionStart === 0 && el.selectionEnd === 0;
+        if (!atStart || promptHistory.length === 0) {
+          return false;
+        }
+        setPendingDraft(state.draftText);
+        const nextIndex = promptHistory.length - 1;
+        setHistoryIndex(nextIndex);
+        onDraftChange(promptHistory[nextIndex]);
+        return true;
+      }
+      const nextIndex = Math.max(0, historyIndex - 1);
+      setHistoryIndex(nextIndex);
+      onDraftChange(promptHistory[nextIndex]);
+      return true;
+    }
+    if (historyIndex === undefined) {
+      return false;
+    }
+    const nextIndex = historyIndex + 1;
+    if (nextIndex >= promptHistory.length) {
+      setHistoryIndex(undefined);
+      onDraftChange(pendingDraft ?? "");
+      setPendingDraft(undefined);
+    } else {
+      setHistoryIndex(nextIndex);
+      onDraftChange(promptHistory[nextIndex]);
+    }
+    return true;
   }
 
   return html`
@@ -278,7 +344,13 @@ export const Composer = ({
         placeholder="Message…"
         disabled=${disabled || steeringBlocked}
         value=${state.draftText}
-        onInput=${(event: Event) => onDraftChange((event.target as HTMLTextAreaElement).value)}
+        onInput=${(event: Event) => {
+          onDraftChange((event.target as HTMLTextAreaElement).value);
+          // Real typing, not our own recall — leaves the recalled slot
+          // behind instead of letting a later Up/Down resume from it.
+          setHistoryIndex(undefined);
+          setPendingDraft(undefined);
+        }}
         onKeyDown=${(event: KeyboardEvent) => {
           if (suggestions.length > 0) {
             if (event.key === "ArrowDown") {
@@ -306,6 +378,14 @@ export const Composer = ({
               setDismissed(true);
               return;
             }
+          }
+          if (event.key === "ArrowUp" && recallHistory("older")) {
+            event.preventDefault();
+            return;
+          }
+          if (event.key === "ArrowDown" && recallHistory("newer")) {
+            event.preventDefault();
+            return;
           }
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
