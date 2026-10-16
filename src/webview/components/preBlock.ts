@@ -3,14 +3,15 @@ import { html } from "htm/preact";
 import { useState } from "preact/hooks";
 
 // Static, trusted markup (not derived from any agent/user data) — safe to
-// assign via innerHTML.
-const COPY_ICON_SVG = `<svg class="icon-copy" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M3.5 10.5V3a1 1 0 0 1 1-1H11"/></svg>`;
-const CHECK_ICON_SVG = `<svg class="icon-check" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3 3 7-7"/></svg>`;
+// assign via innerHTML. Exported since MarkdownBody's own copy button (for
+// fenced code blocks inside rendered markdown) needs the exact same icons.
+export const COPY_ICON_SVG = `<svg class="icon-copy" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M3.5 10.5V3a1 1 0 0 1 1-1H11"/></svg>`;
+export const CHECK_ICON_SVG = `<svg class="icon-check" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3 3 7-7"/></svg>`;
 
 // Collapse past this many lines by default, with a "Show more" toggle — full
 // tool output (a whole file's contents, a long command's stdout, a big
 // diff) can run to thousands of lines.
-export const PRE_BLOCK_TRUNCATE_LINES = 20;
+const PRE_BLOCK_TRUNCATE_LINES = 20;
 
 const CopyButton = ({ content }: { content: string }) => {
   const [copied, setCopied] = useState(false);

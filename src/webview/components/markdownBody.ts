@@ -2,13 +2,9 @@ import hljs from "highlight.js";
 import { html } from "htm/preact";
 import { marked } from "marked";
 import { useEffect, useMemo, useRef } from "preact/hooks";
+import { CHECK_ICON_SVG, COPY_ICON_SVG } from "./preBlock.ts";
 
 marked.setOptions({ breaks: true });
-
-// Static, trusted markup (not derived from any agent/user data) — safe to
-// assign via innerHTML.
-const COPY_ICON_SVG = `<svg class="icon-copy" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M3.5 10.5V3a1 1 0 0 1 1-1H11"/></svg>`;
-const CHECK_ICON_SVG = `<svg class="icon-check" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3 3 7-7"/></svg>`;
 
 /** Wraps a rendered fenced code block with a hover-revealed copy button,
  *  matching the native chat view's code-block toolbar (minus run/insert,
