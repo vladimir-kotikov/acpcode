@@ -231,6 +231,9 @@ class SessionViewSession implements vscode.Disposable {
         .with({ type: "openFile" }, ({ path, line }) =>
           this.openFile(path, line),
         )
+        .with({ type: "setConfigOption" }, ({ configId, value }) =>
+          this.setConfigOption(configId, value),
+        )
         .exhaustive(),
     );
     return this;
@@ -499,6 +502,37 @@ class SessionViewSession implements vscode.Disposable {
     this.pool
       .get(this.current.agentName)
       ?.resolvePermission(requestId, optionId);
+  }
+
+  /** A chip in the composer (model/effort/mode) was changed. The response
+   *  carries the full, current `configOptions` list — folded into the buffer
+   *  and posted as a synthetic `config_option_update`, same trick
+   *  `attachSession` uses for `loadSession`'s response, so every view shares
+   *  one code path for "where configOptions in state come from." */
+  private async setConfigOption(
+    configId: string,
+    value: string | boolean,
+  ): Promise<void> {
+    const target = this.current;
+    const client = target && this.pool.get(target.agentName);
+    if (!target || !client) {
+      return;
+    }
+    try {
+      const configOptions = await client.setConfigOption(
+        target.sessionId,
+        configId,
+        value,
+      );
+      const update: SessionUpdate = {
+        sessionUpdate: "config_option_update",
+        configOptions,
+      };
+      this.buffer.push(update);
+      this.post({ type: "update", sessionId: target.sessionId, update });
+    } catch (err) {
+      this.post({ type: "error", message: describeError(err) });
+    }
   }
 
   /** Sent on every `"ready"` — both the true first load and a reconnect

@@ -56,9 +56,9 @@ code {
   word-break: break-word;
 }
 
-/* Model/effort/context-usage strip — a second, muted line under the plain
- * title, only rendered once there's at least one of those to show (see
- * SessionStats in transcript.ts). */
+/* Context-usage strip — a second, muted line under the plain title, only
+ * rendered once there's usage to show (see SessionStats in transcript.ts).
+ * Model/effort chips now live in the composer instead (see .config-chip). */
 .session-stats {
   display: flex;
   align-items: center;
@@ -526,17 +526,63 @@ details.step:not([open]) > .step-header {
 .input-bar {
   position: relative;
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: var(--vscode-spacing-size60, 6px);
   padding: var(--vscode-spacing-size80, 8px);
   border-top: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
 }
 
+/* Second row of the input bar: model/effort chips on the left, send/stop on
+ * the right — mirrors VS Code's own chat view composer toolbar. */
+.input-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--vscode-spacing-size60, 6px);
+}
+
+.config-chips {
+  display: flex;
+  align-items: center;
+  gap: var(--vscode-spacing-size40, 4px);
+  flex-wrap: wrap;
+}
+
+.config-chip-wrap {
+  position: relative;
+}
+
+.config-chip {
+  background: none;
+  border: none;
+  color: var(--vscode-descriptionForeground);
+  font: inherit;
+  font-size: var(--vscode-fontSize-body2, 0.85em);
+  padding: var(--vscode-spacing-size20, 2px) var(--vscode-spacing-size40, 4px);
+  border-radius: var(--vscode-cornerRadius-xSmall, 3px);
+  cursor: pointer;
+}
+
+.config-chip:hover {
+  background: var(
+    --vscode-toolbar-hoverBackground,
+    var(--vscode-list-hoverBackground)
+  );
+  color: var(--vscode-foreground);
+}
+
+.config-chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Dropdown panel shared by the composer's "/" command menu and its
+ * model/effort/mode chips — same floating-above-the-input shape, just a
+ * different anchor width and stacking context. */
+.config-chip-menu,
 .slash-menu {
   position: absolute;
   bottom: 100%;
-  left: var(--vscode-spacing-size80, 8px);
-  right: var(--vscode-spacing-size80, 8px);
   margin-bottom: var(--vscode-spacing-size40, 4px);
   max-height: 240px;
   overflow-y: auto;
@@ -552,10 +598,21 @@ details.step:not([open]) > .step-header {
   box-shadow: 0 -2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.2));
 }
 
+.config-chip-menu {
+  left: 0;
+  min-width: 160px;
+  /* Sits above the toolbar row's own stacking context (the send button),
+   * unlike .slash-menu which has no sibling to lose to at its z-index. */
+  z-index: 1;
+}
+
+.slash-menu {
+  left: var(--vscode-spacing-size80, 8px);
+  right: var(--vscode-spacing-size80, 8px);
+}
+
+.config-chip-menu-item,
 .slash-menu-item {
-  display: flex;
-  align-items: baseline;
-  gap: var(--vscode-spacing-size80, 8px);
   padding: var(--vscode-spacing-size40, 4px) var(--vscode-spacing-size80, 8px);
   background: none;
   border: none;
@@ -565,9 +622,21 @@ details.step:not([open]) > .step-header {
   font: inherit;
 }
 
+.config-chip-menu-item:hover,
+.config-chip-menu-item-selected,
 .slash-menu-item:hover,
 .slash-menu-item-selected {
   background: var(--vscode-list-hoverBackground);
+}
+
+.config-chip-menu-item {
+  white-space: nowrap;
+}
+
+.slash-menu-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--vscode-spacing-size80, 8px);
 }
 
 .slash-menu-name {
@@ -584,7 +653,6 @@ details.step:not([open]) > .step-header {
 }
 
 .prompt-input {
-  flex: 1;
   resize: none;
   background: var(--vscode-input-background);
   color: var(--vscode-input-foreground);

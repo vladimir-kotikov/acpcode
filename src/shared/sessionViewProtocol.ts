@@ -82,6 +82,9 @@ export type SessionViewToHostMessage =
   | { type: "cancelPrompt" }
   | { type: "permissionResponse"; requestId: string; optionId: string | null }
   | { type: "forkSession" }
+  // The user picked a different value for a model/effort/mode selector chip
+  // in the composer — see Composer's ConfigChip and AgentClient.setConfigOption.
+  | { type: "setConfigOption"; configId: string; value: string | boolean }
   // A `read` tool card's file link — opens `path` in the current window's
   // editor area rather than in the webview, which has no editor of its own.
   | { type: "openFile"; path: string; line?: number };

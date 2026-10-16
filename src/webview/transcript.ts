@@ -6,12 +6,7 @@
 // earlier item is folded into a collapsible "Completed N steps in Ys"
 // wrapper. Browser-side only — no vscode (extension host) imports.
 
-import type {
-  SessionConfigOption,
-  SessionConfigSelectGroup,
-  SessionConfigSelectOption,
-  UsageUpdate,
-} from "@agentclientprotocol/sdk";
+import type { UsageUpdate } from "@agentclientprotocol/sdk";
 import { html } from "htm/preact";
 import type { RefObject } from "preact";
 import { useEffect, useRef } from "preact/hooks";
@@ -191,38 +186,6 @@ const BlocksView = ({
       .exhaustive(),
   );
 
-const findConfigOption = (
-  configOptions: SessionConfigOption[],
-  category: string,
-): SessionConfigOption | undefined =>
-  configOptions.find(option => option.category === category);
-
-// `options` is a flat list OR a list of groups (e.g. models grouped by
-// provider) — never a mix of both at once, but never a mix of item shapes
-// within a list either, so a single "does the first entry look like a group"
-// check is enough to flatten it into one lookup table.
-function flattenSelectOptions(
-  options: SessionConfigSelectOption[] | SessionConfigSelectGroup[],
-): SessionConfigSelectOption[] {
-  return options.some(
-    (entry): entry is SessionConfigSelectGroup => "options" in entry,
-  )
-    ? (options as SessionConfigSelectGroup[]).flatMap(group => group.options)
-    : (options as SessionConfigSelectOption[]);
-}
-
-// A boolean-typed config option (an on/off toggle) has no `options` list to
-// resolve a label from — only "select" options (model, effort, mode) are
-// ever worth a stats-strip entry.
-function selectedOptionLabel(option: SessionConfigOption): string | undefined {
-  if (option.type !== "select") {
-    return undefined;
-  }
-  return flattenSelectOptions(option.options).find(
-    o => o.value === option.currentValue,
-  )?.name;
-}
-
 // Traffic-light coloring so a session nearing its context limit (and thus
 // due for auto-compaction) stands out before it happens — thresholds match
 // no specific documented bridge behavior, just a conservative heads-up.
@@ -250,24 +213,18 @@ function UsageMeter({ usage }: { usage: UsageUpdate }) {
   `;
 }
 
-// Model + effort level (Claude's "thought_level" config option) plus context
-// usage, all sourced from ACP session updates that already flow through the
-// generic update pipeline — see state.ts's extractConfigOptions/extractUsage.
-// Renders nothing for an agent that never sends any of these (e.g. codex-acp,
-// which may not expose config options or usage_update at all).
+// Context usage, sourced from ACP session updates that already flow through
+// the generic update pipeline — see state.ts's extractUsage. Model/effort
+// moved to the composer's own chips (see Composer's ConfigChip), where
+// they're controllable rather than just displayed. Renders nothing for an
+// agent that never sends usage_update at all (e.g. codex-acp).
 function SessionStats({ state }: { state: ViewState }) {
-  const model = findConfigOption(state.configOptions, "model");
-  const effort = findConfigOption(state.configOptions, "thought_level");
-  const modelLabel = model && selectedOptionLabel(model);
-  const effortLabel = effort && selectedOptionLabel(effort);
-  if (!modelLabel && !effortLabel && !state.usage) {
+  if (!state.usage) {
     return null;
   }
   return html`
     <div class="session-stats">
-      ${modelLabel ? html`<span>${modelLabel}</span>` : null}
-      ${effortLabel ? html`<span>${effortLabel}</span>` : null}
-      ${state.usage ? html`<${UsageMeter} usage=${state.usage} />` : null}
+      <${UsageMeter} usage=${state.usage} />
     </div>
   `;
 }
@@ -281,6 +238,7 @@ interface TranscriptProps {
   onFork: () => void;
   onOpenFile: (path: string, line?: number) => void;
   onDraftChange: (text: string) => void;
+  onSetConfigOption: (configId: string, value: string | boolean) => void;
 }
 
 export function Transcript({
@@ -292,6 +250,7 @@ export function Transcript({
   onFork,
   onOpenFile,
   onDraftChange,
+  onSetConfigOption,
 }: TranscriptProps) {
   const logRef = useRef<HTMLDivElement>(null);
   // Whether the user was scrolled at/near the bottom, tracked continuously by
@@ -401,6 +360,7 @@ export function Transcript({
       onSend=${onSend}
       onCancel=${onCancel}
       onDraftChange=${onDraftChange}
+      onSetConfigOption=${onSetConfigOption}
     />
   `;
 }

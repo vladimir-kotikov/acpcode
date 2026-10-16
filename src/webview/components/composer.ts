@@ -1,7 +1,127 @@
-import { AvailableCommand } from "@agentclientprotocol/sdk";
+import {
+  AvailableCommand,
+  SessionConfigOption,
+  SessionConfigSelectGroup,
+  SessionConfigSelectOption,
+} from "@agentclientprotocol/sdk";
 import { html } from "htm/preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { ViewState } from "../state.ts";
+
+// Which config options get a chip, in the order they're shown. "mode" is the
+// session permission/approval mode (claude-agent-acp's "Ask Before Edits"
+// equivalent) — leftmost, matching where VS Code's own chat composer puts it.
+// Deliberately a fixed list rather than "every option the agent sends": the
+// agent also exposes `model_config` ones (Fast mode, Agent) that would crowd
+// the row, and boolean options have no value list for ConfigChip to show.
+const CHIP_CATEGORIES = ["mode", "model", "thought_level"];
+
+const findConfigOption = (
+  configOptions: SessionConfigOption[],
+  category: string,
+): SessionConfigOption | undefined =>
+  configOptions.find(option => option.category === category);
+
+// `options` is a flat list OR a list of groups (e.g. models grouped by
+// provider) — never a mix of both at once, but never a mix of item shapes
+// within a list either, so a single "does the first entry look like a group"
+// check is enough to flatten it into one lookup table.
+function flattenSelectOptions(
+  options: SessionConfigSelectOption[] | SessionConfigSelectGroup[],
+): SessionConfigSelectOption[] {
+  return options.some(
+    (entry): entry is SessionConfigSelectGroup => "options" in entry,
+  )
+    ? (options as SessionConfigSelectGroup[]).flatMap(group => group.options)
+    : (options as SessionConfigSelectOption[]);
+}
+
+function selectedOptionLabel(option: SessionConfigOption): string {
+  if (option.type !== "select") {
+    return option.name;
+  }
+  return (
+    flattenSelectOptions(option.options).find(
+      o => o.value === option.currentValue,
+    )?.name ?? option.name
+  );
+}
+
+// A chip for one select-type config option (see CHIP_CATEGORIES) — click to
+// open a dropdown of its possible values, matching VS Code's own chat view
+// model/mode picker. Boolean-typed options have no value list to pick from,
+// so they're not worth a chip here.
+interface ConfigChipProps {
+  option: SessionConfigOption;
+  disabled: boolean;
+  onSelect: (configId: string, value: string) => void;
+}
+
+function ConfigChip({ option, disabled, onSelect }: ConfigChipProps) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  // Closes on any click outside the chip — without this, picking a model
+  // then clicking into the textarea to type would leave the dropdown
+  // floating over the composer.
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const onDocMouseDown = (event: MouseEvent) => {
+      if (!wrapRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, [open]);
+
+  if (option.type !== "select") {
+    return null;
+  }
+  const values = flattenSelectOptions(option.options);
+
+  return html`
+    <div class="config-chip-wrap" ref=${wrapRef}>
+      <button
+        type="button"
+        class="config-chip"
+        disabled=${disabled}
+        onClick=${() => setOpen(o => !o)}
+      >
+        ${selectedOptionLabel(option)}
+      </button>
+      ${
+        open
+          ? html`<div class="config-chip-menu">
+              ${values.map(
+                value => html`
+                  <button
+                    key=${value.value}
+                    type="button"
+                    class="config-chip-menu-item ${
+                      value.value === option.currentValue
+                        ? "config-chip-menu-item-selected"
+                        : ""
+                    }"
+                    onClick=${() => {
+                      setOpen(false);
+                      if (value.value !== option.currentValue) {
+                        onSelect(option.id, value.value);
+                      }
+                    }}
+                  >
+                    ${value.name}
+                  </button>
+                `,
+              )}
+            </div>`
+          : null
+      }
+    </div>
+  `;
+}
 
 // Only while the whole message is still just "/" + a bare command name (no
 // space yet) — once a space appears the user's typing the command's
@@ -69,6 +189,7 @@ interface ComposerProps {
   onSend: (text: string) => void;
   onCancel: () => void;
   onDraftChange: (text: string) => void;
+  onSetConfigOption: (configId: string, value: string | boolean) => void;
 }
 
 export const Composer = ({
@@ -76,8 +197,12 @@ export const Composer = ({
   onSend,
   onCancel,
   onDraftChange,
+  onSetConfigOption,
 }: ComposerProps) => {
   const disabled = !state.meta;
+  const chipOptions = CHIP_CATEGORIES.map(category =>
+    findConfigOption(state.configOptions, category),
+  ).filter((option): option is SessionConfigOption => option !== undefined);
   // Sending mid-turn ("steering") only works when the connected agent
   // implements `_session/steering` — without it, a second `session/prompt`
   // would interrupt the running turn instead of injecting into it, so fall
@@ -188,23 +313,36 @@ export const Composer = ({
           }
         }}
       ></textarea>
-      ${(() => {
-        // One button instead of two: while busy, it's "Send" (steering)
-        // whenever there's actually something typed to inject, otherwise
-        // there's nothing useful Send could do — "Stop" is the only
-        // meaningful action, so that's what takes over the slot.
-        const canSend =
-          !disabled && !steeringBlocked && !!state.draftText.trim();
-        const showStop = state.busy && !canSend;
-        return html`<button
-          class="send-btn ${showStop ? "cancel-btn" : ""}"
-          disabled=${!showStop && !canSend}
-          onClick=${() => (showStop ? onCancel() : submit())}
-        >
-          ${showStop ? html`<${StopIcon} />` : html`<${SendIcon} />`}
-          ${showStop ? "Stop" : "Send"}
-        </button>`;
-      })()}
+      <div class="input-toolbar">
+        <div class="config-chips">
+          ${chipOptions.map(
+            option =>
+              html`<${ConfigChip}
+                key=${option.id}
+                option=${option}
+                disabled=${disabled}
+                onSelect=${onSetConfigOption}
+              />`,
+          )}
+        </div>
+        ${(() => {
+          // One button instead of two: while busy, it's "Send" (steering)
+          // whenever there's actually something typed to inject, otherwise
+          // there's nothing useful Send could do — "Stop" is the only
+          // meaningful action, so that's what takes over the slot.
+          const canSend =
+            !disabled && !steeringBlocked && !!state.draftText.trim();
+          const showStop = state.busy && !canSend;
+          return html`<button
+            class="send-btn ${showStop ? "cancel-btn" : ""}"
+            disabled=${!showStop && !canSend}
+            onClick=${() => (showStop ? onCancel() : submit())}
+          >
+            ${showStop ? html`<${StopIcon} />` : html`<${SendIcon} />`}
+            ${showStop ? "Stop" : "Send"}
+          </button>`;
+        })()}
+      </div>
     </div>
   `;
 };

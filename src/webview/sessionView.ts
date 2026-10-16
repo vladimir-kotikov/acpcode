@@ -90,6 +90,13 @@ function Root() {
     vscode.postMessage({ type: "openFile", path, line });
   };
 
+  const onSetConfigOption = (
+    configId: string,
+    value: string | boolean,
+  ): void => {
+    vscode.postMessage({ type: "setConfigOption", configId, value });
+  };
+
   return html`<${Transcript}
     state=${state}
     atBottomRef=${atBottomRef}
@@ -99,6 +106,7 @@ function Root() {
     onFork=${() => vscode.postMessage({ type: "forkSession" })}
     onOpenFile=${onOpenFile}
     onDraftChange=${(text: string) => dispatch({ type: "draftChanged", text })}
+    onSetConfigOption=${onSetConfigOption}
   />`;
 }
 
