@@ -54,6 +54,7 @@ function Root() {
           .with({ type: "replayBatch" }, message => message)
           .with({ type: "error" }, message => message)
           .with({ type: "promptStopped" }, message => message)
+          .with({ type: "reset" }, message => message)
           .with({ type: "permissionRequest" }, message => message)
           .with({ type: "permissionResolved" }, message => message)
           .with({ type: "closed" }, message => message)

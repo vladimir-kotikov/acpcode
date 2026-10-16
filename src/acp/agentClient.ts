@@ -3,6 +3,7 @@ import {
   methods,
   ndJsonStream,
   PROTOCOL_VERSION,
+  type AvailableCommand,
   type ClientContext,
   type ForkSessionResponse,
   type LoadSessionResponse,
@@ -19,6 +20,7 @@ import {
   type ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -62,6 +64,22 @@ const AGENT_BRIDGES: Record<
   codex: {
     packageName: "@agentclientprotocol/codex-acp",
     binName: "codex-acp",
+  },
+};
+
+/** The slash command each agent kind's CLI recognizes as "drop prior
+ *  conversation from the model's context." Not every kind has one — codex-acp
+ *  exposes no equivalent built-in (its closest, `/compact`, summarizes rather
+ *  than drops) — so lookups fall through to `undefined` and both `prompt()`
+ *  and `withResetCommand()` below simply leave it out. Only resets the
+ *  *display*; the agent's own CLI is what actually drops the content from
+ *  its context. Doubles as the composer's menu entry (`name`/`description`
+ *  are exactly `AvailableCommand`'s shape) since neither bridge actually
+ *  advertises this one through `available_commands_update` itself. */
+const RESET_COMMANDS: Partial<Record<AgentConfig["kind"], AvailableCommand>> = {
+  claude: {
+    name: "clear",
+    description: "Clear conversation history and free up context",
   },
 };
 
@@ -110,6 +128,9 @@ export type PermissionRequestEvent = {
   toolCall: ToolCallUpdate;
   options: PermissionOption[];
 };
+export type TranscriptResetEvent = {
+  sessionId: SessionId;
+};
 
 /** One live ACP connection to an agent's bridge subprocess. Owns the child
  *  process and the session lifecycle; consumers (tree view, session viewer,
@@ -118,6 +139,9 @@ export type PermissionRequestEvent = {
 export class AgentClient implements vscode.Disposable {
   private child?: ChildProcessWithoutNullStreams;
   private agent?: ClientContext;
+  // Set in `connect()` — read by `prompt()` to look up this kind's reset
+  // command (see `RESET_COMMANDS`).
+  private kind?: AgentConfig["kind"];
   private readonly pendingPermissions = new Map<
     string,
     (response: RequestPermissionResponse) => void
@@ -140,11 +164,19 @@ export class AgentClient implements vscode.Disposable {
   private readonly permissionResolvedEmitter = new vscode.EventEmitter<{
     requestId: string;
   }>();
+  private readonly transcriptResetEmitter =
+    new vscode.EventEmitter<TranscriptResetEvent>();
 
   readonly onConnectionStateChanged = this.connectionStateEmitter.event;
   readonly onSessionUpdate = this.sessionUpdateEmitter.event;
   readonly onPermissionRequest = this.permissionRequestEmitter.event;
   readonly onPermissionResolved = this.permissionResolvedEmitter.event;
+  // Fired instead of (just before) the normal echo when `prompt()` recognizes
+  // the agent's own history-reset command (see `RESET_COMMANDS`) — every view
+  // sharing this connection's session needs it, same reasoning as
+  // `echoUserMessage`'s doc comment, so it rides the same emitter pattern
+  // rather than being each view's own problem to detect.
+  readonly onTranscriptReset = this.transcriptResetEmitter.event;
 
   constructor(cwd: string, label = "ACP Code") {
     this.cwd = cwd;
@@ -153,6 +185,7 @@ export class AgentClient implements vscode.Disposable {
 
   async connect(agent: AgentConfig): Promise<void> {
     this.disconnectChild();
+    this.kind = agent.kind;
     this.connectionStateEmitter.fire({ state: "connecting" });
 
     const entryPoint = resolveAgentEntryPoint(agent.kind);
@@ -209,9 +242,18 @@ export class AgentClient implements vscode.Disposable {
         });
       })
       .onNotification(methods.client.session.update, ctx => {
+        const update = ctx.params.update;
         this.sessionUpdateEmitter.fire({
           sessionId: ctx.params.sessionId,
-          update: ctx.params.update,
+          update:
+            update.sessionUpdate === "available_commands_update"
+              ? {
+                  ...update,
+                  availableCommands: this.withResetCommand(
+                    update.availableCommands,
+                  ),
+                }
+              : update,
         });
       });
 
@@ -339,6 +381,19 @@ export class AgentClient implements vscode.Disposable {
     sessionId: SessionId,
     text: string,
   ): Promise<{ stopReason: StopReason; failureTitle?: string }> {
+    // Checked before echoing: the agent's CLI drops its own context either
+    // way, but nothing in ACP tells a client that happened (no "history
+    // reset" update kind exists) — so without this, the display would just
+    // keep accumulating right through it. Matched on the command word alone
+    // (ignoring any trailing args) the same way the bridges themselves parse
+    // their own local commands.
+    const resetCommand = this.kind && RESET_COMMANDS[this.kind];
+    if (
+      resetCommand &&
+      `/${resetCommand.name}` === text.trim().split(/\s+/, 1)[0]
+    ) {
+      this.transcriptResetEmitter.fire({ sessionId });
+    }
     this.echoUserMessage(sessionId, text);
     const response = await this.requireAgent().request(
       methods.agent.session.prompt,
@@ -393,8 +448,28 @@ export class AgentClient implements vscode.Disposable {
       update: {
         sessionUpdate: "user_message_chunk",
         content: { type: "text", text },
+        // A fresh id on every call, never reused: each call is one complete,
+        // distinct message (unlike a real agent's streamed chunks, which
+        // share one id across several calls) — see appendUserChunk's doc
+        // comment for why reusing the previous block's id here would be
+        // wrong (it's what glued "/clear" onto the next message typed after
+        // it, with no agent turn landing in between to force a new block).
+        messageId: randomUUID(),
       },
     });
+  }
+
+  /** Neither bridge actually lists its reset command (see `RESET_COMMANDS`)
+   *  among the real `available_commands_update` it sends, so the composer's
+   *  "/" menu would never suggest it even though `prompt()` above already
+   *  acts on it — patched in here instead of in the webview so the two stay
+   *  impossible to drift apart (same lookup, same source). `some` guard:
+   *  skip adding it if a future bridge version ever does advertise it. */
+  private withResetCommand(commands: AvailableCommand[]): AvailableCommand[] {
+    const reset = this.kind && RESET_COMMANDS[this.kind];
+    return reset && !commands.some(c => c.name === reset.name)
+      ? [...commands, reset]
+      : commands;
   }
 
   cancelPrompt(sessionId: SessionId): void {

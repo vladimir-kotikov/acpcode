@@ -47,7 +47,13 @@ export type Action =
   | { type: "localPermissionResponse"; requestId: string; optionId: string }
   | { type: "permissionResolved"; requestId: string }
   | { type: "draftChanged"; text: string }
-  | { type: "closed" };
+  | { type: "closed" }
+  // The agent's own history-reset command (e.g. Claude's `/clear`) was just
+  // sent — see AgentClient.prompt's RESET_COMMANDS check. Empties the
+  // transcript client-side since ACP has no update kind that signals this on
+  // its own; `meta`/`availableCommands`/etc. stay untouched, this is still
+  // the same session.
+  | { type: "reset"; sessionId: SessionId };
 
 export interface PendingPermission {
   requestId: string;
@@ -62,6 +68,9 @@ export interface TextItem {
   id: string;
   role: "agent" | "thought";
   text: string;
+  // See UserBlock.messageId's doc comment — same boundary signal, same
+  // reason for needing it.
+  messageId?: string | null;
 }
 
 export interface ToolItem {
@@ -106,6 +115,16 @@ export interface UserBlock {
   type: "user";
   id: string;
   text: string;
+  // ACP's own boundary signal for chunk merging (schema: "All chunks
+  // belonging to the same message share the same messageId. A change in
+  // messageId indicates a new message has started.") — needed because
+  // adjacency alone isn't a reliable "same message" signal: two genuinely
+  // separate user turns land adjacent in `blocks` whenever nothing the agent
+  // produced in between became its own block (e.g. a local-only command like
+  // `/clear` that yields no visible agent content) — appendUserChunk used to
+  // merge those into one bubble, gluing the next message's text onto the
+  // command's.
+  messageId?: string | null;
 }
 
 export type Block = NoteBlock | UserBlock | TurnBlock;
@@ -321,19 +340,24 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
       }),
     }))
     .with({ type: "closed" }, () => ({ ...initialState, drafts: new Map() }))
+    .with({ type: "reset" }, action =>
+      action.sessionId === state.meta?.sessionId
+        ? { ...state, blocks: [], statusText: undefined }
+        : state,
+    )
     .exhaustive();
 
 const applySessionUpdate = (blocks: Block[], update: SessionUpdate): Block[] =>
   match(update)
     .returnType<Block[]>()
     .with({ sessionUpdate: "user_message_chunk" }, u =>
-      appendUserChunk(blocks, textOf(u.content)),
+      appendUserChunk(blocks, textOf(u.content), u.messageId),
     )
     .with({ sessionUpdate: "agent_message_chunk" }, u =>
-      appendText(blocks, "agent", textOf(u.content)),
+      appendText(blocks, "agent", textOf(u.content), u.messageId),
     )
     .with({ sessionUpdate: "agent_thought_chunk" }, u =>
-      appendText(blocks, "thought", textOf(u.content)),
+      appendText(blocks, "thought", textOf(u.content), u.messageId),
     )
     .with(
       { sessionUpdate: "tool_call" },
@@ -446,27 +470,43 @@ const updateTurnItem = <T extends TurnItem>(
       : block;
   });
 
-function appendUserChunk(blocks: Block[], text: string): Block[] {
+// Treats missing ids (null/undefined, from an agent that doesn't send them)
+// as one shared "unknown" bucket rather than as mutually distinct — matches
+// the old adjacency-only behavior for those agents instead of fragmenting
+// every chunk of theirs into its own bubble.
+const sameMessage = (
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean => (a ?? undefined) === (b ?? undefined);
+
+function appendUserChunk(
+  blocks: Block[],
+  text: string,
+  messageId: string | null | undefined,
+): Block[] {
   const last = lastBlock(blocks);
-  if (last?.type === "user") {
+  if (last?.type === "user" && sameMessage(last.messageId, messageId)) {
     return [...blocks.slice(0, -1), { ...last, text: last.text + text }];
   }
-  return [...blocks, { type: "user", id: genId(), text }];
+  return [...blocks, { type: "user", id: genId(), text, messageId }];
 }
 
 function appendText(
   blocks: Block[],
   role: "agent" | "thought",
   text: string,
+  messageId: string | null | undefined,
 ): Block[] {
   const last = lastBlock(blocks);
   const lastItem = last?.type === "turn" ? last.items.at(-1) : undefined;
-  return lastItem?.type === "text" && lastItem.role === role
+  return lastItem?.type === "text" &&
+    lastItem.role === role &&
+    sameMessage(lastItem.messageId, messageId)
     ? replaceLastTurnItem(blocks, lastItem, item => ({
         ...item,
         text: item.text + text,
       }))
-    : pushToTurn(blocks, { type: "text", id: genId(), role, text });
+    : pushToTurn(blocks, { type: "text", id: genId(), role, text, messageId });
 }
 
 // Shared by tool_call(_update) SessionUpdates and permission requests — a

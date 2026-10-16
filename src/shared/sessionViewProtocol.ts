@@ -63,6 +63,10 @@ export type HostToSessionViewMessage =
   // history) is the only available fallback. Set so the webview can offer it.
   | { type: "error"; message: string; forkable?: boolean }
   | { type: "promptStopped"; sessionId: SessionId; stopReason: StopReason }
+  // The agent's own history-reset command (e.g. `/clear`) was just sent for
+  // this session — see AgentClient.onTranscriptReset. Empties the transcript
+  // client-side; still the same session, `loading`/`closed` don't apply.
+  | { type: "reset"; sessionId: SessionId }
   | {
       type: "permissionRequest";
       requestId: string;

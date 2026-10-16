@@ -299,6 +299,18 @@ class SessionViewSession implements vscode.Disposable {
         client.onPermissionResolved(event => {
           this.post({ type: "permissionResolved", requestId: event.requestId });
         }),
+        // Fires right before the "/clear"-style echo lands (see
+        // AgentClient.prompt) — drop our own replay buffer too, not just the
+        // webview's blocks, so a later peer `attachSession` (another tab
+        // opening this same session) seeds from the post-reset state instead
+        // of resurrecting what was just cleared.
+        client.onTranscriptReset(event => {
+          if (event.sessionId !== this.current?.sessionId) {
+            return;
+          }
+          this.buffer = [];
+          this.post({ type: "reset", sessionId: event.sessionId });
+        }),
       );
     }
 
