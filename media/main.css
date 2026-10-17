@@ -523,13 +523,25 @@ details.step:not([open]) > .step-header {
   cursor: default;
 }
 
+/* The whole composer — textarea plus its toolbar — as one floating rounded
+ * card, matching VS Code's own chat view input instead of a flat bar flush
+ * with the panel edges. The textarea itself (.prompt-input) has no border
+ * of its own; this card is the only visible outline. */
 .input-bar {
   position: relative;
   display: flex;
   flex-direction: column;
   gap: var(--vscode-spacing-size60, 6px);
+  margin: var(--vscode-spacing-size80, 8px);
   padding: var(--vscode-spacing-size80, 8px);
-  border-top: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
+  background: var(--vscode-input-background);
+  border: 1px solid
+    var(--vscode-input-border, var(--vscode-sideBarSectionHeader-border));
+  border-radius: var(--vscode-cornerRadius-medium, 8px);
+}
+
+.input-bar:focus-within {
+  border-color: var(--vscode-focusBorder);
 }
 
 /* Second row of the input bar: model/effort chips on the left, send/stop on
@@ -654,40 +666,55 @@ details.step:not([open]) > .step-header {
 
 .prompt-input {
   resize: none;
-  background: var(--vscode-input-background);
+  background: transparent;
   color: var(--vscode-input-foreground);
-  border: 1px solid var(--vscode-input-border);
+  border: none;
   font-family: inherit;
   font-size: inherit;
-  padding: 4px 6px;
+  padding: 0;
   /* Height is driven from JS (scrollHeight) as content grows; capped here so
    * it scrolls internally past ~10 lines instead of growing forever. */
   max-height: 220px;
   overflow-y: auto;
 }
 
+.prompt-input:focus {
+  /* .input-bar:focus-within's border already shows focus on the card as a
+   * whole — an inner ring too would double up. */
+  outline: none;
+}
+
+/* Icon-only, no button chrome — matches the mic/send icons in VS Code's own
+ * chat view toolbar rather than a filled button pill. */
 .send-btn {
   display: flex;
   align-items: center;
-  gap: var(--vscode-spacing-size40, 4px);
-  background: var(--vscode-button-background);
-  color: var(--vscode-button-foreground);
+  justify-content: center;
+  background: none;
+  color: var(--vscode-descriptionForeground);
   border: none;
   border-radius: var(--vscode-cornerRadius-xSmall, 3px);
-  padding: var(--vscode-spacing-size40, 4px) 12px;
+  padding: var(--vscode-spacing-size40, 4px);
   cursor: pointer;
 }
 
-.send-btn svg {
-  flex-shrink: 0;
+.send-btn:hover:not(:disabled) {
+  background: var(
+    --vscode-toolbar-hoverBackground,
+    var(--vscode-list-hoverBackground)
+  );
+  color: var(--vscode-foreground);
 }
 
 .send-btn:disabled {
-  opacity: 0.5;
+  opacity: 0.4;
   cursor: default;
 }
 
 .cancel-btn {
-  background: var(--vscode-button-secondaryBackground);
-  color: var(--vscode-button-secondaryForeground);
+  color: var(--vscode-foreground);
+  background: var(
+    --vscode-toolbar-hoverBackground,
+    var(--vscode-list-hoverBackground)
+  );
 }

@@ -413,13 +413,16 @@ export const Composer = ({
           const canSend =
             !disabled && !steeringBlocked && !!state.draftText.trim();
           const showStop = state.busy && !canSend;
+          const label = showStop ? "Stop" : "Send";
           return html`<button
+            type="button"
             class="send-btn ${showStop ? "cancel-btn" : ""}"
             disabled=${!showStop && !canSend}
+            aria-label=${label}
+            title=${label}
             onClick=${() => (showStop ? onCancel() : submit())}
           >
             ${showStop ? html`<${StopIcon} />` : html`<${SendIcon} />`}
-            ${showStop ? "Stop" : "Send"}
           </button>`;
         })()}
       </div>
