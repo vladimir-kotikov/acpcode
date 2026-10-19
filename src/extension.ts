@@ -77,6 +77,16 @@ export function activate(context: vscode.ExtensionContext) {
       "acpcode.newSession",
       treeProvider.newSession,
     ),
+    // Explorer/tab context-menu command — VS Code calls a resource-scoped
+    // command with (clickedResource, allSelectedResources), the latter only
+    // populated on a multi-select.
+    vscode.commands.registerCommand(
+      "acpcode.attachFileToChat",
+      (clicked?: vscode.Uri, selected?: vscode.Uri[]) => {
+        const targets = selected?.length ? selected : clicked ? [clicked] : [];
+        void sessionViewProvider.attachFilesToChat(targets);
+      },
+    ),
   );
 }
 

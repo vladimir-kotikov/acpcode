@@ -50,6 +50,13 @@ function Root() {
         pastedSourceWaiters.delete(message.requestId);
         return;
       }
+      if (message.type === "attachFile") {
+        dispatch({
+          type: "attachmentsAdded",
+          attachments: message.attachments,
+        });
+        return;
+      }
       dispatch(
         match(message)
           .returnType<Action>()

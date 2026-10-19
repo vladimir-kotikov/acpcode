@@ -87,6 +87,11 @@
         "title": "New Session",
         "category": "ACP Code",
         "icon": "$(add)"
+      },
+      {
+        "command": "acpcode.attachFileToChat",
+        "title": "Attach to ACP Code Chat",
+        "category": "ACP Code"
       }
     ],
     "menus": {
@@ -151,6 +156,18 @@
         {
           "command": "acpcode.newSession",
           "when": "view == acpcode.sessions && viewItem == acpcode.agent",
+          "group": "9_acpcode"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "acpcode.attachFileToChat",
+          "group": "9_acpcode"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "acpcode.attachFileToChat",
           "group": "9_acpcode"
         }
       ]

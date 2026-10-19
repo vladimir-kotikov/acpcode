@@ -589,6 +589,17 @@ class SessionViewSession implements vscode.Disposable {
     }
   }
 
+  /** Pushed from the explorer/tab "Attach to ACP Code Chat" context-menu
+   *  command — see `SessionViewProvider.attachFilesToChat`'s own comment for
+   *  how the target session (sidebar vs. a specific editor tab) is chosen.
+   *  Takes the whole batch in one message (a multi-select attach) rather
+   *  than one call per file, so it's one `waitUntilReady()` and one reducer
+   *  dispatch instead of N. */
+  attachFiles = (attachments: Attachment[]): Promise<void> =>
+    this.waitUntilReady().then(() => {
+      this.post({ type: "attachFile", attachments });
+    });
+
   private respondToPermission(
     requestId: string,
     optionId: string | null,
@@ -823,6 +834,37 @@ export class SessionViewProvider
     [this.sidebar, ...this.editors.keys()].find(
       session => session !== exclude && session.matches(target),
     );
+
+  /** Which session an ambient action (the explorer/tab "Attach to ACP Code
+   *  Chat" command, invoked with no session context of its own — could be
+   *  any number of editor tabs open, or none) should target. Prefers
+   *  whichever editor tab currently has focus (`WebviewPanel.active`,
+   *  read live — VS Code guarantees at most one is ever true at a time),
+   *  since that's the tab the user was actually looking at; falls back to
+   *  the sidebar, the one session that's always available, when no acpcode
+   *  editor tab is focused (including when none are open at all). */
+  private activeSession(): SessionViewSession {
+    for (const [session, panel] of this.editors) {
+      if (panel.active) {
+        return session;
+      }
+    }
+    return this.sidebar;
+  }
+
+  /** Wired to the "Attach to ACP Code Chat" explorer/tab context-menu
+   *  command (extension.ts), which passes every selected resource at once on
+   *  a multi-select — resolves the target session once (see
+   *  `activeSession`) and attaches the whole batch in one message rather
+   *  than re-resolving per file. */
+  attachFilesToChat = (uris: vscode.Uri[]): Promise<void> => {
+    const attachments: Attachment[] = uris.map(uri => ({
+      id: crypto.randomUUID(),
+      uri: uri.toString(),
+      name: uri.path.split("/").pop() ?? uri.fsPath,
+    }));
+    return this.activeSession().attachFiles(attachments);
+  };
 
   /** A deleted session shouldn't keep showing stale content: reset the
    *  sidebar to "no session" if it was showing this one, and close (not just

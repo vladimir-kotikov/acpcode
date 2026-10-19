@@ -101,6 +101,11 @@ export type HostToSessionViewMessage =
       options: PermissionOption[];
     }
   | { type: "permissionResolved"; requestId: string }
+  // Pushed from the explorer/tab "Attach to ACP Code Chat" context-menu
+  // command (sessionViewProvider.ts's attachFilesToChat) — targets whichever
+  // session is active (see SessionViewProvider.activeSession); carries every
+  // selected file in one message on a multi-select attach.
+  | { type: "attachFile"; attachments: Attachment[] }
   // Reply to a `resolvePastedSource` request — `attachment` is undefined when
   // the pasted text didn't match anything in RecentSelectionTracker's buffer.
   | {
