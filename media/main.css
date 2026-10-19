@@ -588,6 +588,54 @@ details.step:not([open]) > .step-header {
   cursor: default;
 }
 
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--vscode-spacing-size40, 4px);
+}
+
+.user-block .attachment-chips {
+  margin-bottom: var(--vscode-spacing-size40, 4px);
+}
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: var(--vscode-spacing-size40, 4px);
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+  border-radius: var(--vscode-cornerRadius-xSmall, 3px);
+  padding: 2px var(--vscode-spacing-size60, 6px);
+  font-size: var(--vscode-fontSize-body2, 0.85em);
+  max-width: 220px;
+}
+
+.attachment-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-chip-openable {
+  cursor: pointer;
+  text-decoration: underline dashed;
+  text-underline-offset: 2px;
+}
+
+.attachment-chip-remove {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+.attachment-chip-remove:hover {
+  opacity: 1;
+}
+
 /* Dropdown panel shared by the composer's "/" command menu and its
  * model/effort/mode chips — same floating-above-the-input shape, just a
  * different anchor width and stacking context. */

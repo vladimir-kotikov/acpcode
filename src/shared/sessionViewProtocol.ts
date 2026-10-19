@@ -22,6 +22,32 @@ export interface SessionViewMeta {
   // falls back to blocking send while busy, since calling `session/prompt`
   // again mid-turn would interrupt it instead of injecting into it.
   canSteer: boolean;
+  // Whether this agent's `promptCapabilities.image` is set — a pasted/dropped
+  // image with no source file (clipboard bytes only, nothing on disk to point
+  // a `resource_link` at) has no fallback when this is false, so the composer
+  // needs to know up front rather than discovering it only once a send fails.
+  // A file (or an image that DOES have a source path) never needs this check:
+  // `resource_link` is baseline-supported by every agent regardless.
+  canAttachImages: boolean;
+}
+
+// One attached file/image, in whichever of the two shapes it was captured:
+// `uri` when a real source path is known (drag from Explorer/tabs/Finder,
+// the explorer/tab context-menu command, or a paste matched back to its
+// source editor selection — see RecentSelectionTracker in
+// sessionViewProvider.ts); `data` (base64) when it's pasted bytes with no
+// path at all (a screenshot-tool clipboard image). Never both — `uri` is
+// preferred whenever available since it lets the agent read the file itself
+// instead of inlining it. `line`/`endLine` are only ever set on a
+// paste-matched-to-source attachment.
+export interface Attachment {
+  id: string;
+  name: string;
+  mimeType?: string;
+  uri?: string;
+  data?: string;
+  line?: number;
+  endLine?: number;
 }
 
 // What the webview persists via `vscode.setState()`/`vscode.getState()` (see
@@ -74,11 +100,18 @@ export type HostToSessionViewMessage =
       toolCall: ToolCallUpdate;
       options: PermissionOption[];
     }
-  | { type: "permissionResolved"; requestId: string };
+  | { type: "permissionResolved"; requestId: string }
+  // Reply to a `resolvePastedSource` request — `attachment` is undefined when
+  // the pasted text didn't match anything in RecentSelectionTracker's buffer.
+  | {
+      type: "pastedSourceResolved";
+      requestId: string;
+      attachment: Attachment | undefined;
+    };
 
 export type SessionViewToHostMessage =
   | { type: "ready" }
-  | { type: "sendPrompt"; text: string }
+  | { type: "sendPrompt"; text: string; attachments: Attachment[] }
   | { type: "cancelPrompt" }
   | { type: "permissionResponse"; requestId: string; optionId: string | null }
   | { type: "forkSession" }
@@ -87,4 +120,10 @@ export type SessionViewToHostMessage =
   | { type: "setConfigOption"; configId: string; value: string | boolean }
   // A `read` tool card's file link — opens `path` in the current window's
   // editor area rather than in the webview, which has no editor of its own.
-  | { type: "openFile"; path: string; line?: number };
+  | { type: "openFile"; path: string; line?: number }
+  // A plain-text paste landed in the composer — ask the host whether it
+  // matches a recently-selected editor range (see RecentSelectionTracker) so
+  // it can be attached as "pasted from this file" alongside the text.
+  // `requestId` correlates the reply since paste events aren't necessarily
+  // answered in order.
+  | { type: "resolvePastedSource"; requestId: string; text: string };

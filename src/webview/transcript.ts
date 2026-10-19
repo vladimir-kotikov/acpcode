@@ -11,9 +11,12 @@ import { html } from "htm/preact";
 import type { RefObject } from "preact";
 import { useEffect, useRef } from "preact/hooks";
 import { match } from "ts-pattern";
+import type { Attachment } from "../shared/sessionViewProtocol.ts";
 import {
+  AttachmentChipList,
   CollapsibleStep,
   Composer,
+  filePathFromUri,
   MarkdownBody,
   ThoughtStep,
   ToolStep,
@@ -151,6 +154,17 @@ interface BlocksViewProps {
   onOpenFile: (path: string, line?: number) => void;
 }
 
+// A sent message's own attachments — read-only (no `onRemove`), opening one
+// re-uses the same onOpenFile flow as everything else in the transcript.
+function openAttachment(
+  attachment: Attachment,
+  onOpenFile: (path: string, line?: number) => void,
+): void {
+  if (attachment.uri) {
+    onOpenFile(filePathFromUri(attachment.uri), attachment.line);
+  }
+}
+
 const BlocksView = ({
   blocks,
   onRespond,
@@ -167,11 +181,21 @@ const BlocksView = ({
       .with(
         { type: "user" },
         block =>
-          html`<${MarkdownBody}
-            key=${block.id}
-            text=${block.text}
-            class="bubble bubble-user"
-          />`,
+          html`<div key=${block.id} class="user-block">
+            <${AttachmentChipList}
+              attachments=${block.attachments}
+              onOpen=${(attachment: Attachment) =>
+                openAttachment(attachment, onOpenFile)}
+            />
+            ${
+              block.text
+                ? html`<${MarkdownBody}
+                    text=${block.text}
+                    class="bubble bubble-user"
+                  />`
+                : null
+            }
+          </div>`,
       )
       .with(
         { type: "turn" },
@@ -232,13 +256,17 @@ function SessionStats({ state }: { state: ViewState }) {
 interface TranscriptProps {
   state: ViewState;
   atBottomRef: RefObject<boolean>;
-  onSend: (text: string) => void;
+  onSend: (text: string, attachments: Attachment[]) => void;
   onCancel: () => void;
   onRespond: (requestId: string, optionId: string) => void;
   onFork: () => void;
   onOpenFile: (path: string, line?: number) => void;
   onDraftChange: (text: string) => void;
   onSetConfigOption: (configId: string, value: string | boolean) => void;
+  onAttachmentsAdded: (attachments: Attachment[]) => void;
+  onAttachmentRemoved: (id: string) => void;
+  onAttachError: (message: string) => void;
+  onResolvePastedSource: (text: string) => Promise<Attachment | undefined>;
 }
 
 export function Transcript({
@@ -251,6 +279,10 @@ export function Transcript({
   onOpenFile,
   onDraftChange,
   onSetConfigOption,
+  onAttachmentsAdded,
+  onAttachmentRemoved,
+  onAttachError,
+  onResolvePastedSource,
 }: TranscriptProps) {
   const logRef = useRef<HTMLDivElement>(null);
   // Whether the user was scrolled at/near the bottom, tracked continuously by
@@ -361,6 +393,11 @@ export function Transcript({
       onCancel=${onCancel}
       onDraftChange=${onDraftChange}
       onSetConfigOption=${onSetConfigOption}
+      onAttachmentsAdded=${onAttachmentsAdded}
+      onAttachmentRemoved=${onAttachmentRemoved}
+      onAttachError=${onAttachError}
+      onResolvePastedSource=${onResolvePastedSource}
+      onOpenFile=${onOpenFile}
     />
   `;
 }

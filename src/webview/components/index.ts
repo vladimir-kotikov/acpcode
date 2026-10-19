@@ -1,3 +1,4 @@
+export * from "./attachmentChip.ts";
 export * from "./collapsibleStep.ts";
 export * from "./composer.ts";
 export * from "./markdownBody.ts";

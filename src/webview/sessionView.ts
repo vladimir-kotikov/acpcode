@@ -2,6 +2,7 @@ import { html, render } from "htm/preact";
 import { useEffect, useReducer, useRef } from "preact/hooks";
 import { match } from "ts-pattern";
 import type {
+  Attachment,
   HostToSessionViewMessage,
   SessionViewPersistedState,
   SessionViewToHostMessage,
@@ -33,10 +34,24 @@ function Root() {
     }
   }, [state.meta, state.draftText]);
 
+  // Resolves a `resolvePastedSource` round-trip by its requestId — a
+  // side-channel outside the reducer (there's nothing to render while it's
+  // pending, just a Promise for the composer's paste handler to await),
+  // populated/drained from the message listener below.
+  const pastedSourceWaiters = useRef(
+    new Map<string, (attachment: Attachment | undefined) => void>(),
+  ).current;
+
   useEffect(() => {
-    const listener = (event: MessageEvent<HostToSessionViewMessage>) =>
+    const listener = (event: MessageEvent<HostToSessionViewMessage>) => {
+      const message = event.data;
+      if (message.type === "pastedSourceResolved") {
+        pastedSourceWaiters.get(message.requestId)?.(message.attachment);
+        pastedSourceWaiters.delete(message.requestId);
+        return;
+      }
       dispatch(
-        match(event.data)
+        match(message)
           .returnType<Action>()
           .with({ type: "connecting" }, message => message)
           .with({ type: "loading" }, message => ({
@@ -60,13 +75,14 @@ function Root() {
           .with({ type: "closed" }, message => message)
           .exhaustive(),
       );
+    };
 
     window.addEventListener("message", listener);
     vscode.postMessage({ type: "ready" });
     return () => window.removeEventListener("message", listener);
   }, []);
 
-  const onSend = (text: string): void => {
+  const onSend = (text: string, attachments: Attachment[]): void => {
     atBottomRef.current = true;
     // Matches Composer's own steeringBlocked/canSend condition: a send while
     // already busy only reaches here at all when the agent supports
@@ -76,9 +92,10 @@ function Root() {
     dispatch({
       type: "draftSent",
       pendingSteerText: isSteering ? text : undefined,
+      pendingSteerAttachments: isSteering ? attachments : undefined,
     });
     dispatch({ type: "sendStart" });
-    vscode.postMessage({ type: "sendPrompt", text });
+    vscode.postMessage({ type: "sendPrompt", text, attachments });
   };
 
   const onRespond = (requestId: string, optionId: string): void => {
@@ -97,6 +114,27 @@ function Root() {
     vscode.postMessage({ type: "setConfigOption", configId, value });
   };
 
+  const onAttachmentsAdded = (attachments: Attachment[]): void =>
+    dispatch({ type: "attachmentsAdded", attachments });
+
+  const onAttachmentRemoved = (id: string): void =>
+    dispatch({ type: "attachmentRemoved", id });
+
+  const onAttachError = (message: string): void =>
+    dispatch({ type: "error", message });
+
+  // Asks the host whether `text` (a plain-text paste) matches a recently
+  // selected editor range — see RecentSelectionTracker in
+  // sessionViewProvider.ts. Resolves `undefined` on no match; never rejects.
+  const onResolvePastedSource = (
+    text: string,
+  ): Promise<Attachment | undefined> =>
+    new Promise(resolve => {
+      const requestId = crypto.randomUUID();
+      pastedSourceWaiters.set(requestId, resolve);
+      vscode.postMessage({ type: "resolvePastedSource", requestId, text });
+    });
+
   return html`<${Transcript}
     state=${state}
     atBottomRef=${atBottomRef}
@@ -107,6 +145,10 @@ function Root() {
     onOpenFile=${onOpenFile}
     onDraftChange=${(text: string) => dispatch({ type: "draftChanged", text })}
     onSetConfigOption=${onSetConfigOption}
+    onAttachmentsAdded=${onAttachmentsAdded}
+    onAttachmentRemoved=${onAttachmentRemoved}
+    onAttachError=${onAttachError}
+    onResolvePastedSource=${onResolvePastedSource}
   />`;
 }
 

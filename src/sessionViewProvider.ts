@@ -6,6 +6,7 @@ import type { AgentClient } from "./acp/agentClient.ts";
 import type { AgentConnectionPool } from "./acp/agentPool.ts";
 import { getAgent } from "./acp/agents/config.ts";
 import type {
+  Attachment,
   HostToSessionViewMessage,
   SessionViewPersistedState,
   SessionViewToHostMessage,
@@ -85,6 +86,84 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     </html>`;
 }
 
+/** Tracks the most recent non-empty editor selections so a pasted code
+ *  snippet in the composer can be matched back to its source file. VS Code's
+ *  own editor copy puts no file info on the OS clipboard — confirmed by
+ *  reading the actual copy handler (`vscode-editor-data`'s payload is just
+ *  `{version, id, isFromEmptySelection, multicursorText, mode}`, `mode`
+ *  being the language id, not a path) — and the built-in chat's equivalent
+ *  feature only works because its input box is a real editor document
+ *  participating in `languages.registerDocumentPasteEditProvider`, which a
+ *  webview `<textarea>` structurally can't join. Matching pasted text
+ *  against recently-selected text is the only signal actually available. */
+class RecentSelectionTracker implements vscode.Disposable {
+  private static readonly MAX_ENTRIES = 5;
+  // Below this, matching gets noisy (e.g. a pasted single word would "match"
+  // any recent selection containing it) without being useful enough to
+  // justify the false-positive risk.
+  private static readonly MIN_MATCH_LENGTH = 20;
+
+  private readonly recent: {
+    uri: string;
+    path: string;
+    line: number;
+    endLine: number;
+    text: string;
+  }[] = [];
+  private readonly subscription: vscode.Disposable;
+
+  constructor() {
+    this.subscription = vscode.window.onDidChangeTextEditorSelection(event => {
+      const doc = event.textEditor.document;
+      if (doc.uri.scheme !== "file") {
+        return;
+      }
+      for (const selection of event.selections) {
+        if (selection.isEmpty) {
+          continue;
+        }
+        const text = doc.getText(selection);
+        if (!text.trim()) {
+          continue;
+        }
+        this.recent.unshift({
+          uri: doc.uri.toString(),
+          path: doc.uri.fsPath,
+          line: selection.start.line + 1,
+          endLine: selection.end.line + 1,
+          text,
+        });
+        this.recent.length = Math.min(
+          this.recent.length,
+          RecentSelectionTracker.MAX_ENTRIES,
+        );
+      }
+    });
+  }
+
+  match(pasted: string): Attachment | undefined {
+    const trimmed = pasted.trim();
+    if (trimmed.length < RecentSelectionTracker.MIN_MATCH_LENGTH) {
+      return undefined;
+    }
+    const hit = this.recent.find(entry => entry.text.trim() === trimmed);
+    if (!hit) {
+      return undefined;
+    }
+    return {
+      id: crypto.randomUUID(),
+      uri: hit.uri,
+      name: hit.path.split(/[\\/]/).pop() ?? hit.path,
+      line: hit.line,
+      endLine: hit.endLine > hit.line ? hit.endLine : undefined,
+    };
+  }
+
+  dispose(): void {
+    this.subscription.dispose();
+  }
+}
+
 /** Enough of another `SessionViewSession`'s state to seed a new one showing
  *  the exact same session without re-triggering a bridge-side history
  *  replay (see `attachSession`'s doc comment for why that matters). */
@@ -101,6 +180,7 @@ interface SessionSnapshot {
  *  loaded sessions) via the connection pool. */
 class SessionViewSession implements vscode.Disposable {
   private readonly pool: AgentConnectionPool;
+  private readonly selectionTracker: RecentSelectionTracker;
   private webview?: vscode.Webview;
   private ready = false;
   private readyWaiters: (() => void)[] = [];
@@ -136,8 +216,12 @@ class SessionViewSession implements vscode.Disposable {
   readonly onPromptSettled = this.promptSettledEmitter.event;
   private firstPromptSettled = false;
 
-  constructor(pool: AgentConnectionPool) {
+  constructor(
+    pool: AgentConnectionPool,
+    selectionTracker: RecentSelectionTracker,
+  ) {
     this.pool = pool;
+    this.selectionTracker = selectionTracker;
   }
 
   matches(target: Pick<SessionTarget, "agentName" | "sessionId">): boolean {
@@ -222,7 +306,9 @@ class SessionViewSession implements vscode.Disposable {
           this.readyWaiters.splice(0).forEach(resolve => resolve());
           this.replay();
         })
-        .with({ type: "sendPrompt" }, message => this.sendPrompt(message.text))
+        .with({ type: "sendPrompt" }, message =>
+          this.sendPrompt(message.text, message.attachments),
+        )
         .with({ type: "cancelPrompt" }, this.cancelPrompt)
         .with({ type: "permissionResponse" }, ({ requestId, optionId }) =>
           this.respondToPermission(requestId, optionId),
@@ -233,6 +319,13 @@ class SessionViewSession implements vscode.Disposable {
         )
         .with({ type: "setConfigOption" }, ({ configId, value }) =>
           this.setConfigOption(configId, value),
+        )
+        .with({ type: "resolvePastedSource" }, ({ requestId, text }) =>
+          this.post({
+            type: "pastedSourceResolved",
+            requestId,
+            attachment: this.selectionTracker.match(text),
+          }),
         )
         .exhaustive(),
     );
@@ -329,6 +422,7 @@ class SessionViewSession implements vscode.Disposable {
         cwd: target.cwd,
         title: target.title,
         canSteer: client.canSteer(),
+        canAttachImages: client.canSendImages(),
       },
     });
 
@@ -407,7 +501,10 @@ class SessionViewSession implements vscode.Disposable {
     }
   }
 
-  private async sendPrompt(text: string): Promise<void> {
+  private async sendPrompt(
+    text: string,
+    attachments: Attachment[],
+  ): Promise<void> {
     if (!this.current) {
       return;
     }
@@ -430,10 +527,10 @@ class SessionViewSession implements vscode.Disposable {
     this.pendingPrompts += 1;
     try {
       if (steering) {
-        await client.steer(target.sessionId, text);
+        await client.steer(target.sessionId, text, attachments);
         return;
       }
-      const result = await client.prompt(target.sessionId, text);
+      const result = await client.prompt(target.sessionId, text, attachments);
       if (result.failureTitle) {
         this.post({ type: "error", message: result.failureTitle });
       } else {
@@ -551,6 +648,8 @@ class SessionViewSession implements vscode.Disposable {
         cwd: this.current.cwd,
         title: this.current.title,
         canSteer: this.pool.get(this.current.agentName)?.canSteer() ?? false,
+        canAttachImages:
+          this.pool.get(this.current.agentName)?.canSendImages() ?? false,
       },
     });
     this.post({
@@ -598,11 +697,12 @@ export class SessionViewProvider
   private readonly promptSettledEmitter =
     new vscode.EventEmitter<SessionTarget>();
   readonly onPromptSettled = this.promptSettledEmitter.event;
+  private readonly selectionTracker = new RecentSelectionTracker();
 
   constructor(extensionUri: vscode.Uri, pool: AgentConnectionPool) {
     this.extensionUri = extensionUri;
     this.pool = pool;
-    this.sidebar = new SessionViewSession(pool);
+    this.sidebar = new SessionViewSession(pool, this.selectionTracker);
     this.sidebar.onPromptSettled(target =>
       this.promptSettledEmitter.fire(target),
     );
@@ -705,7 +805,7 @@ export class SessionViewProvider
       localResourceRoots: [this.extensionUri],
     };
     panel.webview.html = renderHtml(panel.webview, this.extensionUri);
-    const session = new SessionViewSession(this.pool);
+    const session = new SessionViewSession(this.pool, this.selectionTracker);
     session
       .bind(panel.webview)
       .onPromptSettled(target => this.promptSettledEmitter.fire(target));
@@ -742,6 +842,7 @@ export class SessionViewProvider
 
   dispose = (): void => {
     this.promptSettledEmitter.dispose();
+    this.selectionTracker.dispose();
     [this.sidebar, ...this.editors.keys()].forEach(d => d.dispose());
   };
 }

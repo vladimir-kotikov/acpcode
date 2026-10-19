@@ -5,10 +5,12 @@ import {
   PROTOCOL_VERSION,
   type AvailableCommand,
   type ClientContext,
+  type ContentBlock,
   type ForkSessionResponse,
   type LoadSessionResponse,
   type NewSessionResponse,
   type PermissionOption,
+  type PromptCapabilities,
   type RequestPermissionResponse,
   type SessionConfigOption,
   type SessionConfigValueId,
@@ -28,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import * as vscode from "vscode";
 import type { AgentConfig } from "./agents/config.ts";
 import { agentEnv } from "./agents/config.ts";
+import type { Attachment } from "../shared/sessionViewProtocol.ts";
 
 /** Pulls the AIR extension's session-failure title out of a response's
  *  `_meta`, but only when `severity` is "error" — see `prompt()`'s doc
@@ -154,6 +157,10 @@ export class AgentClient implements vscode.Disposable {
   // method in the SDK's schema, called through the generic request() escape
   // hatch). Not every agent kind implements it (e.g. codex-acp doesn't).
   private steeringSupported = false;
+  // From InitializeResponse.agentCapabilities.promptCapabilities — `text` and
+  // `resource_link` are baseline (every agent MUST accept them per the ACP
+  // spec), everything else needs this check before it's safe to send.
+  private promptCapabilities: PromptCapabilities = {};
 
   private readonly connectionStateEmitter =
     new vscode.EventEmitter<ConnectionState>();
@@ -281,6 +288,8 @@ export class AgentClient implements vscode.Disposable {
         !!steeringMeta &&
         typeof steeringMeta === "object" &&
         (steeringMeta as { supported?: unknown }).supported === true;
+      this.promptCapabilities =
+        response.agentCapabilities?.promptCapabilities ?? {};
       this.connectionStateEmitter.fire({ state: "connected" });
     } catch (err) {
       this.connectionStateEmitter.fire({ state: "error", error: String(err) });
@@ -290,6 +299,14 @@ export class AgentClient implements vscode.Disposable {
 
   canSteer(): boolean {
     return this.steeringSupported;
+  }
+
+  /** Whether a pathless image attachment (pasted clipboard bytes, no source
+   *  file) can be sent as an inline `image` content block. A file attachment,
+   *  or an image that DOES have a source `uri`, never needs this — those fall
+   *  back to `resource_link`, which every agent accepts. */
+  canSendImages(): boolean {
+    return !!this.promptCapabilities.image;
   }
 
   private requireAgent(): ClientContext {
@@ -369,6 +386,63 @@ export class AgentClient implements vscode.Disposable {
     );
   }
 
+  /** Builds one `ContentBlock` per attachment, in the cheapest form the
+   *  connected agent accepts: an image with a source `uri` (or any
+   *  non-image) becomes a baseline `resource_link` — the agent reads it off
+   *  disk itself, no bytes cross the wire. Only a pathless image (pasted
+   *  clipboard bytes with nowhere else to point) needs inlining as a base64
+   *  `image` block, and only when `canSendImages()` — the composer already
+   *  checks that before ever creating such an attachment (see
+   *  `SessionViewMeta.canAttachImages`), so `undefined` here should be
+   *  unreachable in practice; still handled instead of throwing, since a
+   *  dropped attachment is a much smaller surprise than a failed send. */
+  private attachmentToBlock(
+    attachment: Attachment,
+  ): Promise<ContentBlock | undefined> {
+    const isImage = attachment.mimeType?.startsWith("image/") ?? false;
+    if (isImage && this.canSendImages() && attachment.data) {
+      return Promise.resolve({
+        type: "image",
+        data: attachment.data,
+        mimeType: attachment.mimeType!,
+        uri: attachment.uri,
+      });
+    }
+    if (isImage && this.canSendImages() && attachment.uri) {
+      return Promise.resolve(
+        vscode.workspace.fs.readFile(vscode.Uri.parse(attachment.uri)),
+      ).then(bytes => ({
+        type: "image",
+        data: Buffer.from(bytes).toString("base64"),
+        mimeType: attachment.mimeType!,
+        uri: attachment.uri,
+      }));
+    }
+    if (attachment.uri) {
+      return Promise.resolve({
+        type: "resource_link",
+        uri: attachment.uri,
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+      });
+    }
+    return Promise.resolve(undefined);
+  }
+
+  private buildContentBlocks(
+    text: string,
+    attachments: Attachment[],
+  ): Promise<ContentBlock[]> {
+    return Promise.all(
+      attachments.map(attachment => this.attachmentToBlock(attachment)),
+    ).then(blocks => {
+      const resolved = blocks.filter(
+        (block): block is ContentBlock => block !== undefined,
+      );
+      return text ? [{ type: "text", text }, ...resolved] : resolved;
+    });
+  }
+
   /** `failureTitle` surfaces an AIR session failure (see
    *  session-failure-extension.js's `sessionFailureMeta`) that settled the
    *  turn WITHOUT a `RequestError` — e.g. hitting a spend/usage limit ends
@@ -380,6 +454,7 @@ export class AgentClient implements vscode.Disposable {
   async prompt(
     sessionId: SessionId,
     text: string,
+    attachments: Attachment[] = [],
   ): Promise<{ stopReason: StopReason; failureTitle?: string }> {
     // Checked before echoing: the agent's CLI drops its own context either
     // way, but nothing in ACP tells a client that happened (no "history
@@ -394,13 +469,11 @@ export class AgentClient implements vscode.Disposable {
     ) {
       this.transcriptResetEmitter.fire({ sessionId });
     }
-    this.echoUserMessage(sessionId, text);
+    const blocks = await this.buildContentBlocks(text, attachments);
+    this.echoUserMessage(sessionId, blocks);
     const response = await this.requireAgent().request(
       methods.agent.session.prompt,
-      {
-        sessionId,
-        prompt: [{ type: "text", text }],
-      },
+      { sessionId, prompt: blocks },
     );
     return {
       stopReason: response.stopReason as StopReason,
@@ -424,12 +497,17 @@ export class AgentClient implements vscode.Disposable {
    *  `pendingSteerText`), which becomes the real transcript entry only once
    *  this echo fires. Echoing before the request, like `prompt()` does, would
    *  leave a permanent bubble behind even if the injection itself failed. */
-  async steer(sessionId: SessionId, text: string): Promise<void> {
+  async steer(
+    sessionId: SessionId,
+    text: string,
+    attachments: Attachment[] = [],
+  ): Promise<void> {
+    const blocks = await this.buildContentBlocks(text, attachments);
     await this.requireAgent().request("_session/steering", {
       sessionId,
-      prompt: [{ type: "text", text }],
+      prompt: blocks,
     });
-    this.echoUserMessage(sessionId, text);
+    this.echoUserMessage(sessionId, blocks);
   }
 
   /** ACP doesn't echo a prompt you send back as a `user_message_chunk` (that
@@ -441,22 +519,26 @@ export class AgentClient implements vscode.Disposable {
    *  content that should stay pinned as "the last item of the completed
    *  turn." Firing it through the same `onSessionUpdate` every view already
    *  subscribes to fixes that for all of them in one place, instead of each
-   *  view needing its own client-side optimistic echo. */
-  private echoUserMessage(sessionId: SessionId, text: string): void {
-    this.sessionUpdateEmitter.fire({
-      sessionId,
-      update: {
-        sessionUpdate: "user_message_chunk",
-        content: { type: "text", text },
-        // A fresh id on every call, never reused: each call is one complete,
-        // distinct message (unlike a real agent's streamed chunks, which
-        // share one id across several calls) — see appendUserChunk's doc
-        // comment for why reusing the previous block's id here would be
-        // wrong (it's what glued "/clear" onto the next message typed after
-        // it, with no agent turn landing in between to force a new block).
-        messageId: randomUUID(),
-      },
-    });
+   *  view needing its own client-side optimistic echo.
+   *
+   *  Fires one event per block (matching how the bridge itself replays a
+   *  multi-block message — see integration_points.md's note on
+   *  `toAcpNotifications`) rather than one event carrying the whole array,
+   *  since `user_message_chunk`'s `content` field is a single `ContentBlock`,
+   *  not an array — the webview's reducer merges consecutive chunks sharing
+   *  the same `messageId` back into one block (state.ts's
+   *  `appendUserChunk`/`sameMessage`), so every block fired here shares one
+   *  freshly generated id, never reused across calls (see `appendUserChunk`'s
+   *  doc comment for why reusing the previous call's id would be wrong —
+   *  it's what used to glue "/clear" onto the next message typed after it). */
+  private echoUserMessage(sessionId: SessionId, blocks: ContentBlock[]): void {
+    const messageId = randomUUID();
+    for (const content of blocks) {
+      this.sessionUpdateEmitter.fire({
+        sessionId,
+        update: { sessionUpdate: "user_message_chunk", content, messageId },
+      });
+    }
   }
 
   /** Neither bridge actually lists its reset command (see `RESET_COMMANDS`)

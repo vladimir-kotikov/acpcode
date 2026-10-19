@@ -12,7 +12,10 @@ import {
   type ToolCallUpdate,
   type UsageUpdate,
 } from "@agentclientprotocol/sdk";
-import type { SessionViewMeta } from "../shared/sessionViewProtocol.ts";
+import type {
+  Attachment,
+  SessionViewMeta,
+} from "../shared/sessionViewProtocol.ts";
 
 export type Action =
   // `restoredDraftText`: an in-progress draft recovered from vscode.setState
@@ -36,7 +39,11 @@ export type Action =
   // ViewState.pendingSteerText). A plain send needs no provisional bubble:
   // its real echo lands the instant `prompt()` is called, host-side, well
   // before any reply — see AgentClient.echoUserMessage's comment.
-  | { type: "draftSent"; pendingSteerText?: string }
+  | {
+      type: "draftSent";
+      pendingSteerText?: string;
+      pendingSteerAttachments?: Attachment[];
+    }
   | {
       type: "permissionRequest";
       requestId: string;
@@ -47,6 +54,8 @@ export type Action =
   | { type: "localPermissionResponse"; requestId: string; optionId: string }
   | { type: "permissionResolved"; requestId: string }
   | { type: "draftChanged"; text: string }
+  | { type: "attachmentsAdded"; attachments: Attachment[] }
+  | { type: "attachmentRemoved"; id: string }
   | { type: "closed" }
   // The agent's own history-reset command (e.g. Claude's `/clear`) was just
   // sent — see AgentClient.prompt's RESET_COMMANDS check. Empties the
@@ -125,6 +134,7 @@ export interface UserBlock {
   // merge those into one bubble, gluing the next message's text onto the
   // command's.
   messageId?: string | null;
+  attachments: Attachment[];
 }
 
 export type Block = NoteBlock | UserBlock | TurnBlock;
@@ -144,11 +154,22 @@ export interface ViewState {
   // "sessionUpdate"/"replayBatch" (cleared there; see the reducer). Unset for
   // a plain (non-steering) send, which never has a provisional phase.
   pendingSteerText: string | undefined;
+  // Companion to pendingSteerText — same lifecycle (set in `draftSent`,
+  // cleared the moment real content lands for this session).
+  pendingSteerAttachments: Attachment[] | undefined;
   // Text currently typed in the composer, plus every other session's typed
   // text this webview has seen — swapped in/out on session switch so a draft
   // never lingers to be sent to the wrong session, and isn't lost either.
   draftText: string;
   drafts: Map<SessionId, string>;
+  // Files/images attached to the in-progress draft. Unlike `draftText`, NOT
+  // preserved across a session switch (no `Map<SessionId, Attachment[]>`
+  // companion to `drafts`) — deliberately simpler for now, since attaching
+  // something and then switching sessions before sending is a rare enough
+  // path that losing the attachment (same as any other unsent draft chip UI)
+  // is an acceptable corner to cut rather than doubling the persistence
+  // machinery this early.
+  attachments: Attachment[];
   // Replaces the plain "Working…" note while set — e.g. "Retrying Claude,
   // attempt 2 of 10." from the AIR session-failure extension. Cleared once
   // real content resumes (it's stale by then) or the turn ends.
@@ -189,8 +210,10 @@ export const initialState: ViewState = {
   loading: false,
   connecting: false,
   pendingSteerText: undefined,
+  pendingSteerAttachments: undefined,
   draftText: "",
   drafts: new Map(),
+  attachments: [],
   statusText: undefined,
   availableCommands: [],
   configOptions: [],
@@ -221,9 +244,11 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
         loading: true,
         connecting: false,
         pendingSteerText: undefined,
+        pendingSteerAttachments: undefined,
         draftText:
           drafts.get(action.meta.sessionId) ?? action.restoredDraftText ?? "",
         drafts,
+        attachments: [],
         statusText: undefined,
         availableCommands: [],
         configOptions: [],
@@ -246,6 +271,7 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
       loading: false,
       connecting: false,
       pendingSteerText: undefined,
+      pendingSteerAttachments: undefined,
       statusText: undefined,
     }))
     .with({ type: "sendStart" }, () => ({
@@ -271,12 +297,22 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
         ...state,
         draftText: "",
         drafts,
+        attachments: [],
         pendingSteerText: action.pendingSteerText,
+        pendingSteerAttachments: action.pendingSteerAttachments,
       };
     })
     .with({ type: "draftChanged" }, action => ({
       ...state,
       draftText: action.text,
+    }))
+    .with({ type: "attachmentsAdded" }, action => ({
+      ...state,
+      attachments: [...state.attachments, ...action.attachments],
+    }))
+    .with({ type: "attachmentRemoved" }, action => ({
+      ...state,
+      attachments: state.attachments.filter(a => a.id !== action.id),
     }))
     .with({ type: "sessionUpdate" }, action =>
       action.sessionId === state.meta?.sessionId
@@ -289,6 +325,7 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
             // echoes after its request resolves) — clear the provisional
             // bubble so it doesn't sit duplicated alongside the real one.
             pendingSteerText: undefined,
+            pendingSteerAttachments: undefined,
           }
         : state,
     )
@@ -297,6 +334,7 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
         ? {
             ...state,
             pendingSteerText: undefined,
+            pendingSteerAttachments: undefined,
             ...action.updates.reduce<UpdateResult>(applyOneUpdate, state),
             loading: false,
             busy: action.busy,
@@ -351,7 +389,7 @@ const applySessionUpdate = (blocks: Block[], update: SessionUpdate): Block[] =>
   match(update)
     .returnType<Block[]>()
     .with({ sessionUpdate: "user_message_chunk" }, u =>
-      appendUserChunk(blocks, textOf(u.content), u.messageId),
+      appendUserChunk(blocks, u.content, u.messageId),
     )
     .with({ sessionUpdate: "agent_message_chunk" }, u =>
       appendText(blocks, "agent", textOf(u.content), u.messageId),
@@ -479,16 +517,98 @@ const sameMessage = (
   b: string | null | undefined,
 ): boolean => (a ?? undefined) === (b ?? undefined);
 
+// Only resource_link/image/resource ever reach here as a non-text chunk (the
+// only content-block types AgentClient.attachmentToBlock ever produces) —
+// audio is never sent, so it's not handled; an unrecognized/audio block is
+// dropped rather than crashing, matching textOf's own permissive fallback.
+function attachmentFromContentBlock(
+  block: ContentBlock,
+): Attachment | undefined {
+  if (block.type === "resource_link") {
+    return {
+      id: genId(),
+      uri: block.uri,
+      name: block.name,
+      mimeType: block.mimeType ?? undefined,
+    };
+  }
+  if (block.type === "image") {
+    return {
+      id: genId(),
+      uri: block.uri ?? undefined,
+      name: block.uri?.split(/[\\/]/).pop() ?? "Image",
+      mimeType: block.mimeType,
+      data: block.uri ? undefined : block.data,
+    };
+  }
+  if (block.type === "resource") {
+    const uri = block.resource.uri;
+    return {
+      id: genId(),
+      uri,
+      name: uri.split(/[\\/]/).pop() ?? uri,
+      mimeType: block.resource.mimeType ?? undefined,
+    };
+  }
+  return undefined;
+}
+
+// One logical user message can replay as several sequential
+// user_message_chunk updates, one per content block (see
+// AgentClient.echoUserMessage's doc comment and integration_points.md) —
+// text chunks concatenate onto the trailing user block same as before;
+// attachment chunks (resource_link/image/resource) append onto that same
+// block's `attachments` instead of being coerced into text. `sameMessage`
+// (not just "is the trailing block a user block") decides whether a chunk
+// continues the previous message or starts a new one — adjacency alone
+// isn't reliable: two genuinely separate user turns land adjacent in
+// `blocks` whenever nothing the agent produced in between became its own
+// block (e.g. a local-only command like `/clear`), and without this check
+// appendUserChunk would glue the next message onto the previous one.
 function appendUserChunk(
   blocks: Block[],
-  text: string,
+  content: ContentBlock,
   messageId: string | null | undefined,
 ): Block[] {
   const last = lastBlock(blocks);
-  if (last?.type === "user" && sameMessage(last.messageId, messageId)) {
-    return [...blocks.slice(0, -1), { ...last, text: last.text + text }];
+  if (content.type === "text") {
+    if (last?.type === "user" && sameMessage(last.messageId, messageId)) {
+      return [
+        ...blocks.slice(0, -1),
+        { ...last, text: last.text + content.text },
+      ];
+    }
+    return [
+      ...blocks,
+      {
+        type: "user",
+        id: genId(),
+        text: content.text,
+        attachments: [],
+        messageId,
+      },
+    ];
   }
-  return [...blocks, { type: "user", id: genId(), text, messageId }];
+  const attachment = attachmentFromContentBlock(content);
+  if (!attachment) {
+    return blocks;
+  }
+  if (last?.type === "user" && sameMessage(last.messageId, messageId)) {
+    return [
+      ...blocks.slice(0, -1),
+      { ...last, attachments: [...last.attachments, attachment] },
+    ];
+  }
+  return [
+    ...blocks,
+    {
+      type: "user",
+      id: genId(),
+      text: "",
+      attachments: [attachment],
+      messageId,
+    },
+  ];
 }
 
 function appendText(

@@ -6,7 +6,9 @@ import {
 } from "@agentclientprotocol/sdk";
 import { html } from "htm/preact";
 import { useEffect, useRef, useState } from "preact/hooks";
+import type { Attachment } from "../../shared/sessionViewProtocol.ts";
 import { ViewState } from "../state.ts";
+import { AttachmentChipList, filePathFromUri } from "./attachmentChip.ts";
 
 // Which config options get a chip, in the order they're shown. "mode" is the
 // session permission/approval mode (claude-agent-acp's "Ask Before Edits"
@@ -184,12 +186,111 @@ const StopIcon = () =>
     <rect x="4" y="4" width="8" height="8" rx="1.5" />
   </svg>`;
 
+// Below this, a plain-text paste isn't worth a round-trip to
+// RecentSelectionTracker — matches the host's own minimum (see
+// sessionViewProvider.ts), purely to skip a pointless message for an
+// obviously-too-short paste; the host enforces the real threshold either way.
+const MIN_SOURCE_MATCH_LENGTH = 20;
+
+function parseUriList(text: string): string[] {
+  return text
+    .split(/\r\n|\n/)
+    .map(line => line.trim())
+    .filter(line => line && !line.startsWith("#"));
+}
+
+function attachmentFromUri(uri: string): Attachment {
+  let name = uri;
+  try {
+    name = decodeURIComponent(new URL(uri).pathname.split("/").pop() || uri);
+  } catch {
+    // Not a parseable URI — fall back to the raw string as the name too.
+  }
+  return { id: crypto.randomUUID(), uri, name };
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  let binary = "";
+  for (const byte of new Uint8Array(buffer)) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+/** A dropped/pasted OS file has no `uri` unless Electron happens to expose
+ *  the real path on the `File` object (`.path` — not part of the standard
+ *  File API, and Electron's been deprecating it, so this can't be relied on
+ *  across builds). When it's there, treat it exactly like a uri-list entry —
+ *  cheapest for the agent, no bytes cross the wire. When it's not: an image
+ *  can still be inlined by reading its bytes directly (gated on the
+ *  connected agent's `promptCapabilities.image`); a non-image file has
+ *  nothing left to fall back to. */
+function fileToAttachment(
+  file: File,
+  canAttachImages: boolean,
+): Promise<Attachment> {
+  const path = (file as unknown as { path?: string }).path;
+  if (path) {
+    return Promise.resolve({
+      id: crypto.randomUUID(),
+      uri: `file://${path}`,
+      name: file.name,
+      mimeType: file.type || undefined,
+    });
+  }
+  const isImage = file.type.startsWith("image/");
+  if (!isImage) {
+    return Promise.reject(
+      new Error(
+        `Can't attach "${file.name}" — no source path available. Try dragging it from the Explorer instead.`,
+      ),
+    );
+  }
+  if (!canAttachImages) {
+    return Promise.reject(
+      new Error(
+        `Can't attach "${file.name}" — the connected agent doesn't support image attachments.`,
+      ),
+    );
+  }
+  return file.arrayBuffer().then(buffer => ({
+    id: crypto.randomUUID(),
+    name: file.name || "pasted-image",
+    mimeType: file.type || undefined,
+    data: arrayBufferToBase64(buffer),
+  }));
+}
+
+/** Shared by drag-drop and paste — both hand over a `DataTransfer` (a paste
+ *  event's `clipboardData` is the same type). `text/uri-list` is checked
+ *  first and, when present, wins outright: it's how VS Code's own
+ *  Explorer/tab drag identifies files, and typically how a file copied in
+ *  Finder/Explorer shows up too — cheaper and more reliable than the raw
+ *  `File` fallback, which depends on the `.path` availability above. */
+function collectAttachments(
+  data: DataTransfer,
+  canAttachImages: boolean,
+): Promise<Attachment[]> {
+  const uriList = data.getData("text/uri-list");
+  if (uriList) {
+    return Promise.resolve(parseUriList(uriList).map(attachmentFromUri));
+  }
+  return Promise.all(
+    Array.from(data.files).map(file => fileToAttachment(file, canAttachImages)),
+  );
+}
+
 interface ComposerProps {
   state: ViewState;
-  onSend: (text: string) => void;
+  onSend: (text: string, attachments: Attachment[]) => void;
   onCancel: () => void;
   onDraftChange: (text: string) => void;
   onSetConfigOption: (configId: string, value: string | boolean) => void;
+  onAttachmentsAdded: (attachments: Attachment[]) => void;
+  onAttachmentRemoved: (id: string) => void;
+  onAttachError: (message: string) => void;
+  onResolvePastedSource: (text: string) => Promise<Attachment | undefined>;
+  onOpenFile: (path: string, line?: number) => void;
 }
 
 export const Composer = ({
@@ -198,6 +299,11 @@ export const Composer = ({
   onCancel,
   onDraftChange,
   onSetConfigOption,
+  onAttachmentsAdded,
+  onAttachmentRemoved,
+  onAttachError,
+  onResolvePastedSource,
+  onOpenFile,
 }: ComposerProps) => {
   const disabled = !state.meta;
   const chipOptions = CHIP_CATEGORIES.map(category =>
@@ -208,6 +314,7 @@ export const Composer = ({
   // would interrupt the running turn instead of injecting into it, so fall
   // back to the old block-until-idle behavior for agents that don't.
   const steeringBlocked = state.busy && !state.meta?.canSteer;
+  const canAttachImages = !!state.meta?.canAttachImages;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [dismissed, setDismissed] = useState(false);
@@ -272,10 +379,14 @@ export const Composer = ({
 
   function submit(): void {
     const trimmed = state.draftText.trim();
-    if (!trimmed || disabled || steeringBlocked) {
+    if (
+      (!trimmed && state.attachments.length === 0) ||
+      disabled ||
+      steeringBlocked
+    ) {
       return;
     }
-    onSend(trimmed);
+    onSend(trimmed, state.attachments);
     setHistoryIndex(undefined);
     setPendingDraft(undefined);
   }
@@ -326,8 +437,55 @@ export const Composer = ({
     return true;
   }
 
+  function addAttachments(promise: Promise<Attachment[]>): void {
+    promise
+      .then(onAttachmentsAdded)
+      .catch((err: Error) => onAttachError(err.message));
+  }
+
+  function onDrop(event: DragEvent): void {
+    event.preventDefault();
+    if (event.dataTransfer) {
+      addAttachments(collectAttachments(event.dataTransfer, canAttachImages));
+    }
+  }
+
+  function onPaste(event: ClipboardEvent): void {
+    const data = event.clipboardData;
+    if (!data) {
+      return;
+    }
+    if (data.getData("text/uri-list") || data.files.length > 0) {
+      event.preventDefault();
+      addAttachments(collectAttachments(data, canAttachImages));
+      return;
+    }
+    // Plain text paste — leave the default text insertion alone, but also
+    // check whether it matches a recently-selected editor range (see
+    // RecentSelectionTracker in sessionViewProvider.ts) so the source file
+    // gets attached alongside the pasted text.
+    const text = data.getData("text/plain");
+    if (text.trim().length >= MIN_SOURCE_MATCH_LENGTH) {
+      onResolvePastedSource(text).then(attachment => {
+        if (attachment) {
+          onAttachmentsAdded([attachment]);
+        }
+      });
+    }
+  }
+
+  function openAttachment(attachment: Attachment): void {
+    if (attachment.uri) {
+      onOpenFile(filePathFromUri(attachment.uri), attachment.line);
+    }
+  }
+
   return html`
-    <div class="input-bar">
+    <div
+      class="input-bar"
+      onDragOver=${(event: DragEvent) => event.preventDefault()}
+      onDrop=${onDrop}
+    >
       ${
         suggestions.length > 0
           ? html`<${SlashCommandMenu}
@@ -337,6 +495,11 @@ export const Composer = ({
             />`
           : null
       }
+      <${AttachmentChipList}
+        attachments=${state.attachments}
+        onOpen=${openAttachment}
+        onRemove=${onAttachmentRemoved}
+      />
       <textarea
         ref=${textareaRef}
         class="prompt-input"
@@ -351,6 +514,7 @@ export const Composer = ({
           setHistoryIndex(undefined);
           setPendingDraft(undefined);
         }}
+        onPaste=${onPaste}
         onKeyDown=${(event: KeyboardEvent) => {
           if (suggestions.length > 0) {
             if (event.key === "ArrowDown") {
@@ -407,11 +571,14 @@ export const Composer = ({
         </div>
         ${(() => {
           // One button instead of two: while busy, it's "Send" (steering)
-          // whenever there's actually something typed to inject, otherwise
-          // there's nothing useful Send could do — "Stop" is the only
-          // meaningful action, so that's what takes over the slot.
+          // whenever there's actually something to inject (text or an
+          // attachment), otherwise there's nothing useful Send could do —
+          // "Stop" is the only meaningful action, so that's what takes over
+          // the slot.
           const canSend =
-            !disabled && !steeringBlocked && !!state.draftText.trim();
+            !disabled &&
+            !steeringBlocked &&
+            (!!state.draftText.trim() || state.attachments.length > 0);
           const showStop = state.busy && !canSend;
           const label = showStop ? "Stop" : "Send";
           return html`<button
