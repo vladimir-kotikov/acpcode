@@ -1,5 +1,6 @@
 import type {
   PermissionOption,
+  SessionConfigOption,
   SessionInfo,
   SessionUpdate,
   ToolCallContent,
@@ -8,8 +9,8 @@ import type {
 import {
   ActionType,
   AhpErrorCodes,
-  JsonRpcErrorCodes,
   ConfirmationOptionKind,
+  JsonRpcErrorCodes,
   MessageAttachmentKind,
   MessageKind,
   ResponsePartKind,
@@ -30,12 +31,22 @@ import {
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { Disposable, Output } from "../shared/events.ts";
 import { describeError, type AgentClient } from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
+import type { Disposable, Output } from "../shared/events.ts";
 import type { Attachment } from "../shared/sessionViewProtocol.ts";
 import { buildDiffText } from "../webview/diffText.ts";
+import {
+  accepts,
+  configSchema,
+  configValues,
+  modelOption,
+  modelsOf,
+  resolveConfig,
+  resolveModelConfig,
+  type ConfigValue,
+} from "./configOptions.ts";
 import { AhpRequestError, AhpServer, ROOT_CHANNEL } from "./server.ts";
 
 const DEFAULT_CHAT_TITLE = "New chat";
@@ -75,6 +86,8 @@ interface Binding {
   markdownPartId?: string;
   reasoningPartId?: string;
   readonly toolCalls: Map<string, ToolCallTracking>;
+  /** The ACP session's config options, once it's created or loaded. */
+  configOptions?: SessionConfigOption[];
 }
 
 /** AHP provider IDs double as URI schemes VS Code builds draft-session
@@ -145,6 +158,12 @@ export interface AgentHostEnvironment {
   agents(): AgentConfig[];
   /** Folders whose sessions to list; the first one is the default cwd. */
   folders(): string[];
+  /** Last-seen ACP config options per agent name, persisted so model lists
+   *  and config pickers are there before any of its sessions is opened. */
+  configCache: {
+    load(): Record<string, SessionConfigOption[]>;
+    save(cache: Record<string, SessionConfigOption[]>): void;
+  };
 }
 
 /** Exposes the configured ACP agents through an `AhpServer`, so VS Code's
@@ -159,6 +178,7 @@ export class AcpAgentHost implements Disposable {
   private readonly byAcpSession = new Map<string, Binding>(); // by `${agent}\0${sessionId}`
   private readonly hookedClients = new WeakSet<AgentClient>();
   private readonly env: AgentHostEnvironment;
+  private readonly knownOptions: Record<string, SessionConfigOption[]>;
 
   constructor(
     pool: AgentConnectionPool,
@@ -168,6 +188,7 @@ export class AcpAgentHost implements Disposable {
     this.pool = pool;
     this.output = output;
     this.env = env;
+    this.knownOptions = env.configCache.load();
     this.server = new AhpServer(
       {
         handlers: {
@@ -176,16 +197,25 @@ export class AcpAgentHost implements Disposable {
             this.createSession(params),
           disposeSession: ({ channel }: { channel: string }) =>
             this.disposeSession(channel),
-          // ponytail: ACP config options (model, mode, effort) aren't exposed
-          // yet — an empty schema makes VS Code use the agent's defaults.
           resolveSessionConfig: ({
+            provider,
             config,
           }: {
+            provider?: string;
             config?: Record<string, unknown>;
-          }) => ({
-            schema: { type: "object", properties: {} },
-            values: config ?? {},
-          }),
+          }) => {
+            const agent = this.env
+              .agents()
+              .find(a => providerId(a) === provider);
+            if (!agent) {
+              return { schema: { type: "object", properties: {} }, values: {} };
+            }
+            const options = this.knownOptions[agent.name] ?? [];
+            return {
+              schema: configSchema(options, agent.kind),
+              values: { ...configValues(options, agent.kind), ...config },
+            };
+          },
           sessionConfigCompletions: () => ({ items: [] }),
         },
         materialize: channel => this.materialize(channel),
@@ -215,10 +245,101 @@ export class AcpAgentHost implements Disposable {
       provider: providerId(agent),
       displayName: agent.name,
       description: `${agent.kind} via ACP`,
-      // ponytail: one placeholder model; the agent's real model list arrives
-      // as ACP config options, which aren't mapped yet.
-      models: [{ id: "default", provider: providerId(agent), name: "Default" }],
+      // Until one of its sessions has been opened, the agent's models aren't
+      // known; "Default" leaves the choice to the agent.
+      models: modelsOf(
+        this.knownOptions[agent.name] ?? [],
+        providerId(agent),
+      ) ?? [{ id: "default", provider: providerId(agent), name: "Default" }],
     }));
+  }
+
+  /** Records a session's current options; they also become the agent's
+   *  defaults for model lists and new sessions. */
+  private rememberOptions(
+    binding: Binding,
+    options: SessionConfigOption[],
+  ): void {
+    binding.configOptions = options;
+    const name = binding.agent.name;
+    const provider = providerId(binding.agent);
+    const modelsBefore = JSON.stringify(
+      modelsOf(this.knownOptions[name] ?? [], provider),
+    );
+    this.knownOptions[name] = options;
+    this.env.configCache.save(this.knownOptions);
+    if (JSON.stringify(modelsOf(options, provider)) !== modelsBefore) {
+      this.agentsChanged();
+    }
+  }
+
+  /** Sets one ACP config option if it isn't already `value`; the agent
+   *  answers with the full, possibly changed, option list. */
+  private async setOption(
+    binding: Binding,
+    option: SessionConfigOption,
+    value: ConfigValue,
+  ): Promise<void> {
+    if (option.currentValue === value) {
+      return;
+    }
+    const client = await this.connect(binding);
+    const options = await client.setConfigOption(
+      binding.sessionId!,
+      option.id,
+      value,
+    );
+    this.rememberOptions(binding, options);
+  }
+
+  /** Switches the ACP session to the model (and effort etc.) the message
+   *  was sent with. */
+  private async applyModelSelection(
+    binding: Binding,
+    message: Message,
+  ): Promise<void> {
+    const options = () => binding.configOptions ?? [];
+    const model = modelOption(options());
+    if (model && accepts(model, message.model?.id)) {
+      await this.setOption(binding, model, message.model.id);
+    }
+    // Looked up again after each change: the agent may change the list.
+    for (const [key, value] of Object.entries(message.model?.config ?? {})) {
+      const target = resolveModelConfig(options(), key, value);
+      if (target) {
+        await this.setOption(binding, target.option, target.value);
+      }
+    }
+  }
+
+  /** Applies AHP config values (`acp.<id>` keys) to the ACP session, then
+   *  publishes what the agent actually ended up with. */
+  private async applyConfig(
+    binding: Binding,
+    config: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await (binding.ready ?? this.ensureLoaded(binding));
+      for (const [key, value] of Object.entries(config)) {
+        const target = resolveConfig(
+          binding.configOptions ?? [],
+          binding.agent.kind,
+          key,
+          value,
+        );
+        if (target) {
+          await this.setOption(binding, target.option, target.value);
+        }
+      }
+    } catch (err) {
+      this.output.appendLine(`[config] ${describeError(err)}`);
+    }
+    if (binding.configOptions) {
+      this.server.dispatch(binding.sessionUri, {
+        type: ActionType.SessionConfigChanged,
+        config: configValues(binding.configOptions, binding.agent.kind),
+      });
+    }
   }
 
   private defaultCwd(): string {
@@ -333,6 +454,8 @@ export class AcpAgentHost implements Disposable {
 
   private sessionState(binding: Binding): SessionState {
     const { title } = binding;
+    const options =
+      binding.configOptions ?? this.knownOptions[binding.agent.name] ?? [];
     const chat: ChatSummary = {
       resource: binding.chatUri,
       title,
@@ -348,6 +471,13 @@ export class AcpAgentHost implements Disposable {
       chats: [chat],
       defaultChat: binding.chatUri,
       workingDirectories: [pathToFileURL(binding.cwd).href],
+      // AHP can't change a session's config schema later, only its values,
+      // so a session created before its options are known uses the agent's
+      // last-seen ones.
+      config: {
+        schema: configSchema(options, binding.agent.kind),
+        values: configValues(options, binding.agent.kind),
+      },
     };
   }
 
@@ -361,15 +491,22 @@ export class AcpAgentHost implements Disposable {
     };
   }
 
-  /** First subscribe to a listed session/chat: create its state, and for the
-   *  chat, load the ACP session so its history replays into turns before the
-   *  snapshot is taken. Unknown URIs (incl. VS Code's `<provider>:/untitled-…`
-   *  drafts) are left alone and answer NotFound. */
+  /** First subscribe to a listed session/chat: load the ACP session so its
+   *  history replays into the chat's turns, and its config options are known,
+   *  before either snapshot is taken. Unknown URIs (incl. VS Code's
+   *  `<provider>:/untitled-…` drafts) are left alone and answer NotFound. */
   private async materialize(channel: string): Promise<void> {
     const binding = this.bindings.get(channel);
     if (!binding) {
       return;
     }
+    if (!this.server.has(binding.chatUri)) {
+      this.server.create(binding.chatUri, "chat", this.chatState(binding));
+    }
+    const loaded = this.ensureLoaded(binding);
+    // The session opens even if its history can't be loaded; subscribing to
+    // the chat reports why.
+    await loaded.catch(() => undefined);
     if (!this.server.has(binding.sessionUri)) {
       this.server.create(
         binding.sessionUri,
@@ -377,9 +514,8 @@ export class AcpAgentHost implements Disposable {
         this.sessionState(binding),
       );
     }
-    if (channel === binding.chatUri && !this.server.has(binding.chatUri)) {
-      this.server.create(binding.chatUri, "chat", this.chatState(binding));
-      await this.ensureLoaded(binding);
+    if (channel === binding.chatUri) {
+      await loaded;
     }
   }
 
@@ -391,7 +527,13 @@ export class AcpAgentHost implements Disposable {
         // ponytail: loading a session the webview frontend also has open on
         // this connection replays its history into that view a second time
         // (see SessionViewSession.attachSession's `seed`).
-        await client.loadSession(binding.sessionId!, binding.cwd);
+        const response = await client.loadSession(
+          binding.sessionId!,
+          binding.cwd,
+        );
+        if (response?.configOptions) {
+          this.rememberOptions(binding, response.configOptions);
+        }
         this.flushReplayedUserMessage(binding);
         this.endTurn(binding, ActionType.ChatTurnComplete);
       } finally {
@@ -407,7 +549,7 @@ export class AcpAgentHost implements Disposable {
     return binding.ready;
   }
 
-  private createSession(params: CreateSessionParams): null {
+  private createSession(params: CreateSessionParams): Promise<null> {
     const agent = this.env
       .agents()
       .find(a => providerId(a) === params.provider);
@@ -427,32 +569,50 @@ export class AcpAgentHost implements Disposable {
       `ahp-chat:/${randomUUID()}`,
       cwd,
     );
-    this.server.create(binding.sessionUri, "session", {
-      ...this.sessionState(binding),
-      lifecycle: SessionLifecycle.Creating,
-    });
     this.server.create(binding.chatUri, "chat", this.chatState(binding));
-    binding.ready = (async () => {
-      const client = await this.connect(binding);
-      const response = await client.newSession(cwd);
-      this.bind(binding, response.sessionId);
-    })();
-    binding.ready.then(
-      () =>
-        this.server.dispatch(binding.sessionUri, {
-          type: ActionType.SessionReady,
-        }),
-      err =>
-        this.server.dispatch(binding.sessionUri, {
-          type: ActionType.SessionCreationFailed,
-          error: { errorType: "agentError", message: describeError(err) },
-        }),
+    const ready = this.connect(binding)
+      .then(client => client.newSession(cwd))
+      .then(response => {
+        this.bind(binding, response.sessionId);
+        if (response.configOptions) {
+          this.rememberOptions(binding, response.configOptions);
+        }
+      });
+    binding.ready = ready;
+    // The session's config schema can't change once it's published, so the
+    // first session of an agent waits until its options are known.
+    const known = agent.name in this.knownOptions;
+    return (known ? Promise.resolve() : ready.catch(() => undefined)).then(
+      () => {
+        const initial = this.sessionState(binding);
+        this.server.create(binding.sessionUri, "session", {
+          ...initial,
+          lifecycle: SessionLifecycle.Creating,
+          config: initial.config && {
+            ...initial.config,
+            values: { ...initial.config.values, ...params.config },
+          },
+        });
+        ready.then(
+          () => {
+            this.server.dispatch(binding.sessionUri, {
+              type: ActionType.SessionReady,
+            });
+            void this.applyConfig(binding, params.config ?? {});
+          },
+          err =>
+            this.server.dispatch(binding.sessionUri, {
+              type: ActionType.SessionCreationFailed,
+              error: { errorType: "agentError", message: describeError(err) },
+            }),
+        );
+        this.server.notify("root/sessionAdded", {
+          channel: ROOT_CHANNEL,
+          summary: this.summary(binding, new Date().toISOString()),
+        });
+        return null;
+      },
     );
-    this.server.notify("root/sessionAdded", {
-      channel: ROOT_CHANNEL,
-      summary: this.summary(binding, new Date().toISOString()),
-    });
-    return null;
   }
 
   /** Forgets the session on this host only — the agent keeps its transcript,
@@ -498,7 +658,13 @@ export class AcpAgentHost implements Disposable {
 
   private onClientAction(channel: string, action: StateAction): void {
     const binding = this.bindings.get(channel);
-    if (!binding || channel !== binding.chatUri) {
+    if (!binding) {
+      return;
+    }
+    if (channel === binding.sessionUri) {
+      if (action.type === ActionType.SessionConfigChanged) {
+        void this.applyConfig(binding, action.config);
+      }
       return;
     }
     switch (action.type) {
@@ -547,6 +713,7 @@ export class AcpAgentHost implements Disposable {
     }
     try {
       await (binding.ready ?? this.ensureLoaded(binding));
+      await this.applyModelSelection(binding, message);
       const client = await this.connect(binding);
       const { stopReason, failureTitle } = await client.prompt(
         binding.sessionId!,
@@ -642,6 +809,14 @@ export class AcpAgentHost implements Disposable {
       }
       return;
     }
+    if (update.sessionUpdate === "config_option_update") {
+      this.rememberOptions(binding, update.configOptions);
+      this.server.dispatch(binding.sessionUri, {
+        type: ActionType.SessionConfigChanged,
+        config: configValues(update.configOptions, binding.agent.kind),
+      });
+      return;
+    }
     if (update.sessionUpdate === "session_info_update") {
       if (update.title) {
         this.setTitle(binding, update.title);
@@ -683,8 +858,8 @@ export class AcpAgentHost implements Disposable {
         }
         this.updateToolCall(binding, turnId, update);
         return;
-      // ponytail: plan, available commands, config options, usage and mode
-      // updates aren't mapped yet.
+      // ponytail: plan, available commands, usage and mode updates aren't
+      // mapped yet.
     }
   }
 

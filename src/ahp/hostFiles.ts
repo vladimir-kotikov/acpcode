@@ -24,6 +24,8 @@ export interface WindowInfo {
 export const hostFiles = (dir: string) => ({
   host: path.join(dir, "host.json"),
   config: path.join(dir, "config.json"),
+  /** Written by the host: last-seen ACP config options per agent. */
+  configOptions: path.join(dir, "configOptions.json"),
   windows: path.join(dir, "windows"),
   log: path.join(dir, "host.log"),
 });

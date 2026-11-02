@@ -80,7 +80,14 @@ const folders = (): string[] => {
 };
 
 const pool = new AgentConnectionPool(name => output(`[${name}] `));
-const host = new AcpAgentHost(pool, log, { agents: () => agents, folders });
+const host = new AcpAgentHost(pool, log, {
+  agents: () => agents,
+  folders,
+  configCache: {
+    load: () => readJson(files.configOptions) ?? {},
+    save: cache => fs.writeFileSync(files.configOptions, JSON.stringify(cache)),
+  },
+});
 
 fs.mkdirSync(files.windows, { recursive: true });
 // ponytail: fs.watch fires several times per write on macOS; loadAgents
