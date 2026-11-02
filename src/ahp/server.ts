@@ -20,7 +20,7 @@ import {
   type Snapshot,
   type StateAction,
 } from "@microsoft/agent-host-protocol";
-import * as vscode from "vscode";
+import type { Disposable, Output } from "../shared/events.ts";
 import { WebSocketServer, type WebSocket } from "ws";
 
 export const ROOT_CHANNEL = "ahp-root://";
@@ -58,17 +58,20 @@ export interface AhpServerHooks {
 }
 
 type ChannelState = RootState | SessionState | ChatState;
+/** Which reducer a channel's state goes through. Not derivable from the URI:
+ *  sessions created by the client live under its own `<provider>:/…` URI. */
+export type ChannelKind = "root" | "session" | "chat";
 
 function reduce(
-  channel: string,
+  kind: ChannelKind,
   state: ChannelState,
   action: StateAction,
   log: (msg: string) => void,
 ): ChannelState {
-  if (channel.startsWith("ahp-root:")) {
+  if (kind === "root") {
     return rootReducer(state as RootState, action as RootAction, log);
   }
-  if (channel.startsWith("ahp-session:")) {
+  if (kind === "session") {
     return sessionReducer(state as SessionState, action as SessionAction, log);
   }
   return chatReducer(state as ChatState, action as ChatAction, log);
@@ -79,8 +82,9 @@ function reduce(
  *  same ones every client runs, so host and client can't disagree on what an
  *  action means), sequenced and broadcast to subscribers. Knows nothing about
  *  agents — `AhpServerHooks` supplies everything channel-specific. */
-export class AhpServer implements vscode.Disposable {
+export class AhpServer implements Disposable {
   private readonly states = new Map<string, ChannelState>();
+  private readonly kinds = new Map<string, ChannelKind>();
   private readonly subscribers = new Map<string, Set<AhpConnection>>();
   private readonly connections = new Set<AhpConnection>();
   private readonly replayBuffer: ActionEnvelope[] = [];
@@ -88,12 +92,12 @@ export class AhpServer implements vscode.Disposable {
   private serverSeq = 0;
   private wss?: WebSocketServer;
   private readonly hooks: AhpServerHooks;
-  private readonly output: vscode.OutputChannel;
+  private readonly output: Output;
   private readonly defaultDirectory: () => string | undefined;
 
   constructor(
     hooks: AhpServerHooks,
-    output: vscode.OutputChannel,
+    output: Output,
     defaultDirectory: () => string | undefined,
   ) {
     this.hooks = hooks;
@@ -120,18 +124,24 @@ export class AhpServer implements vscode.Disposable {
     });
   }
 
+  get connectionCount(): number {
+    return this.connections.size;
+  }
+
   has(channel: string): boolean {
     return this.states.has(channel);
   }
 
   /** Seeds a channel's initial state. No action is broadcast — nobody can be
    *  subscribed to a channel that didn't exist yet. */
-  create(channel: string, state: ChannelState): void {
+  create(channel: string, kind: ChannelKind, state: ChannelState): void {
     this.states.set(channel, state);
+    this.kinds.set(channel, kind);
   }
 
   delete(channel: string): void {
     this.states.delete(channel);
+    this.kinds.delete(channel);
     this.subscribers.delete(channel);
   }
 
@@ -158,7 +168,7 @@ export class AhpServer implements vscode.Disposable {
     if (state && !rejectionReason) {
       this.states.set(
         channel,
-        reduce(channel, state, action, msg =>
+        reduce(this.kinds.get(channel)!, state, action, msg =>
           this.output.appendLine(`[reducer] ${channel}: ${msg}`),
         ),
       );

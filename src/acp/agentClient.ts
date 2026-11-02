@@ -1,4 +1,5 @@
 import {
+  RequestError,
   client as createClientApp,
   methods,
   ndJsonStream,
@@ -27,7 +28,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import * as vscode from "vscode";
+import { Emitter, type Disposable, type Output } from "../shared/events.ts";
 import type { AgentConfig } from "./agents/config.ts";
 import { agentEnv } from "./agents/config.ts";
 import type { Attachment } from "../shared/sessionViewProtocol.ts";
@@ -135,11 +136,35 @@ export type TranscriptResetEvent = {
   sessionId: SessionId;
 };
 
+/** `RequestError`'s `message` is often just the generic JSON-RPC category
+ *  (e.g. "Internal error") — the agent-specific detail, when present, is in
+ *  `.data`, which `String(err)` drops entirely. An *uncaught* exception in the
+ *  bridge's request handler (as opposed to one it deliberately throws as a
+ *  `RequestError` with its own message) gets wrapped by the ACP SDK itself as
+ *  `internalError({ details: <original message> })` — unwrap that shape
+ *  directly instead of dumping raw JSON at the user. */
+export function describeError(err: unknown): string {
+  if (err instanceof RequestError) {
+    const data = err.data;
+    if (
+      data &&
+      typeof data === "object" &&
+      "details" in data &&
+      typeof data.details === "string"
+    ) {
+      return data.details;
+    }
+    const detail = data !== undefined ? ` ${JSON.stringify(data)}` : "";
+    return `${err.message}${detail}`;
+  }
+  return String(err);
+}
+
 /** One live ACP connection to an agent's bridge subprocess. Owns the child
  *  process and the session lifecycle; consumers (tree view, session viewer,
  *  chat webview) subscribe to its events rather than the client knowing
  *  about any particular UI's message shape. */
-export class AgentClient implements vscode.Disposable {
+export class AgentClient implements Disposable {
   private child?: ChildProcessWithoutNullStreams;
   private agent?: ClientContext;
   // Set in `connect()` — read by `prompt()` to look up this kind's reset
@@ -149,7 +174,7 @@ export class AgentClient implements vscode.Disposable {
     string,
     (response: RequestPermissionResponse) => void
   >();
-  private readonly output: vscode.OutputChannel;
+  private readonly output: Output;
   private permissionCounter = 0;
   private readonly cwd: string;
   // Advertised via InitializeResponse._meta.steering.supported (the agreed
@@ -162,17 +187,14 @@ export class AgentClient implements vscode.Disposable {
   // spec), everything else needs this check before it's safe to send.
   private promptCapabilities: PromptCapabilities = {};
 
-  private readonly connectionStateEmitter =
-    new vscode.EventEmitter<ConnectionState>();
-  private readonly sessionUpdateEmitter =
-    new vscode.EventEmitter<SessionUpdateEvent>();
+  private readonly connectionStateEmitter = new Emitter<ConnectionState>();
+  private readonly sessionUpdateEmitter = new Emitter<SessionUpdateEvent>();
   private readonly permissionRequestEmitter =
-    new vscode.EventEmitter<PermissionRequestEvent>();
-  private readonly permissionResolvedEmitter = new vscode.EventEmitter<{
+    new Emitter<PermissionRequestEvent>();
+  private readonly permissionResolvedEmitter = new Emitter<{
     requestId: string;
   }>();
-  private readonly transcriptResetEmitter =
-    new vscode.EventEmitter<TranscriptResetEvent>();
+  private readonly transcriptResetEmitter = new Emitter<TranscriptResetEvent>();
 
   readonly onConnectionStateChanged = this.connectionStateEmitter.event;
   readonly onSessionUpdate = this.sessionUpdateEmitter.event;
@@ -185,9 +207,9 @@ export class AgentClient implements vscode.Disposable {
   // rather than being each view's own problem to detect.
   readonly onTranscriptReset = this.transcriptResetEmitter.event;
 
-  constructor(cwd: string, label = "ACP Code") {
+  constructor(cwd: string, output: Output) {
     this.cwd = cwd;
-    this.output = vscode.window.createOutputChannel(label);
+    this.output = output;
   }
 
   async connect(agent: AgentConfig): Promise<void> {
@@ -409,14 +431,16 @@ export class AgentClient implements vscode.Disposable {
       });
     }
     if (isImage && this.canSendImages() && attachment.uri) {
-      return Promise.resolve(
-        vscode.workspace.fs.readFile(vscode.Uri.parse(attachment.uri)),
-      ).then(bytes => ({
-        type: "image",
-        data: Buffer.from(bytes).toString("base64"),
-        mimeType: attachment.mimeType!,
-        uri: attachment.uri,
-      }));
+      // ponytail: file: URIs only (vscode.workspace.fs also read untitled:/
+      // virtual documents); a non-file URI rejects instead of throwing.
+      return Promise.resolve(attachment.uri)
+        .then(uri => fs.promises.readFile(fileURLToPath(uri)))
+        .then(bytes => ({
+          type: "image",
+          data: Buffer.from(bytes).toString("base64"),
+          mimeType: attachment.mimeType!,
+          uri: attachment.uri,
+        }));
     }
     if (attachment.uri) {
       return Promise.resolve({

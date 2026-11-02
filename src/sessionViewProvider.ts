@@ -1,10 +1,10 @@
-import { RequestError, type SessionUpdate } from "@agentclientprotocol/sdk";
+import type { SessionUpdate } from "@agentclientprotocol/sdk";
 import * as crypto from "node:crypto";
 import { match } from "ts-pattern";
 import * as vscode from "vscode";
-import type { AgentClient } from "./acp/agentClient.ts";
+import { describeError, type AgentClient } from "./acp/agentClient.ts";
 import type { AgentConnectionPool } from "./acp/agentPool.ts";
-import { getAgent } from "./acp/agents/config.ts";
+import { getAgent } from "./settings.ts";
 import type {
   Attachment,
   HostToSessionViewMessage,
@@ -12,30 +12,6 @@ import type {
   SessionViewToHostMessage,
 } from "./shared/sessionViewProtocol.ts";
 import { resolveCwd } from "./workspaceUtils.ts";
-
-/** `RequestError`'s `message` is often just the generic JSON-RPC category
- *  (e.g. "Internal error") — the agent-specific detail, when present, is in
- *  `.data`, which `String(err)` drops entirely. An *uncaught* exception in the
- *  bridge's request handler (as opposed to one it deliberately throws as a
- *  `RequestError` with its own message) gets wrapped by the ACP SDK itself as
- *  `internalError({ details: <original message> })` — unwrap that shape
- *  directly instead of dumping raw JSON at the user. */
-function describeError(err: unknown): string {
-  if (err instanceof RequestError) {
-    const data = err.data;
-    if (
-      data &&
-      typeof data === "object" &&
-      "details" in data &&
-      typeof data.details === "string"
-    ) {
-      return data.details;
-    }
-    const detail = data !== undefined ? ` ${JSON.stringify(data)}` : "";
-    return `${err.message}${detail}`;
-  }
-  return String(err);
-}
 
 /** The `claude` CLI itself refuses to resume a session that's currently owned
  *  by a live `claude --bg` background-agent process elsewhere — ACP has no

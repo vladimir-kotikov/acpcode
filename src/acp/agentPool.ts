@@ -1,4 +1,4 @@
-import * as vscode from "vscode";
+import type { Disposable, Output } from "../shared/events.ts";
 import { AgentClient } from "./agentClient.ts";
 import type { AgentConfig } from "./agents/config.ts";
 
@@ -6,7 +6,7 @@ import type { AgentConfig } from "./agents/config.ts";
  *  shared by anything that needs to talk to a configured agent (the sessions
  *  tree, the session viewer). Keeps exactly one subprocess per agent name
  *  regardless of how many consumers are looking at it. */
-export class AgentConnectionPool implements vscode.Disposable {
+export class AgentConnectionPool implements Disposable {
   private readonly clients = new Map<string, AgentClient>();
   // Tracks connects still in flight so concurrent callers for the same agent
   // (tree refresh, newSession, attachSession all call connect()) share the
@@ -17,6 +17,12 @@ export class AgentConnectionPool implements vscode.Disposable {
   // finish ends up in `clients` — every earlier one leaks (never disposed)
   // while other code may still be holding onto it.
   private readonly connecting = new Map<string, Promise<AgentClient>>();
+  // One log per agent, named after it (an output channel in the extension).
+  private readonly createOutput: (agentName: string) => Output;
+
+  constructor(createOutput: (agentName: string) => Output) {
+    this.createOutput = createOutput;
+  }
 
   async connect(agent: AgentConfig, cwd: string): Promise<AgentClient> {
     const existing = this.clients.get(agent.name);
@@ -28,7 +34,7 @@ export class AgentConnectionPool implements vscode.Disposable {
       return inFlight;
     }
     const promise = (async () => {
-      const client = new AgentClient(cwd, agent.name);
+      const client = new AgentClient(cwd, this.createOutput(agent.name));
       await client.connect(agent);
       this.clients.set(agent.name, client);
       return client;

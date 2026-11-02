@@ -30,10 +30,10 @@ import {
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import * as vscode from "vscode";
-import type { AgentClient } from "../acp/agentClient.ts";
+import type { Disposable, Output } from "../shared/events.ts";
+import { describeError, type AgentClient } from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
-import { getAgents, type AgentConfig } from "../acp/agents/config.ts";
+import type { AgentConfig } from "../acp/agents/config.ts";
 import type { Attachment } from "../shared/sessionViewProtocol.ts";
 import { buildDiffText } from "../webview/diffText.ts";
 import { AhpRequestError, AhpServer, ROOT_CHANNEL } from "./server.ts";
@@ -50,6 +50,9 @@ interface ToolCallTracking {
   title: string;
   phase: "running" | "pending" | "done";
   permission?: { requestId: string; options: PermissionOption[] };
+  // ACP's completing update usually omits content, and an absent `content`
+  // in `toolCallComplete` would wipe what was shown while it ran.
+  content?: ToolResultContent[];
 }
 
 /** One ACP session exposed as one AHP session with exactly one chat. */
@@ -82,9 +85,6 @@ const providerId = (agent: AgentConfig): string =>
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")}`;
-
-const describeError = (err: unknown): string =>
-  err instanceof Error ? err.message : String(err);
 
 function toolContent(
   content: ToolCallContent[] | null | undefined,
@@ -139,21 +139,35 @@ function toAttachments(message: Message): Attachment[] {
   });
 }
 
+/** What the host needs from wherever it runs: the extension reads these from
+ *  VS Code settings and workspace folders. */
+export interface AgentHostEnvironment {
+  agents(): AgentConfig[];
+  /** Folders whose sessions to list; the first one is the default cwd. */
+  folders(): string[];
+}
+
 /** Exposes the configured ACP agents through an `AhpServer`, so VS Code's
  *  native Chat can drive them. Shares `AgentConnectionPool` with the webview
- *  frontend: one bridge subprocess per agent either way. */
-export class AcpAgentHost implements vscode.Disposable {
+ *  frontend: one bridge subprocess per agent either way. Call
+ *  `agentsChanged()` when `env.agents()` would return something new. */
+export class AcpAgentHost implements Disposable {
   readonly server: AhpServer;
   private readonly pool: AgentConnectionPool;
-  private readonly output: vscode.OutputChannel;
+  private readonly output: Output;
   private readonly bindings = new Map<string, Binding>(); // by session and chat URI
   private readonly byAcpSession = new Map<string, Binding>(); // by `${agent}\0${sessionId}`
   private readonly hookedClients = new WeakSet<AgentClient>();
-  private readonly disposables: vscode.Disposable[] = [];
+  private readonly env: AgentHostEnvironment;
 
-  constructor(pool: AgentConnectionPool, output: vscode.OutputChannel) {
+  constructor(
+    pool: AgentConnectionPool,
+    output: Output,
+    env: AgentHostEnvironment,
+  ) {
     this.pool = pool;
     this.output = output;
+    this.env = env;
     this.server = new AhpServer(
       {
         handlers: {
@@ -181,22 +195,23 @@ export class AcpAgentHost implements vscode.Disposable {
       output,
       () => this.defaultCwd() && pathToFileURL(this.defaultCwd()).href,
     );
-    this.server.create(ROOT_CHANNEL, { agents: this.agentInfos() });
-    this.disposables.push(
-      this.server,
-      vscode.workspace.onDidChangeConfiguration(e => {
-        if (e.affectsConfiguration("acpcode.agents")) {
-          this.server.dispatch(ROOT_CHANNEL, {
-            type: ActionType.RootAgentsChanged,
-            agents: this.agentInfos(),
-          });
-        }
-      }),
-    );
+    this.server.create(ROOT_CHANNEL, "root", { agents: this.agentInfos() });
+  }
+
+  /** A turn is running (possibly waiting on a permission prompt). */
+  get busy(): boolean {
+    return [...this.bindings.values()].some(binding => binding.turnId);
+  }
+
+  agentsChanged(): void {
+    this.server.dispatch(ROOT_CHANNEL, {
+      type: ActionType.RootAgentsChanged,
+      agents: this.agentInfos(),
+    });
   }
 
   private agentInfos(): AgentInfo[] {
-    return getAgents().map(agent => ({
+    return this.env.agents().map(agent => ({
       provider: providerId(agent),
       displayName: agent.name,
       description: `${agent.kind} via ACP`,
@@ -207,7 +222,7 @@ export class AcpAgentHost implements vscode.Disposable {
   }
 
   private defaultCwd(): string {
-    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
+    return this.env.folders()[0] ?? os.homedir();
   }
 
   private async connect(binding: Binding): Promise<AgentClient> {
@@ -262,13 +277,13 @@ export class AcpAgentHost implements vscode.Disposable {
   // --- session catalogue -----------------------------------------------------
 
   private async listSessions(): Promise<{ items: SessionSummary[] }> {
-    const folders = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath);
+    const folders = this.env.folders();
     const perAgent = await Promise.all(
-      getAgents().map(async agent => {
+      this.env.agents().map(async agent => {
         try {
           const client = await this.pool.connect(agent, this.defaultCwd());
           const lists = await Promise.all(
-            folders?.length
+            folders.length
               ? folders.map(folder => client.listSessions(folder))
               : [client.listSessions()],
           );
@@ -356,10 +371,14 @@ export class AcpAgentHost implements vscode.Disposable {
       return;
     }
     if (!this.server.has(binding.sessionUri)) {
-      this.server.create(binding.sessionUri, this.sessionState(binding));
+      this.server.create(
+        binding.sessionUri,
+        "session",
+        this.sessionState(binding),
+      );
     }
     if (channel === binding.chatUri && !this.server.has(binding.chatUri)) {
-      this.server.create(binding.chatUri, this.chatState(binding));
+      this.server.create(binding.chatUri, "chat", this.chatState(binding));
       await this.ensureLoaded(binding);
     }
   }
@@ -389,7 +408,9 @@ export class AcpAgentHost implements vscode.Disposable {
   }
 
   private createSession(params: CreateSessionParams): null {
-    const agent = getAgents().find(a => providerId(a) === params.provider);
+    const agent = this.env
+      .agents()
+      .find(a => providerId(a) === params.provider);
     if (!agent) {
       throw new AhpRequestError(
         AhpErrorCodes.ProviderNotFound,
@@ -406,11 +427,11 @@ export class AcpAgentHost implements vscode.Disposable {
       `ahp-chat:/${randomUUID()}`,
       cwd,
     );
-    this.server.create(binding.sessionUri, {
+    this.server.create(binding.sessionUri, "session", {
       ...this.sessionState(binding),
       lifecycle: SessionLifecycle.Creating,
     });
-    this.server.create(binding.chatUri, this.chatState(binding));
+    this.server.create(binding.chatUri, "chat", this.chatState(binding));
     binding.ready = (async () => {
       const client = await this.connect(binding);
       const response = await client.newSession(cwd);
@@ -553,7 +574,8 @@ export class AcpAgentHost implements vscode.Disposable {
     type: ActionType.ChatTurnComplete | ActionType.ChatTurnCancelled,
     turnId = binding.turnId,
   ): void {
-    if (!turnId) {
+    // Already ended, e.g. the client cancelled it and has its own echo.
+    if (!turnId || binding.turnId !== turnId) {
       return;
     }
     this.server.dispatch(binding.chatUri, {
@@ -561,9 +583,7 @@ export class AcpAgentHost implements vscode.Disposable {
       turnId,
       duration: Date.now() - binding.turnStartedAt,
     });
-    if (binding.turnId === turnId) {
-      binding.turnId = undefined;
-    }
+    binding.turnId = undefined;
   }
 
   private failTurn(binding: Binding, turnId: string, message: string): void {
@@ -734,6 +754,26 @@ export class AcpAgentHost implements vscode.Disposable {
           : JSON.stringify(call.rawInput, null, 2),
       confirmed: ToolCallConfirmationReason.NotNeeded,
     });
+    this.setToolContent(binding, turnId, call);
+  }
+
+  private setToolContent(
+    binding: Binding,
+    turnId: string,
+    update: ToolCallUpdate,
+  ): void {
+    const content = toolContent(update.content);
+    const tracking = binding.toolCalls.get(update.toolCallId);
+    if (!content || !tracking) {
+      return;
+    }
+    tracking.content = content;
+    this.server.dispatch(binding.chatUri, {
+      type: ActionType.ChatToolCallContentChanged,
+      turnId,
+      toolCallId: update.toolCallId,
+      content,
+    });
   }
 
   private updateToolCall(
@@ -748,7 +788,6 @@ export class AcpAgentHost implements vscode.Disposable {
     if (update.title) {
       tracking.title = update.title;
     }
-    const content = toolContent(update.content);
     if (update.status === "completed" || update.status === "failed") {
       tracking.phase = "done";
       this.server.dispatch(binding.chatUri, {
@@ -758,7 +797,7 @@ export class AcpAgentHost implements vscode.Disposable {
         result: {
           success: update.status === "completed",
           pastTenseMessage: tracking.title,
-          content,
+          content: toolContent(update.content) ?? tracking.content,
           ...(update.status === "failed"
             ? { error: { message: tracking.title } }
             : {}),
@@ -778,14 +817,7 @@ export class AcpAgentHost implements vscode.Disposable {
         confirmed: ToolCallConfirmationReason.NotNeeded,
       });
     }
-    if (content) {
-      this.server.dispatch(binding.chatUri, {
-        type: ActionType.ChatToolCallContentChanged,
-        turnId,
-        toolCallId: update.toolCallId,
-        content,
-      });
-    }
+    this.setToolContent(binding, turnId, update);
   }
 
   private onPermissionRequest(
@@ -830,8 +862,6 @@ export class AcpAgentHost implements vscode.Disposable {
   }
 
   dispose(): void {
-    for (const disposable of this.disposables) {
-      disposable.dispose();
-    }
+    this.server.dispose();
   }
 }

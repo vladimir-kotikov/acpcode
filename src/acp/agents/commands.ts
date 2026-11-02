@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
-import { getAgents, saveAgents, type AgentConfig } from "./config.ts";
+import { getAgents, saveAgents } from "../../settings.ts";
+import type { AgentConfig } from "./config.ts";
 import { AGENT_KINDS } from "./kinds.ts";
 
 export const editAgentsConfigCommand = async () =>

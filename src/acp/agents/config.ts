@@ -1,5 +1,4 @@
 import * as os from "node:os";
-import * as vscode from "vscode";
 
 /** A configured, connectable agent instance. `kind` is a literal union so
  *  adding a second agent type later is a type error everywhere it needs
@@ -18,17 +17,6 @@ function expandHome(value: string): string {
     return os.homedir() + value.slice(1);
   }
   return value;
-}
-
-export const getAgents = (): AgentConfig[] =>
-  vscode.workspace.getConfiguration("acpcode").get<AgentConfig[]>("agents", []);
-
-export const getAgent = (name: string): AgentConfig | undefined =>
-  getAgents().find(agent => agent.name === name);
-
-export async function saveAgents(agents: AgentConfig[]): Promise<void> {
-  const config = vscode.workspace.getConfiguration("acpcode");
-  await config.update("agents", agents, vscode.ConfigurationTarget.Global);
 }
 
 /** Environment overlay for spawning this agent's ACP subprocess, expanding

@@ -1,20 +1,33 @@
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import * as vscode from "vscode";
 import { AgentConnectionPool } from "./acp/agentPool.ts";
-import { AcpAgentHost } from "./ahp/acpBridge.ts";
 import {
   addAgentCommand,
   editAgentsConfigCommand,
 } from "./acp/agents/commands.ts";
 import {
+  hostFiles,
+  isAlive,
+  readJson,
+  type HostConfig,
+  type HostInfo,
+  type WindowInfo,
+} from "./ahp/hostFiles.ts";
+import {
   SessionViewProvider,
   type SessionTarget,
 } from "./sessionViewProvider.ts";
-import { toggleGroupSessionsByCwd } from "./settings.ts";
+import { getAgents, toggleGroupSessionsByCwd } from "./settings.ts";
 import { SessionsTreeProvider } from "./treeProvider.ts";
 
 export function activate(context: vscode.ExtensionContext) {
-  const agentPool = new AgentConnectionPool();
+  const agentPool = new AgentConnectionPool(name =>
+    vscode.window.createOutputChannel(name),
+  );
   const sessionViewProvider = new SessionViewProvider(
     context.extensionUri,
     agentPool,
@@ -92,9 +105,19 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("acpcode.connectChatToAgentHost", () =>
       connectChatToAgentHost(context),
     ),
+    vscode.commands.registerCommand("acpcode.restartAgentHost", () =>
+      restartAgentHost(context).then(() =>
+        vscode.window.showInformationMessage("ACP Code agent host restarted."),
+      ),
+    ),
+    vscode.commands.registerCommand("acpcode.showAgentHostLog", () =>
+      vscode.window.showTextDocument(
+        vscode.Uri.file(hostFiles(agentHostDir(context)).log),
+      ),
+    ),
   );
 
-  void startAgentHost(context, agentPool);
+  startAgentHost(context);
 }
 
 const AGENT_HOST_NAME = "ACP Code";
@@ -111,63 +134,169 @@ function agentHostToken(context: vscode.ExtensionContext): string {
   return token;
 }
 
-async function startAgentHost(
-  context: vscode.ExtensionContext,
-  agentPool: AgentConnectionPool,
-): Promise<void> {
-  const config = vscode.workspace.getConfiguration("acpcode.agentHost");
-  if (!config.get<boolean>("enabled", false)) {
+/** State shared with the detached host (`ahp/hostMain.ts`). Global storage,
+ *  so every window talks to the same host. */
+const agentHostDir = (context: vscode.ExtensionContext): string =>
+  path.join(context.globalStorageUri.fsPath, "agentHost");
+
+const agentHostPort = (): number =>
+  vscode.workspace
+    .getConfiguration("acpcode.agentHost")
+    .get<number>("port", 8765);
+
+/** Changes with every install, so a reinstall or update restarts the host:
+ *  the version alone doesn't change on dev reinstalls. */
+function agentHostBuild(context: vscode.ExtensionContext): string {
+  const installed = fs.statSync(
+    path.join(context.extensionPath, "package.json"),
+  ).mtimeMs;
+  return `${context.extension.packageJSON.version}+${installed}`;
+}
+
+/** Tells the host about this window, and starts it unless one from this
+ *  build is already running (e.g. it outlived a window reload). */
+function startAgentHost(context: vscode.ExtensionContext): void {
+  if (
+    !vscode.workspace
+      .getConfiguration("acpcode.agentHost")
+      .get<boolean>("enabled", false)
+  ) {
     return;
   }
-  const port = config.get<number>("port", 8765);
-  const output = vscode.window.createOutputChannel("ACP Code: Agent Host");
-  const host = new AcpAgentHost(agentPool, output);
-  context.subscriptions.push(host, output);
-  try {
-    await host.server.listen(port, agentHostToken(context));
-    output.appendLine(`Listening on 127.0.0.1:${port}`);
-  } catch (err) {
-    // ponytail: with several windows open only the first one binds the port;
-    // the others' Chat talks to that window's host. Per-window ports if
-    // sessions ever need to run in their own window's extension host.
-    output.appendLine(`Couldn't listen on 127.0.0.1:${port}: ${String(err)}`);
-    host.dispose();
+  const files = hostFiles(agentHostDir(context));
+  fs.mkdirSync(files.windows, { recursive: true });
+  const writeConfig = () => {
+    const config: HostConfig = { agents: getAgents() };
+    fs.writeFileSync(files.config, JSON.stringify(config));
+  };
+  const windowFile = path.join(files.windows, `${process.pid}.json`);
+  const writeWindow = () => {
+    const info: WindowInfo = {
+      folders: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
+    };
+    fs.writeFileSync(windowFile, JSON.stringify(info));
+  };
+  writeConfig();
+  writeWindow();
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration("acpcode.agents")) {
+        writeConfig();
+      }
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(writeWindow),
+    { dispose: () => fs.rmSync(windowFile, { force: true }) },
+  );
+
+  const running = readJson<HostInfo>(files.host);
+  if (
+    running &&
+    isAlive(running.pid) &&
+    running.build === agentHostBuild(context) &&
+    running.port === agentHostPort()
+  ) {
+    return;
   }
+  // ponytail: an update restarts the host even mid-turn; wait for it to go
+  // idle first if that bites.
+  void restartAgentHost(context);
+}
+
+function restartAgentHost(context: vscode.ExtensionContext): Promise<void> {
+  const files = hostFiles(agentHostDir(context));
+  return stopProcess(readJson<HostInfo>(files.host)?.pid).then(() =>
+    spawnAgentHost(context, files),
+  );
+}
+
+/** SIGTERM, then SIGKILL if it's still around after 5 s. */
+function stopProcess(pid: number | undefined): Promise<void> {
+  if (!pid || !isAlive(pid)) {
+    return Promise.resolve();
+  }
+  process.kill(pid, "SIGTERM");
+  const started = Date.now();
+  return new Promise(resolve => {
+    const timer = setInterval(() => {
+      if (isAlive(pid) && Date.now() - started < 5000) {
+        return;
+      }
+      clearInterval(timer);
+      if (isAlive(pid)) {
+        process.kill(pid, "SIGKILL");
+      }
+      resolve();
+    }, 100);
+  });
+}
+
+function spawnAgentHost(
+  context: vscode.ExtensionContext,
+  files: ReturnType<typeof hostFiles>,
+): void {
+  // Appended to rather than truncated: windows starting together each spawn
+  // a host, and the losers' "port in use" line lands next to the winner's log.
+  if (fs.existsSync(files.log) && fs.statSync(files.log).size > 1_000_000) {
+    fs.renameSync(files.log, `${files.log}.old`);
+  }
+  const log = fs.openSync(files.log, "a");
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL("./ahp/hostMain.ts", import.meta.url))],
+    {
+      cwd: agentHostDir(context),
+      detached: true,
+      stdio: ["ignore", log, log],
+      env: {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: "1",
+        ACPCODE_HOST_DIR: agentHostDir(context),
+        ACPCODE_HOST_PORT: String(agentHostPort()),
+        ACPCODE_HOST_TOKEN: agentHostToken(context),
+        ACPCODE_HOST_BUILD: agentHostBuild(context),
+      },
+    },
+  );
+  fs.closeSync(log);
+  child.unref();
+  child.once("exit", code => {
+    // Losing the startup race to another window's host is fine.
+    const running = readJson<HostInfo>(files.host);
+    if (code && !(running && isAlive(running.pid))) {
+      void vscode.window
+        .showWarningMessage(
+          `ACP Code agent host exited (code ${code}).`,
+          "Show Log",
+        )
+        .then(choice => {
+          if (choice) {
+            void vscode.commands.executeCommand("acpcode.showAgentHostLog");
+          }
+        });
+    }
+  });
 }
 
 async function connectChatToAgentHost(
   context: vscode.ExtensionContext,
 ): Promise<void> {
-  if (!vscode.workspace.workspaceFolders?.length) {
-    void vscode.window.showErrorMessage(
-      "Open a folder first: VS Code reads remote agent hosts from workspace settings.",
-    );
-    return;
-  }
-  const confirm = await vscode.window.showWarningMessage(
-    "This writes the agent host's address and connection token to this workspace's settings (.vscode/settings.json). Don't commit that file with the token in it.",
-    { modal: true },
-    "Continue",
-  );
-  if (confirm !== "Continue") {
-    return;
-  }
-  const port = vscode.workspace
-    .getConfiguration("acpcode.agentHost")
-    .get<number>("port", 8765);
   const entry = {
     name: AGENT_HOST_NAME,
-    address: `127.0.0.1:${port}`,
+    address: `127.0.0.1:${agentHostPort()}`,
     connectionToken: agentHostToken(context),
   };
   const chat = vscode.workspace.getConfiguration("chat");
+  // Despite its name this setting is resource-scoped, so a user-level value
+  // reaches every editor window (`chat.remoteAgentHosts` is only read by the
+  // Agents window).
   const hosts =
-    chat.get<{ name: string }[]>("workspaceRemoteAgentHosts", []) ?? [];
+    chat.inspect<{ name: string }[]>("workspaceRemoteAgentHosts")
+      ?.globalValue ?? [];
   try {
     await chat.update(
       "workspaceRemoteAgentHosts",
       [...hosts.filter(h => h.name !== AGENT_HOST_NAME), entry],
-      vscode.ConfigurationTarget.Workspace,
+      vscode.ConfigurationTarget.Global,
     );
     await chat.update(
       "remoteAgentHostsEnabled",

@@ -98,6 +98,16 @@
         "command": "acpcode.connectChatToAgentHost",
         "title": "Connect VS Code Chat to ACP Agents",
         "category": "ACP Code"
+      },
+      {
+        "command": "acpcode.restartAgentHost",
+        "title": "Restart Agent Host",
+        "category": "ACP Code"
+      },
+      {
+        "command": "acpcode.showAgentHostLog",
+        "title": "Show Agent Host Log",
+        "category": "ACP Code"
       }
     ],
     "menus": {

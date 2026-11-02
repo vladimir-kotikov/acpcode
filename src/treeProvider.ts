@@ -4,9 +4,9 @@ import { match } from "ts-pattern";
 import * as vscode from "vscode";
 import type { AgentClient } from "./acp/agentClient.ts";
 import type { AgentConnectionPool } from "./acp/agentPool.ts";
-import { getAgent, getAgents, type AgentConfig } from "./acp/agents/config.ts";
+import type { AgentConfig } from "./acp/agents/config.ts";
 import type { SessionViewProvider } from "./sessionViewProvider.ts";
-import { getGroupSessionsByCwd } from "./settings.ts";
+import { getAgent, getAgents, getGroupSessionsByCwd } from "./settings.ts";
 import { resolveCwd } from "./workspaceUtils.ts";
 
 type MaybePromise<T> = T | Promise<T>;
