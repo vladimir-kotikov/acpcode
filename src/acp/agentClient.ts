@@ -25,6 +25,7 @@ import {
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -116,6 +117,32 @@ export function resolveAgentEntryPoint(kind: AgentConfig["kind"]): string {
     );
   }
   return path.join(pkgDir, binRel);
+}
+
+/** The user's own `claude`, preferred over the bridge's bundled binary: theirs
+ *  follows `claude update`, while the bundled one only moves when this
+ *  extension bumps its claude-agent-acp dependency — and new models refuse
+ *  older versions outright ("Claude Code 2.1.232 does not support this
+ *  model"). Handed to the bridge as `CLAUDE_CODE_EXECUTABLE`, which it checks
+ *  before falling back to its own copy. Searches PATH plus the native
+ *  installer's locations, which a GUI-launched VS Code's PATH can miss. */
+function findInstalledClaude(): string | undefined {
+  const exe = process.platform === "win32" ? "claude.exe" : "claude";
+  const dirs = [
+    ...(process.env.PATH ?? "").split(path.delimiter),
+    path.join(os.homedir(), ".local", "bin"),
+    path.join(os.homedir(), ".claude", "local"),
+  ];
+  for (const dir of dirs.filter(Boolean)) {
+    const candidate = path.join(dir, exe);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // not here — keep looking
+    }
+  }
+  return undefined;
 }
 
 export type ConnectionState = {
@@ -218,13 +245,20 @@ export class AgentClient implements Disposable {
     this.connectionStateEmitter.fire({ state: "connecting" });
 
     const entryPoint = resolveAgentEntryPoint(agent.kind);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...agentEnv(agent),
+      ELECTRON_RUN_AS_NODE: "1",
+    };
+    if (agent.kind === "claude" && !env.CLAUDE_CODE_EXECUTABLE) {
+      env.CLAUDE_CODE_EXECUTABLE = findInstalledClaude();
+    }
+    this.output.appendLine(
+      `[acpcode] Claude Code binary: ${env.CLAUDE_CODE_EXECUTABLE ?? "bundled with the bridge"}`,
+    );
     const child = spawn(process.execPath, [entryPoint], {
       cwd: this.cwd,
-      env: {
-        ...process.env,
-        ...agentEnv(agent),
-        ELECTRON_RUN_AS_NODE: "1",
-      },
+      env,
       stdio: ["pipe", "pipe", "pipe"] as const,
     });
     this.child = child;
