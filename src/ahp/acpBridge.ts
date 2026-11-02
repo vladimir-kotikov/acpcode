@@ -1,4 +1,5 @@
 import type {
+  AvailableCommand,
   PermissionOption,
   SessionConfigOption,
   SessionInfo,
@@ -21,6 +22,8 @@ import {
   type AgentInfo,
   type ChatState,
   type ChatSummary,
+  type CompletionsParams,
+  type CompletionsResult,
   type CreateSessionParams,
   type Message,
   type SessionState,
@@ -47,6 +50,14 @@ import {
   resolveModelConfig,
   type ConfigValue,
 } from "./configOptions.ts";
+import {
+  TRIGGER_CHARACTERS,
+  commandItems,
+  fileItems,
+  listFiles,
+  mentionToken,
+  slashToken,
+} from "./completions.ts";
 import { AhpRequestError, AhpServer, ROOT_CHANNEL } from "./server.ts";
 
 const DEFAULT_CHAT_TITLE = "New chat";
@@ -88,6 +99,8 @@ interface Binding {
   readonly toolCalls: Map<string, ToolCallTracking>;
   /** The ACP session's config options, once it's created or loaded. */
   configOptions?: SessionConfigOption[];
+  /** The ACP session's slash commands, once the agent has announced them. */
+  commands?: AvailableCommand[];
 }
 
 /** AHP provider IDs double as URI schemes VS Code builds draft-session
@@ -217,7 +230,9 @@ export class AcpAgentHost implements Disposable {
             };
           },
           sessionConfigCompletions: () => ({ items: [] }),
+          completions: (params: CompletionsParams) => this.completions(params),
         },
+        completionTriggerCharacters: TRIGGER_CHARACTERS,
         materialize: channel => this.materialize(channel),
         onClientAction: (channel, action) =>
           this.onClientAction(channel, action),
@@ -654,6 +669,31 @@ export class AcpAgentHost implements Disposable {
     });
   }
 
+  // --- input completions -----------------------------------------------------
+
+  private completions(
+    params: CompletionsParams,
+  ): CompletionsResult | Promise<CompletionsResult> {
+    // VS Code only asks once a chat's session exists, so there's always one.
+    const binding = this.bindings.get(params.channel);
+    if (!binding) {
+      return { items: [] };
+    }
+    const slash = slashToken(params.text, params.offset);
+    if (slash) {
+      // Empty until the agent announces its commands, just after the session
+      // starts; they're per session (a project can add its own).
+      return { items: commandItems(binding.commands ?? [], slash) };
+    }
+    const mention = mentionToken(params.text, params.offset);
+    if (!mention) {
+      return { items: [] };
+    }
+    return listFiles(binding.cwd).then(files => ({
+      items: fileItems(binding.cwd, files, mention),
+    }));
+  }
+
   // --- client actions --------------------------------------------------------
 
   private onClientAction(channel: string, action: StateAction): void {
@@ -809,6 +849,10 @@ export class AcpAgentHost implements Disposable {
       }
       return;
     }
+    if (update.sessionUpdate === "available_commands_update") {
+      binding.commands = update.availableCommands;
+      return;
+    }
     if (update.sessionUpdate === "config_option_update") {
       this.rememberOptions(binding, update.configOptions);
       this.server.dispatch(binding.sessionUri, {
@@ -858,8 +902,7 @@ export class AcpAgentHost implements Disposable {
         }
         this.updateToolCall(binding, turnId, update);
         return;
-      // ponytail: plan, available commands, usage and mode updates aren't
-      // mapped yet.
+      // ponytail: plan, usage and mode updates aren't mapped yet.
     }
   }
 

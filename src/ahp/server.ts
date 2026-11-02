@@ -55,6 +55,8 @@ export interface AhpServerHooks {
   readonly materialize: (channel: string) => Promise<void>;
   /** Called after a client-dispatched action has been applied. */
   readonly onClientAction: (channel: string, action: StateAction) => void;
+  /** Characters that make the client ask for `completions` while typing. */
+  readonly completionTriggerCharacters?: string[];
 }
 
 type ChannelState = RootState | SessionState | ChatState;
@@ -248,6 +250,7 @@ export class AhpServer implements Disposable {
       serverInfo: { name: "acpcode", title: "ACP Code" },
       snapshots,
       defaultDirectory: this.defaultDirectory(),
+      completionTriggerCharacters: this.hooks.completionTriggerCharacters,
     };
   }
 
@@ -255,19 +258,22 @@ export class AhpServer implements Disposable {
     params: ReconnectParams,
     connection: AhpConnection,
   ): Promise<ReconnectResult> {
+    // A client this host instance never initialized (its initialize hit a
+    // previous instance, e.g. one replaced after an update) holds that
+    // instance's capabilities, such as completion trigger characters. VS Code
+    // answers NotFound here with a fresh initialize, which picks up ours.
+    if (!this.servedClients.has(params.clientId)) {
+      throw new AhpRequestError(
+        AhpErrorCodes.NotFound,
+        `Unknown client ${params.clientId}; initialize again`,
+      );
+    }
     connection.clientId = params.clientId;
     const oldest = this.replayBuffer[0]?.serverSeq ?? this.serverSeq + 1;
-    // Replay only continues state this host instance itself handed out. A
-    // client it has never served (e.g. one whose initialize hit a previous
-    // instance, or failed before this one was listening) can carry a seq
-    // that happens to fall inside our range — replaying "nothing missed" to
-    // it would leave it without any root snapshot, i.e. no agents. Same for
-    // a gap older than the buffer: fresh snapshots instead.
+    // A gap older than the replay buffer gets fresh snapshots instead.
     const canReplay =
-      this.servedClients.has(params.clientId) &&
       params.lastSeenServerSeq >= oldest - 1 &&
       params.lastSeenServerSeq <= this.serverSeq;
-    this.servedClients.add(params.clientId);
     const snapshots: Snapshot[] = [];
     const missing: string[] = [];
     for (const channel of params.subscriptions) {
