@@ -16,6 +16,12 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Trusted Publishing: vsce trades the job's OIDC token for a short-lived
+    # Marketplace credential, so there's no PAT secret. Needs a policy for this
+    # repo + workflow on the publisher's Marketplace management page.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -45,8 +51,8 @@ jobs:
 
       - name: Publish pre-release
         if: github.ref_type == 'branch'
-        run: npx @vscode/vsce publish --pre-release --packagePath acpcode.vsix -p ${{ secrets.VSCE_PAT }}
+        run: npx @vscode/vsce@^4 publish --oidc --pre-release --packagePath acpcode.vsix
 
       - name: Publish release
         if: github.ref_type == 'tag'
-        run: npx @vscode/vsce publish --packagePath acpcode.vsix -p ${{ secrets.VSCE_PAT }}
+        run: npx @vscode/vsce@^4 publish --oidc --packagePath acpcode.vsix
