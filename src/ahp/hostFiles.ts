@@ -26,6 +26,8 @@ export const hostFiles = (dir: string) => ({
   config: path.join(dir, "config.json"),
   /** Written by the host: last-seen ACP config options per agent. */
   configOptions: path.join(dir, "configOptions.json"),
+  /** Written by the host: whether each agent accepts image prompts. */
+  imageSupport: path.join(dir, "imageSupport.json"),
   windows: path.join(dir, "windows"),
   log: path.join(dir, "host.log"),
 });

@@ -177,6 +177,12 @@ export interface AgentHostEnvironment {
     load(): Record<string, SessionConfigOption[]>;
     save(cache: Record<string, SessionConfigOption[]>): void;
   };
+  /** Per agent name, whether it accepts image prompts — VS Code only lets
+   *  users attach images to models that say so. */
+  imageCache: {
+    load(): Record<string, boolean>;
+    save(cache: Record<string, boolean>): void;
+  };
 }
 
 /** Exposes the configured ACP agents through an `AhpServer`, so VS Code's
@@ -192,6 +198,7 @@ export class AcpAgentHost implements Disposable {
   private readonly hookedClients = new WeakSet<AgentClient>();
   private readonly env: AgentHostEnvironment;
   private readonly knownOptions: Record<string, SessionConfigOption[]>;
+  private readonly imageSupport: Record<string, boolean>;
 
   constructor(
     pool: AgentConnectionPool,
@@ -202,6 +209,7 @@ export class AcpAgentHost implements Disposable {
     this.output = output;
     this.env = env;
     this.knownOptions = env.configCache.load();
+    this.imageSupport = env.imageCache.load();
     this.server = new AhpServer(
       {
         handlers: {
@@ -256,17 +264,24 @@ export class AcpAgentHost implements Disposable {
   }
 
   private agentInfos(): AgentInfo[] {
-    return this.env.agents().map(agent => ({
-      provider: providerId(agent),
-      displayName: agent.name,
-      description: `${agent.kind} via ACP`,
+    return this.env.agents().map(agent => {
+      const provider = providerId(agent);
       // Until one of its sessions has been opened, the agent's models aren't
       // known; "Default" leaves the choice to the agent.
-      models: modelsOf(
+      const models = modelsOf(
         this.knownOptions[agent.name] ?? [],
-        providerId(agent),
-      ) ?? [{ id: "default", provider: providerId(agent), name: "Default" }],
-    }));
+        provider,
+      ) ?? [{ id: "default", provider, name: "Default" }];
+      // ponytail: ACP advertises image support per agent, not per model, so
+      // every model of an image-capable agent claims vision.
+      const supportsVision = this.imageSupport[agent.name];
+      return {
+        provider,
+        displayName: agent.name,
+        description: `${agent.kind} via ACP`,
+        models: models.map(model => ({ ...model, supportsVision })),
+      };
+    });
   }
 
   /** Records a session's current options; they also become the agent's
@@ -366,6 +381,11 @@ export class AcpAgentHost implements Disposable {
     if (!this.hookedClients.has(client)) {
       this.hookedClients.add(client);
       const agentName = binding.agent.name;
+      if (this.imageSupport[agentName] !== client.canSendImages()) {
+        this.imageSupport[agentName] = client.canSendImages();
+        this.env.imageCache.save(this.imageSupport);
+        this.agentsChanged();
+      }
       client.onSessionUpdate(({ sessionId, update }) => {
         const target = this.byAcpSession.get(`${agentName}\0${sessionId}`);
         if (target) {
