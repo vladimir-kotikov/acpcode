@@ -108,6 +108,11 @@
         "command": "acpcode.showAgentHostLog",
         "title": "Show Agent Host Log",
         "category": "ACP Code"
+      },
+      {
+        "command": "acpcode.updateBridges",
+        "title": "Update Agent Bridges",
+        "category": "ACP Code"
       }
     ],
     "menus": {
@@ -252,6 +257,22 @@
           "type": "number",
           "default": 8765,
           "description": "Local port (127.0.0.1) the agent host listens on. Requires a window reload."
+        },
+        "acpcode.bridgeVersions": {
+          "type": "object",
+          "markdownDescription": "npm version (or range, or dist-tag) of each agent's ACP bridge to install instead of the latest release, e.g. `{ \"claude\": \"0.93.0\" }`. Changing it installs that version. Without a pin, bridges only update through **ACP Code: Update Agent Bridges**.",
+          "properties": {
+            "claude": {
+              "type": "string",
+              "description": "@agentclientprotocol/claude-agent-acp version"
+            },
+            "codex": {
+              "type": "string",
+              "description": "@agentclientprotocol/codex-acp version"
+            }
+          },
+          "additionalProperties": false,
+          "default": {}
         }
       }
     }
@@ -272,8 +293,6 @@
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "~0.93.0",
-    "@agentclientprotocol/codex-acp": "~2.5.0",
     "@agentclientprotocol/sdk": "^1.3.0",
     "@microsoft/agent-host-protocol": "^1.0.0",
     "diff": "^8.0.4",

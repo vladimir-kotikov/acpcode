@@ -188,7 +188,8 @@ export interface AgentHostEnvironment {
 /** Exposes the configured ACP agents through an `AhpServer`, so VS Code's
  *  native Chat can drive them. Shares `AgentConnectionPool` with the webview
  *  frontend: one bridge subprocess per agent either way. Call
- *  `agentsChanged()` when `env.agents()` would return something new. */
+ *  `agentsChanged()` when `env.agents()` would return something new, and
+ *  `bridgesChanged()` after a bridge install. */
 export class AcpAgentHost implements Disposable {
   readonly server: AhpServer;
   private readonly pool: AgentConnectionPool;
@@ -199,6 +200,8 @@ export class AcpAgentHost implements Disposable {
   private readonly env: AgentHostEnvironment;
   private readonly knownOptions: Record<string, SessionConfigOption[]>;
   private readonly imageSupport: Record<string, boolean>;
+  // Agents whose last listing failed; see `bridgesChanged()`.
+  private readonly unlisted = new Set<string>();
 
   constructor(
     pool: AgentConnectionPool,
@@ -432,10 +435,29 @@ export class AcpAgentHost implements Disposable {
 
   // --- session catalogue -----------------------------------------------------
 
-  private async listSessions(): Promise<{ items: SessionSummary[] }> {
+  private listSessions(): Promise<{ items: SessionSummary[] }> {
+    return this.listAgents(this.env.agents()).then(items => ({ items }));
+  }
+
+  /** A bridge was installed or updated: lists the agents whose last listing
+   *  failed (e.g. their bridge wasn't installed yet) and announces their
+   *  sessions one by one, as AHP has no "list changed" notification and VS
+   *  Code only lists on connect. Agents that were listed keep the bridge
+   *  they're connected to until the host restarts. */
+  async bridgesChanged(): Promise<void> {
+    const agents = this.env.agents().filter(a => this.unlisted.has(a.name));
+    for (const summary of await this.listAgents(agents)) {
+      this.server.notify("root/sessionAdded", {
+        channel: ROOT_CHANNEL,
+        summary,
+      });
+    }
+  }
+
+  private async listAgents(agents: AgentConfig[]): Promise<SessionSummary[]> {
     const folders = this.env.folders();
     const perAgent = await Promise.all(
-      this.env.agents().map(async agent => {
+      agents.map(async agent => {
         try {
           const client = await this.pool.connect(agent, this.defaultCwd());
           const lists = await Promise.all(
@@ -443,8 +465,10 @@ export class AcpAgentHost implements Disposable {
               ? folders.map(folder => client.listSessions(folder))
               : [client.listSessions()],
           );
+          this.unlisted.delete(agent.name);
           return lists.flat().map(info => this.summaryFor(agent, info));
         } catch (err) {
+          this.unlisted.add(agent.name);
           this.output.appendLine(
             `[listSessions] ${agent.name}: ${describeError(err)}`,
           );
@@ -454,7 +478,7 @@ export class AcpAgentHost implements Disposable {
     );
     // Multi-root workspaces (e.g. git worktrees) can list one session twice.
     const items = new Map(perAgent.flat().map(s => [s.resource, s]));
-    return { items: [...items.values()] };
+    return [...items.values()];
   }
 
   /** Listed sessions get URIs derived from their ACP identity, so the same

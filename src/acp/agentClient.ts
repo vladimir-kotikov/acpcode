@@ -1,9 +1,9 @@
 import {
-  RequestError,
   client as createClientApp,
   methods,
   ndJsonStream,
   PROTOCOL_VERSION,
+  RequestError,
   type AvailableCommand,
   type ClientContext,
   type ContentBlock,
@@ -25,14 +25,13 @@ import {
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { Emitter, type Disposable, type Output } from "../shared/events.ts";
+import type { Attachment } from "../shared/sessionViewProtocol.ts";
 import type { AgentConfig } from "./agents/config.ts";
 import { agentEnv } from "./agents/config.ts";
-import type { Attachment } from "../shared/sessionViewProtocol.ts";
+import { bridgeEntryPoint, withAgentCli } from "./bridges.ts";
 
 /** Pulls the AIR extension's session-failure title out of a response's
  *  `_meta`, but only when `severity` is "error" — see `prompt()`'s doc
@@ -56,22 +55,6 @@ function extractAirFailureTitle(
   return severity === "error" && typeof title === "string" ? title : undefined;
 }
 
-/** ACP bridge package per agent kind: the npm package to resolve and which
- *  key in its `bin` map is the executable to spawn. */
-const AGENT_BRIDGES: Record<
-  AgentConfig["kind"],
-  { packageName: string; binName: string }
-> = {
-  claude: {
-    packageName: "@agentclientprotocol/claude-agent-acp",
-    binName: "claude-agent-acp",
-  },
-  codex: {
-    packageName: "@agentclientprotocol/codex-acp",
-    binName: "codex-acp",
-  },
-};
-
 /** The slash command each agent kind's CLI recognizes as "drop prior
  *  conversation from the model's context." Not every kind has one — codex-acp
  *  exposes no equivalent built-in (its closest, `/compact`, summarizes rather
@@ -87,63 +70,6 @@ const RESET_COMMANDS: Partial<Record<AgentConfig["kind"], AvailableCommand>> = {
     description: "Clear conversation history and free up context",
   },
 };
-
-/** Resolves the on-disk entry point for a kind's ACP bridge bin. `require`
- *  isn't available (package.json declares "type": "module", so this file runs
- *  as ESM under Node's native TypeScript loading) — walk from this module's
- *  own URL to the extension root's node_modules instead of using Node's
- *  package resolver, avoiding any dependency on its "exports" map shape. */
-export function resolveAgentEntryPoint(kind: AgentConfig["kind"]): string {
-  const bridge = AGENT_BRIDGES[kind];
-  const here = fileURLToPath(import.meta.url); // <extensionRoot>/src/acp/agentClient.ts
-  const extensionRoot = path.resolve(path.dirname(here), "..", "..");
-  const pkgJsonPath = path.join(
-    extensionRoot,
-    "node_modules",
-    bridge.packageName,
-    "package.json",
-  );
-  const pkgDir = path.dirname(pkgJsonPath);
-  const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, "utf8")) as {
-    bin?: string | Record<string, string>;
-  };
-  const binRel =
-    typeof pkgJson.bin === "string"
-      ? pkgJson.bin
-      : pkgJson.bin?.[bridge.binName];
-  if (!binRel) {
-    throw new Error(
-      `${bridge.packageName} package does not declare a "${bridge.binName}" bin entry`,
-    );
-  }
-  return path.join(pkgDir, binRel);
-}
-
-/** The user's own `claude`, preferred over the bridge's bundled binary: theirs
- *  follows `claude update`, while the bundled one only moves when this
- *  extension bumps its claude-agent-acp dependency — and new models refuse
- *  older versions outright ("Claude Code 2.1.232 does not support this
- *  model"). Handed to the bridge as `CLAUDE_CODE_EXECUTABLE`, which it checks
- *  before falling back to its own copy. Searches PATH plus the native
- *  installer's locations, which a GUI-launched VS Code's PATH can miss. */
-function findInstalledClaude(): string | undefined {
-  const exe = process.platform === "win32" ? "claude.exe" : "claude";
-  const dirs = [
-    ...(process.env.PATH ?? "").split(path.delimiter),
-    path.join(os.homedir(), ".local", "bin"),
-    path.join(os.homedir(), ".claude", "local"),
-  ];
-  for (const dir of dirs.filter(Boolean)) {
-    const candidate = path.join(dir, exe);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch {
-      // not here — keep looking
-    }
-  }
-  return undefined;
-}
 
 export type ConnectionState = {
   state: "connecting" | "connected" | "error";
@@ -239,23 +165,26 @@ export class AgentClient implements Disposable {
     this.output = output;
   }
 
-  async connect(agent: AgentConfig): Promise<void> {
+  /** Spawns the agent's bridge, installing it first if needed (see
+   *  `bridgeEntryPoint`); `entryPoint` overrides which bridge install. */
+  async connect(agent: AgentConfig, entryPoint?: string): Promise<void> {
     this.disconnectChild();
     this.kind = agent.kind;
     this.connectionStateEmitter.fire({ state: "connecting" });
 
-    const entryPoint = resolveAgentEntryPoint(agent.kind);
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...agentEnv(agent),
-      ELECTRON_RUN_AS_NODE: "1",
-    };
-    if (agent.kind === "claude" && !env.CLAUDE_CODE_EXECUTABLE) {
-      env.CLAUDE_CODE_EXECUTABLE = findInstalledClaude();
+    let env: NodeJS.ProcessEnv;
+    try {
+      env = withAgentCli(agent.kind, {
+        ...process.env,
+        ...agentEnv(agent),
+        ELECTRON_RUN_AS_NODE: "1",
+      });
+      entryPoint ??= await bridgeEntryPoint(agent.kind);
+    } catch (err) {
+      this.connectionStateEmitter.fire({ state: "error", error: String(err) });
+      throw err;
     }
-    this.output.appendLine(
-      `[acpcode] Claude Code binary: ${env.CLAUDE_CODE_EXECUTABLE ?? "bundled with the bridge"}`,
-    );
+    this.output.appendLine(`[acpcode] Bridge: ${entryPoint}`);
     const child = spawn(process.execPath, [entryPoint], {
       cwd: this.cwd,
       env,
@@ -339,6 +268,14 @@ export class AgentClient implements Disposable {
         },
         clientInfo: { name: "acpcode", version: "0.0.1" },
       });
+      // An agent that can't speak the requested version answers with the
+      // latest one it does speak.
+      if (response.protocolVersion !== PROTOCOL_VERSION) {
+        this.disconnectChild();
+        throw new Error(
+          `the agent bridge speaks ACP protocol v${response.protocolVersion}, ACP Code needs v${PROTOCOL_VERSION}`,
+        );
+      }
       const steeringMeta = response._meta?.steering;
       this.steeringSupported =
         !!steeringMeta &&
@@ -350,6 +287,21 @@ export class AgentClient implements Disposable {
     } catch (err) {
       this.connectionStateEmitter.fire({ state: "error", error: String(err) });
       throw err;
+    }
+  }
+
+  /** A throwaway connection to a freshly installed bridge; see `BridgeProbe`. */
+  static async probe(
+    agent: AgentConfig,
+    entryPoint: string,
+    cwd: string,
+    output: Output,
+  ): Promise<void> {
+    const client = new AgentClient(cwd, output);
+    try {
+      await client.connect(agent, entryPoint);
+    } finally {
+      client.disconnectChild();
     }
   }
 

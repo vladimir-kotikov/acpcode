@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
+import { setBridgesDir } from "../acp/bridges.ts";
 import type { Output } from "../shared/events.ts";
 import { AcpAgentHost } from "./acpBridge.ts";
 import {
@@ -25,14 +26,18 @@ const {
   ACPCODE_HOST_PORT: port,
   ACPCODE_HOST_TOKEN: token,
   ACPCODE_HOST_BUILD: build,
+  ACPCODE_BRIDGES_DIR: bridgesDir,
 } = process.env;
-if (!dir || !port || !token || !build) {
-  console.error("ACPCODE_HOST_{DIR,PORT,TOKEN,BUILD} must be set");
+if (!dir || !port || !token || !build || !bridgesDir) {
+  console.error(
+    "ACPCODE_HOST_{DIR,PORT,TOKEN,BUILD} and ACPCODE_BRIDGES_DIR must be set",
+  );
   process.exit(2);
 }
 // The agent bridges inherit process.env; keep the token out of it.
 delete process.env.ACPCODE_HOST_TOKEN;
 
+setBridgesDir(bridgesDir);
 const files = hostFiles(dir);
 
 const output = (prefix: string): Output => ({
@@ -100,6 +105,20 @@ fs.watch(dir, (_, name) => {
   if (name === "config.json" && loadAgents()) {
     log.appendLine("agents changed");
     host.agentsChanged();
+  }
+});
+
+// The extension host installs bridges and swaps `<kind>/current.json` when
+// done (see bridges.ts). One install can fire several events; debounced.
+fs.mkdirSync(bridgesDir, { recursive: true });
+let bridgesTimer: NodeJS.Timeout | undefined;
+fs.watch(bridgesDir, { recursive: true }, (_, name) => {
+  if (name?.endsWith("current.json")) {
+    clearTimeout(bridgesTimer);
+    bridgesTimer = setTimeout(() => {
+      log.appendLine("bridges changed");
+      void host.bridgesChanged();
+    }, 500);
   }
 });
 

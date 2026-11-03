@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as vscode from "vscode";
 import { AgentConnectionPool } from "./acp/agentPool.ts";
+import { setBridgesDir } from "./acp/bridges.ts";
+import { installBridges } from "./bridgeInstaller.ts";
 import {
   addAgentCommand,
   editAgentsConfigCommand,
@@ -25,6 +27,7 @@ import { getAgents, toggleGroupSessionsByCwd } from "./settings.ts";
 import { SessionsTreeProvider } from "./treeProvider.ts";
 
 export function activate(context: vscode.ExtensionContext) {
+  setBridgesDir(bridgesDir(context));
   const agentPool = new AgentConnectionPool(name =>
     vscode.window.createOutputChannel(name),
   );
@@ -33,6 +36,10 @@ export function activate(context: vscode.ExtensionContext) {
     agentPool,
   );
   const treeProvider = new SessionsTreeProvider(agentPool, sessionViewProvider);
+  // The tree's session lists fetched while a bridge was missing show an error
+  // until refreshed. (The agent host notices installs itself.)
+  const installAndRefresh = (update: boolean) =>
+    installBridges(update).then(changed => changed && treeProvider.refresh());
 
   context.subscriptions.push(
     agentPool,
@@ -110,6 +117,17 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showInformationMessage("ACP Code agent host restarted."),
       ),
     ),
+    vscode.commands.registerCommand("acpcode.updateBridges", () =>
+      installAndRefresh(true),
+    ),
+    vscode.workspace.onDidChangeConfiguration(event => {
+      if (
+        event.affectsConfiguration("acpcode.agents") ||
+        event.affectsConfiguration("acpcode.bridgeVersions")
+      ) {
+        void installAndRefresh(false);
+      }
+    }),
     vscode.commands.registerCommand("acpcode.showAgentHostLog", () =>
       vscode.window.showTextDocument(
         vscode.Uri.file(hostFiles(agentHostDir(context)).log),
@@ -117,6 +135,7 @@ export function activate(context: vscode.ExtensionContext) {
     ),
   );
 
+  void installAndRefresh(false);
   startAgentHost(context);
 }
 
@@ -138,6 +157,10 @@ function agentHostToken(context: vscode.ExtensionContext): string {
  *  so every window talks to the same host. */
 const agentHostDir = (context: vscode.ExtensionContext): string =>
   path.join(context.globalStorageUri.fsPath, "agentHost");
+
+/** Shared with the detached host, which spawns bridges too (but never installs them). */
+const bridgesDir = (context: vscode.ExtensionContext): string =>
+  path.join(context.globalStorageUri.fsPath, "bridges");
 
 const agentHostPort = (): number =>
   vscode.workspace
@@ -254,6 +277,7 @@ function spawnAgentHost(
         ACPCODE_HOST_PORT: String(agentHostPort()),
         ACPCODE_HOST_TOKEN: agentHostToken(context),
         ACPCODE_HOST_BUILD: agentHostBuild(context),
+        ACPCODE_BRIDGES_DIR: bridgesDir(context),
       },
     },
   );
