@@ -263,9 +263,12 @@ function spawnAgentHost(
     fs.renameSync(files.log, `${files.log}.old`);
   }
   const log = fs.openSync(files.log, "a");
+  // Next to this module either way: src/ in development, dist/ when bundled
+  // (see esbuild.cjs), with this module's own extension.
+  const ext = path.extname(fileURLToPath(import.meta.url));
   const child = spawn(
     process.execPath,
-    [fileURLToPath(new URL("./ahp/hostMain.ts", import.meta.url))],
+    [fileURLToPath(new URL(`./ahp/hostMain${ext}`, import.meta.url))],
     {
       cwd: agentHostDir(context),
       detached: true,

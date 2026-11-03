@@ -6,6 +6,7 @@
   "engines": {
     "vscode": "^1.125.0"
   },
+  "publisher": "vlkoti",
   "repository": "https://github.com/vladimir.kotikov/acpcode.git",
   "license": "MIT",
   "categories": [
@@ -296,10 +297,6 @@
     "@agentclientprotocol/sdk": "^1.3.0",
     "@microsoft/agent-host-protocol": "^1.0.0",
     "diff": "^8.0.4",
-    "highlight.js": "^11.12.0",
-    "htm": "^3.1.1",
-    "marked": "^18.0.11",
-    "preact": "^10.29.8",
     "ts-pattern": "^5.9.0",
     "ws": "^8.22.1"
   },
@@ -312,7 +309,11 @@
     "@vscode/test-electron": "^3.0.0",
     "esbuild": "^0.28.1",
     "eslint": "^10.5.0",
+    "highlight.js": "^11.12.0",
+    "htm": "^3.1.1",
+    "marked": "^18.1.3",
     "npm-run-all": "^4.1.5",
+    "preact": "^10.29.8",
     "prettier": "^3.9.6",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.1"

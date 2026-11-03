@@ -14,3 +14,6 @@ Makefile
 **/*.map
 **/.vscode-test.*
 **/*.test.ts
+build/**
+dist/extension.js
+dist/ahp/**
