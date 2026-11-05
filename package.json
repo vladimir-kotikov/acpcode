@@ -4,7 +4,7 @@
   "description": "Yet another ACP-based agentic chat",
   "version": "0.0.1",
   "engines": {
-    "vscode": "^1.125.0"
+    "vscode": "^1.145.0"
   },
   "publisher": "vlkoti",
   "repository": "https://github.com/vladimir.kotikov/acpcode.git",
@@ -256,8 +256,7 @@
         },
         "acpcode.agentHost.port": {
           "type": "number",
-          "default": 8765,
-          "description": "Local port (127.0.0.1) the agent host listens on. Requires a window reload."
+          "markdownDescription": "Local port (127.0.0.1) the agent host listens on. Defaults to 8765 (8766 in VS Code Insiders, so both can run side by side). Requires a window reload."
         },
         "acpcode.bridgeVersions": {
           "type": "object",
@@ -303,7 +302,7 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
-    "@types/vscode": "^1.125.0",
+    "@types/vscode": "^1.145.0",
     "@types/ws": "^8.18.2",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
