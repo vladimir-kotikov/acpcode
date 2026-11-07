@@ -46,6 +46,8 @@ import {
 } from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
+import { agentProcessEnv } from "../acp/bridges.ts";
+import { removeClaudeJob } from "../acp/claudeJobs.ts";
 import type { Disposable, Output } from "../shared/events.ts";
 import type { Attachment } from "../shared/sessionViewProtocol.ts";
 import { buildDiffText } from "../webview/diffText.ts";
@@ -117,6 +119,8 @@ interface Binding {
    *  turn boundaries instead of being `prompt()`'s own echo. */
   replaying: boolean;
   pendingUserText?: string;
+  /** A turn was sent from this host, so the agent stores the session. */
+  prompted?: boolean;
   turnId?: string;
   turnStartedAt: number;
   markdownPartId?: string;
@@ -265,6 +269,8 @@ export class AcpAgentHost implements Disposable {
   private readonly bindings = new Map<string, Binding>(); // by session and chat URI
   private readonly byAcpSession = new Map<string, Binding>(); // by `${agent}\0${sessionId}`
   private readonly hookedClients = new WeakSet<AgentClient>();
+  /** `claude agents` job removals in flight, by `${agent}\0${sessionId}`. */
+  private readonly removingJobs = new Map<string, Promise<void>>();
   /** `${agent}\0${cwd}` of the session lists the agent is pushing changes
    *  for (`_session/list/subscribe`, one per directory). */
   private readonly watchedLists = new Set<string>();
@@ -295,10 +301,10 @@ export class AcpAgentHost implements Disposable {
           createSession: (params: CreateSessionParams) =>
             this.createSession(params),
           disposeSession: ({ channel }: { channel: string }) =>
-            this.disposeSession(channel),
+            this.deleteSession(channel),
           createChat: (params: CreateChatParams) => this.createChat(params),
           disposeChat: ({ channel }: { channel: string }) =>
-            this.disposeChat(channel),
+            this.deleteChat(channel),
           resolveSessionConfig: ({
             provider,
             config,
@@ -1341,6 +1347,77 @@ export class AcpAgentHost implements Disposable {
     );
   }
 
+  /** Chat deleted the session: its chats' ACP sessions go too, for good. */
+  private deleteSession(sessionUri: string): null {
+    const chats = this.chatsOf(sessionUri);
+    this.disposeSession(sessionUri);
+    for (const chat of chats) {
+      void this.deleteFromAgent(chat);
+    }
+    return null;
+  }
+
+  /** Chat deleted a forked chat: its ACP session goes too, for good. */
+  private deleteChat(chatUri: string): null {
+    const chat = this.bindings.get(chatUri);
+    this.disposeChat(chatUri);
+    if (chat && !chat.primary) {
+      void this.deleteFromAgent(chat);
+    }
+    return null;
+  }
+
+  /** Deletes a chat's ACP session — its transcript — and its `claude agents`
+   *  job. Only one the agent has stored (listed, forked or prompted): Chat
+   *  also disposes the drafts it never sent. */
+  private async deleteFromAgent(chat: Binding): Promise<void> {
+    if (chat.listedStatus === undefined && !chat.origin && !chat.prompted) {
+      return;
+    }
+    // Not while it's still being created or loaded: the session id may only
+    // be known then. The agent ends a loaded session itself.
+    await chat.ready?.catch(() => undefined);
+    if (!chat.sessionId) {
+      return;
+    }
+    try {
+      const client = await this.connect(chat);
+      await client.deleteSession(chat.sessionId);
+    } catch (err) {
+      this.output.appendLine(`[delete] ${describeError(err)}`);
+    }
+    await this.removeJob(chat);
+  }
+
+  /** Removes the session's `claude agents` job, as ctrl+x there does; its
+   *  transcript stays. */
+  private removeJob(binding: Binding): Promise<void> {
+    const { agent, sessionId } = binding;
+    if (agent.kind !== "claude" || !sessionId) {
+      return Promise.resolve();
+    }
+    // Archiving the primary chat can arrive as both the session's and the
+    // chat's action: one removal serves both.
+    const key = `${agent.name}\0${sessionId}`;
+    const inFlight = this.removingJobs.get(key);
+    if (inFlight) {
+      return inFlight;
+    }
+    const removal = Promise.resolve()
+      .then(() => removeClaudeJob(agentProcessEnv(agent), sessionId))
+      .then(
+        printed => {
+          if (printed) {
+            this.output.appendLine(`[claude rm] ${printed}`);
+          }
+        },
+        err => this.output.appendLine(`[claude rm] ${describeError(err)}`),
+      )
+      .finally(() => this.removingJobs.delete(key));
+    this.removingJobs.set(key, removal);
+    return removal;
+  }
+
   /** Forgets the session on this host only — the agent keeps its transcript,
    *  so it shows up again on the next listing. */
   private disposeSession(sessionUri: string): null {
@@ -1428,6 +1505,9 @@ export class AcpAgentHost implements Disposable {
         void this.withIndex(binding, client =>
           client.archiveSession(binding.sessionId!, action.isArchived),
         );
+        if (action.isArchived) {
+          void this.removeJob(binding);
+        }
       } else if (
         action.type === ActionType.SessionWorkingDirectorySet ||
         action.type === ActionType.SessionWorkingDirectoryRemoved ||
@@ -1454,6 +1534,9 @@ export class AcpAgentHost implements Disposable {
         void this.withIndex(binding, client =>
           client.archiveSession(binding.sessionId!, action.isArchived),
         );
+        if (action.isArchived) {
+          void this.removeJob(binding);
+        }
         return;
       }
       case ActionType.ChatTurnCancelled:
@@ -1490,6 +1573,7 @@ export class AcpAgentHost implements Disposable {
     message: Message,
   ): Promise<void> {
     this.beginTurn(binding, turnId);
+    binding.prompted = true;
     if (binding.title === DEFAULT_CHAT_TITLE && message.text.trim()) {
       this.setTitle(
         binding,
