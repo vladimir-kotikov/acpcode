@@ -151,6 +151,12 @@ export function rowStatus(info: SessionInfo): SessionStatus {
   return air?.archived ? state | SessionStatus.IsArchived : state;
 }
 
+/** The ACP session a listed one was forked from, if the session index knows:
+ *  it only reads that from the head of the transcript. */
+const forkedFrom = (info: SessionInfo): string | undefined =>
+  (info._meta?.jetbrains as { air?: { forkedFrom?: string } } | undefined)?.air
+    ?.forkedFrom;
+
 const directoryUris = (binding: Binding): string[] =>
   [binding.cwd, ...binding.additionalDirectories].map(
     dir => pathToFileURL(dir).href,
@@ -524,6 +530,14 @@ export class AcpAgentHost implements Disposable {
   ): string | undefined {
     const binding = this.bindings.get(channel);
     if (
+      binding &&
+      action.type === ActionType.ChatIsArchivedChanged &&
+      this.pool.get(binding.agent.name)?.canIndexSessions() === false
+    ) {
+      // Nowhere to keep it: the chat would come back on the next listing.
+      return `${binding.agent.name} can't archive chats`;
+    }
+    if (
       binding?.sessionUri !== channel ||
       (action.type !== ActionType.SessionWorkingDirectoryRemoved &&
         action.type !== ActionType.SessionWorkingDirectoryReplaced)
@@ -623,6 +637,7 @@ export class AcpAgentHost implements Disposable {
     chatUri: string,
     cwd: string,
     additionalDirectories: string[] = [],
+    primary = true,
   ): Binding {
     const binding: Binding = {
       agent,
@@ -630,14 +645,16 @@ export class AcpAgentHost implements Disposable {
       chatUri,
       cwd,
       additionalDirectories,
-      primary: true,
+      primary,
       turnMessages: new Map(),
       replaying: false,
       turnStartedAt: 0,
       title: DEFAULT_CHAT_TITLE,
       toolCalls: new Map(),
     };
-    this.bindings.set(sessionUri, binding);
+    if (primary) {
+      this.bindings.set(sessionUri, binding);
+    }
     this.bindings.set(chatUri, binding);
     return binding;
   }
@@ -676,9 +693,23 @@ export class AcpAgentHost implements Disposable {
               : [client.listSessions(undefined, true)],
           );
           this.unlisted.delete(agent.name);
-          return lists
-            .flat()
-            .flatMap(info => this.summaryFor(agent, info) ?? []);
+          const listed = new Map(lists.flat().map(i => [i.sessionId, i]));
+          // Forks first, so their sessions' summaries list them as chats.
+          const sessions = [...listed.values()].filter(info => {
+            // A fork already shown as a session of its own (listed before its
+            // parent was) stays one until the host restarts, rather than
+            // being pulled from under Chat.
+            const sessionUri = this.byAcpSession.get(
+              `${agent.name}\0${info.sessionId}`,
+            )?.primary
+              ? undefined
+              : this.forkRoot(agent, info, listed);
+            if (sessionUri) {
+              this.bindForkRow(agent, info, sessionUri);
+            }
+            return !sessionUri;
+          });
+          return sessions.flatMap(info => this.summaryFor(agent, info) ?? []);
         } catch (err) {
           this.unlisted.add(agent.name);
           this.output.appendLine(
@@ -691,6 +722,61 @@ export class AcpAgentHost implements Disposable {
     // Multi-root workspaces (e.g. git worktrees) can list one session twice.
     const items = new Map(perAgent.flat().map(s => [s.resource, s]));
     return [...items.values()];
+  }
+
+  /** The session a listed fork is a chat of: that of its earliest ancestor
+   *  this host runs or `listed` has. None when it isn't a fork, or its parent
+   *  is gone, so it's a session of its own. */
+  private forkRoot(
+    agent: AgentConfig,
+    info: SessionInfo,
+    listed: Map<string, SessionInfo>,
+  ): string | undefined {
+    let root: string | undefined;
+    const seen = new Set([info.sessionId]);
+    for (let id = forkedFrom(info); id && !seen.has(id);) {
+      seen.add(id);
+      const live = this.byAcpSession.get(`${agent.name}\0${id}`);
+      if (live) {
+        return live.sessionUri;
+      }
+      const row = listed.get(id);
+      if (!row) {
+        break;
+      }
+      root = `ahp-session:/${providerId(agent)}/${encodeURIComponent(id)}`;
+      id = forkedFrom(row);
+    }
+    return root;
+  }
+
+  /** A listed fork as a chat of `sessionUri` — e.g. one made before the host
+   *  restarted. Its fork point isn't known any more, so it has no origin. */
+  private bindForkRow(
+    agent: AgentConfig,
+    info: SessionInfo,
+    sessionUri: string,
+  ): Binding {
+    const status = rowStatus(info);
+    const live = this.byAcpSession.get(`${agent.name}\0${info.sessionId}`);
+    if (live) {
+      live.listedStatus = status;
+      return live;
+    }
+    const binding = this.register(
+      agent,
+      sessionUri,
+      `ahp-chat:/${providerId(agent)}/${encodeURIComponent(info.sessionId)}`,
+      info.cwd,
+      info.additionalDirectories ??
+        this.directories[`${agent.name}\0${info.sessionId}`] ??
+        [],
+      false,
+    );
+    this.bind(binding, info.sessionId);
+    binding.title = info.title || binding.title;
+    binding.listedStatus = status;
+    return binding;
   }
 
   /** A forked chat's ACP session is listed too, but it's a chat of its
@@ -795,11 +881,47 @@ export class AcpAgentHost implements Disposable {
     }
   }
 
+  /** A forked chat follows its ACP session's row: its activity, and an
+   *  archive made elsewhere. */
+  private mirrorChatRow(binding: Binding, status: SessionStatus): void {
+    const was = binding.listedStatus ?? SessionStatus.Idle;
+    if (status === was) {
+      binding.listedStatus = status;
+      return;
+    }
+    const archived = (status & SessionStatus.IsArchived) !== 0;
+    if (archived !== ((was & SessionStatus.IsArchived) !== 0)) {
+      this.server.dispatch(binding.chatUri, {
+        type: ActionType.ChatIsArchivedChanged,
+        isArchived: archived,
+      });
+    }
+    this.setChatStatus(binding, status);
+  }
+
+  /** Publishes a chat's status in its session's chat catalog. */
+  private setChatStatus(binding: Binding, status: SessionStatus): void {
+    binding.listedStatus = status;
+    this.server.dispatch(binding.sessionUri, {
+      type: ActionType.SessionChatUpdated,
+      chat: binding.chatUri,
+      changes: { status },
+    });
+    this.announceChats(binding);
+  }
+
   private onListChanges(agent: AgentConfig, changes: SessionListChanges): void {
     for (const info of changes.sessions) {
       const live = this.byAcpSession.get(`${agent.name}\0${info.sessionId}`);
       if (live && !live.primary) {
-        continue; // a forked chat isn't a row of the session list
+        // A forked chat isn't a row of the session list.
+        this.mirrorChatRow(live, rowStatus(info));
+        continue;
+      }
+      const forkOf = live ? undefined : this.forkRoot(agent, info, new Map());
+      if (forkOf) {
+        this.addChat(this.bindForkRow(agent, info, forkOf));
+        continue;
       }
       const known =
         live ??
@@ -839,8 +961,12 @@ export class AcpAgentHost implements Disposable {
           `ahp-session:/${providerId(agent)}/${encodeURIComponent(sessionId)}`,
         );
       // Never from under a turn that's running.
-      if (gone?.primary && !gone.turnId) {
-        this.disposeSession(gone.sessionUri);
+      if (gone && !gone.turnId) {
+        if (gone.primary) {
+          this.disposeSession(gone.sessionUri);
+        } else {
+          this.disposeChat(gone.chatUri);
+        }
       }
       const key = `${agent.name}\0${sessionId}`;
       if (key in this.directories) {
@@ -868,23 +994,35 @@ export class AcpAgentHost implements Disposable {
     };
   }
 
+  private chatSummary(chat: Binding): ChatSummary {
+    const status = chat.listedStatus ?? SessionStatus.Idle;
+    return {
+      resource: chat.chatUri,
+      title: chat.title,
+      // Only a fork's row keeps this current (`mirrorChatRow`); a primary
+      // chat's activity would go stale, so it only carries the archive flag.
+      status: chat.primary
+        ? SessionStatus.Idle | (status & SessionStatus.IsArchived)
+        : status,
+      modifiedAt: new Date().toISOString(),
+      ...(chat.origin && {
+        origin: { kind: ChatOriginKind.Fork, ...chat.origin },
+      }),
+    };
+  }
+
   private sessionState(binding: Binding): SessionState {
     const { title } = binding;
     const options =
       binding.configOptions ?? this.knownOptions[binding.agent.name] ?? [];
-    const chat: ChatSummary = {
-      resource: binding.chatUri,
-      title,
-      status: SessionStatus.Idle,
-      modifiedAt: new Date().toISOString(),
-    };
+    const chats = this.chatsOf(binding.sessionUri);
     return {
       provider: providerId(binding.agent),
       title,
       status: binding.listedStatus ?? SessionStatus.Idle,
       lifecycle: SessionLifecycle.Ready,
       activeClients: [],
-      chats: [chat],
+      chats: (chats.length ? chats : [binding]).map(c => this.chatSummary(c)),
       defaultChat: binding.chatUri,
       workingDirectories: directoryUris(binding),
       // AHP can't change a session's config schema later, only its values,
@@ -918,6 +1056,8 @@ export class AcpAgentHost implements Disposable {
     return (chats.length ? chats : [fallback]).map(chat => ({
       resource: chat.chatUri,
       title: chat.title,
+      // Chat's list reads a chat's archived flag from here.
+      ...(chat.listedStatus !== undefined && { status: chat.listedStatus }),
       ...(chat.origin && {
         origin: { kind: ChatOriginKind.Fork, ...chat.origin },
       }),
@@ -1032,18 +1172,17 @@ export class AcpAgentHost implements Disposable {
         }
       },
     );
+    this.addChat(binding);
+    return null;
+  }
+
+  /** Announces a session's new chat to Chat. */
+  private addChat(binding: Binding): void {
     this.server.dispatch(binding.sessionUri, {
       type: ActionType.SessionChatAdded,
-      summary: {
-        resource: binding.chatUri,
-        title: binding.title,
-        status: SessionStatus.Idle,
-        modifiedAt: new Date().toISOString(),
-        origin: { kind: ChatOriginKind.Fork, ...binding.origin! },
-      },
+      summary: this.chatSummary(binding),
     });
     this.announceChats(binding);
-    return null;
   }
 
   /** Stops tracking a chat on this host; its ACP session is left alone,
@@ -1090,10 +1229,11 @@ export class AcpAgentHost implements Disposable {
     // the chat reports why.
     await loaded.catch(() => undefined);
     if (!this.server.has(binding.sessionUri)) {
+      // A fork's session is its primary chat's.
       this.server.create(
         binding.sessionUri,
         "session",
-        this.sessionState(binding),
+        this.sessionState(this.bindings.get(binding.sessionUri) ?? binding),
       );
     }
     if (channel === binding.chatUri) {
@@ -1301,6 +1441,21 @@ export class AcpAgentHost implements Disposable {
       case ActionType.ChatTurnStarted:
         void this.runTurn(binding, action.turnId, action.message);
         return;
+      case ActionType.ChatIsArchivedChanged: {
+        // A chat is its own ACP session: a fork's, or for the primary chat
+        // the session's, whose row then archives the session as well.
+        const status = binding.listedStatus ?? SessionStatus.Idle;
+        this.setChatStatus(
+          binding,
+          action.isArchived
+            ? status | SessionStatus.IsArchived
+            : status & ~SessionStatus.IsArchived,
+        );
+        void this.withIndex(binding, client =>
+          client.archiveSession(binding.sessionId!, action.isArchived),
+        );
+        return;
+      }
       case ActionType.ChatTurnCancelled:
         if (binding.sessionId) {
           this.pool.get(binding.agent.name)?.cancelPrompt(binding.sessionId);

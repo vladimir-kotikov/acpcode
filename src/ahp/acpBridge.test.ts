@@ -4,6 +4,8 @@ import {
   ActionType,
   ChatSourceKind,
   type ChatState,
+  type SessionChatSummary,
+  SessionStatus,
   type StateAction,
 } from "@microsoft/agent-host-protocol";
 import assert from "node:assert/strict";
@@ -19,8 +21,13 @@ const SESSION = "ahp-session:/acp-claude/s1";
 const CHAT = "ahp-chat:/acp-claude/s1";
 
 /** A bridge whose `s1` replays one turn ending in agent message `m1`. */
-function setup(directories: Record<string, string[]> = {}) {
+function setup(
+  directories: Record<string, string[]> = {},
+  { indexed = true }: { indexed?: boolean } = {},
+) {
   const calls: { method: string; args: unknown[] }[] = [];
+  /** What the agent's session list returns. */
+  const listed: SessionInfo[] = [];
   const updateListeners: ((e: {
     sessionId: string;
     update: SessionUpdate;
@@ -30,7 +37,7 @@ function setup(directories: Record<string, string[]> = {}) {
   const disposable = { dispose: () => undefined };
   const client = {
     canSendImages: () => false,
-    canIndexSessions: () => true,
+    canIndexSessions: () => indexed,
     onSessionUpdate: (l: (typeof updateListeners)[number]) => {
       updateListeners.push(l);
       return disposable;
@@ -55,14 +62,19 @@ function setup(directories: Record<string, string[]> = {}) {
       calls.push({ method: "forkSession", args });
       return Promise.resolve({ sessionId: "fork-1" });
     },
+    listSessions: () => Promise.resolve(listed),
     resumeSession: (...args: unknown[]) => {
       calls.push({ method: "resumeSession", args });
+      return Promise.resolve();
+    },
+    archiveSession: (...args: unknown[]) => {
+      calls.push({ method: "archiveSession", args });
       return Promise.resolve();
     },
   } as unknown as AgentClient;
   const pool = {
     connect: () => Promise.resolve(client),
-    get: () => undefined,
+    get: () => client,
   } as unknown as AgentConnectionPool;
 
   const saved: Record<string, string[]>[] = [];
@@ -105,7 +117,16 @@ function setup(directories: Record<string, string[]> = {}) {
     }
     return rejection;
   };
-  return { host, hooks, calls, saved, notified, listChanged, clientAction };
+  return {
+    host,
+    hooks,
+    calls,
+    listed,
+    saved,
+    notified,
+    listChanged,
+    clientAction,
+  };
 }
 
 const row = (sessionId: string, title?: string): SessionInfo => ({
@@ -208,4 +229,262 @@ test("a fork branches at its turn's last agent message and isn't listed", async 
   const before = notified.length;
   listChanged({ sessions: [row("fork-1")] });
   assert.equal(notified.length, before);
+});
+
+test("archiving a fork archives its ACP session and its catalog entry", async () => {
+  const { host, hooks, calls, notified, listChanged, clientAction } = setup();
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+  const [turn] = (host.server.stateOf(CHAT) as ChatState).turns;
+  await (hooks.handlers.createChat as (p: unknown) => Promise<null>)({
+    channel: SESSION,
+    chat: "ahp-chat:/fork",
+    source: { kind: ChatSourceKind.Fork, chat: CHAT, turnId: turn.id },
+  });
+  const forkStatus = () =>
+    (
+      notified.findLast(n => n.method === "root/sessionSummaryChanged")!.params
+        .changes as { chats: SessionChatSummary[] }
+    ).chats.find(c => c.resource === "ahp-chat:/fork")?.status;
+
+  clientAction("ahp-chat:/fork", {
+    type: ActionType.ChatIsArchivedChanged,
+    isArchived: true,
+  });
+  await settle();
+
+  assert.deepEqual(
+    calls.filter(c => c.method === "archiveSession").map(c => c.args),
+    [["fork-1", true]],
+  );
+  assert.equal(forkStatus(), SessionStatus.Idle | SessionStatus.IsArchived);
+
+  // Unarchived elsewhere: the fork's row brings the chat back.
+  listChanged({ sessions: [row("fork-1")] });
+  assert.equal(forkStatus(), SessionStatus.Idle);
+  assert.equal(
+    (host.server.stateOf("ahp-chat:/fork") as ChatState).status &
+      SessionStatus.IsArchived,
+    0,
+  );
+});
+
+/** A row as an index-capable bridge lists it (`_meta.jetbrains.air`). */
+const indexedRow = (
+  sessionId: string,
+  air: Record<string, unknown>,
+): SessionInfo => ({
+  ...row(sessionId, sessionId),
+  _meta: { jetbrains: { air } },
+});
+
+const forkRow = (sessionId: string, parent: string): SessionInfo =>
+  indexedRow(sessionId, { forkedFrom: parent });
+
+type Listed = { resource: string; chats: SessionChatSummary[] };
+
+const listSessions = (hooks: AhpServerHooks) =>
+  (hooks.handlers.listSessions as () => Promise<{ items: Listed[] }>)();
+
+/** The chats of `session` as Chat's list last heard of them. */
+function lastCatalog(
+  items: Listed[],
+  notified: { method: string; params: Record<string, unknown> }[],
+  session: string,
+): SessionChatSummary[] {
+  const changed = notified.findLast(
+    n =>
+      n.method === "root/sessionSummaryChanged" &&
+      n.params.session === session &&
+      "chats" in (n.params.changes as object),
+  );
+  return changed
+    ? (changed.params.changes as { chats: SessionChatSummary[] }).chats
+    : items.find(i => i.resource === session)!.chats;
+}
+
+test("listed forks are chats of their earliest listed ancestor's session", async () => {
+  const { host, hooks, listed } = setup();
+  listed.push(
+    forkRow("f2", "f1"),
+    forkRow("f1", "s1"),
+    row("s1", "Root"),
+    forkRow("orphan", "gone"),
+  );
+
+  const { items } = await (
+    hooks.handlers.listSessions as () => Promise<{
+      items: { resource: string; chats: SessionChatSummary[] }[];
+    }>
+  )();
+
+  assert.deepEqual(
+    items.map(i => [
+      i.resource,
+      // The primary chat first; the forks in the listing's order.
+      [
+        i.chats[0].resource,
+        ...i.chats
+          .slice(1)
+          .map(c => c.resource)
+          .sort(),
+      ],
+    ]),
+    [
+      [SESSION, [CHAT, "ahp-chat:/acp-claude/f1", "ahp-chat:/acp-claude/f2"]],
+      ["ahp-session:/acp-claude/orphan", ["ahp-chat:/acp-claude/orphan"]],
+    ],
+  );
+  // Opening a fork first still gives its session the primary chat's state.
+  await hooks.materialize("ahp-chat:/acp-claude/f1");
+  const session = host.server.stateOf(SESSION) as {
+    defaultChat: string;
+    chats: unknown[];
+  };
+  assert.equal(session.defaultChat, CHAT);
+  assert.equal(session.chats.length, 3);
+});
+
+test("a fork's row added or removed later adds or removes its chat", () => {
+  const { notified, listChanged } = setup();
+  listChanged({ sessions: [row("s1")] });
+  const catalog = () =>
+    (
+      notified.findLast(n => n.method === "root/sessionSummaryChanged")!.params
+        .changes as { chats: SessionChatSummary[] }
+    ).chats.map(c => c.resource);
+
+  listChanged({ sessions: [forkRow("f1", "s1")] });
+  assert.deepEqual(catalog(), [CHAT, "ahp-chat:/acp-claude/f1"]);
+  assert.equal(
+    notified.filter(n => n.method === "root/sessionAdded").length,
+    1,
+  );
+
+  listChanged({ removed: ["f1"] });
+  assert.deepEqual(catalog(), [CHAT]);
+});
+
+test("archiving the primary chat archives the session's ACP session", async () => {
+  const { hooks, calls, listChanged, clientAction } = setup();
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+
+  clientAction(CHAT, {
+    type: ActionType.ChatIsArchivedChanged,
+    isArchived: true,
+  });
+  await settle();
+
+  assert.deepEqual(
+    calls.filter(c => c.method === "archiveSession").map(c => c.args),
+    [["s1", true]],
+  );
+});
+
+test("a fork of an open fork listed later is a chat of the original session", async () => {
+  const { host, hooks, notified, listChanged } = setup();
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+  const [turn] = (host.server.stateOf(CHAT) as ChatState).turns;
+  await (hooks.handlers.createChat as (p: unknown) => Promise<null>)({
+    channel: SESSION,
+    chat: "ahp-chat:/fork",
+    source: { kind: ChatSourceKind.Fork, chat: CHAT, turnId: turn.id },
+  });
+
+  listChanged({ sessions: [forkRow("f2", "fork-1")] });
+
+  assert.deepEqual(
+    lastCatalog([], notified, SESSION).map(c => c.resource),
+    [CHAT, "ahp-chat:/fork", "ahp-chat:/acp-claude/f2"],
+  );
+});
+
+test("a listed fork archived elsewhere is listed as archived", async () => {
+  const { hooks, listed, notified, listChanged } = setup();
+  listed.push(row("s1"), forkRow("f1", "s1"));
+  const { items } = await listSessions(hooks);
+
+  listChanged({
+    sessions: [indexedRow("f1", { forkedFrom: "s1", archived: true })],
+  });
+
+  const fork = lastCatalog(items, notified, SESSION).find(
+    c => c.resource === "ahp-chat:/acp-claude/f1",
+  );
+  assert.equal(
+    (fork?.status ?? 0) & SessionStatus.IsArchived,
+    SessionStatus.IsArchived,
+  );
+});
+
+test("a fork first listed without its parent link stays listed once the link shows up", async () => {
+  const { hooks, listed } = setup();
+  listed.push(row("s1"), row("f1"));
+  await listSessions(hooks);
+  listed.splice(0, Infinity, row("s1"), forkRow("f1", "s1"));
+
+  const { items } = await listSessions(hooks);
+
+  const shown = items.flatMap(i => [
+    i.resource,
+    ...i.chats.map(c => c.resource),
+  ]);
+  assert.ok(
+    shown.includes("ahp-session:/acp-claude/f1") ||
+      shown.includes("ahp-chat:/acp-claude/f1"),
+    `f1 is gone from ${JSON.stringify(shown)}`,
+  );
+});
+
+test("a listed fork that stops running is listed as idle", async () => {
+  const { hooks, listed, notified, listChanged } = setup();
+  listed.push(
+    row("s1"),
+    indexedRow("f1", { forkedFrom: "s1", state: "running" }),
+  );
+  const { items } = await listSessions(hooks);
+
+  listChanged({
+    sessions: [indexedRow("f1", { forkedFrom: "s1", state: "idle" })],
+  });
+
+  const fork = lastCatalog(items, notified, SESSION).find(
+    c => c.resource === "ahp-chat:/acp-claude/f1",
+  );
+  assert.equal(fork?.status, SessionStatus.Idle);
+});
+
+test("a session listed as running doesn't keep its chat running", async () => {
+  const { host, hooks, listChanged } = setup();
+  listChanged({ sessions: [indexedRow("s1", { state: "running" })] });
+
+  await hooks.materialize(SESSION);
+
+  const { chats } = host.server.stateOf(SESSION) as {
+    chats: { status: SessionStatus }[];
+  };
+  assert.equal(chats[0].status, SessionStatus.Idle);
+});
+
+test("a chat of an agent without a session index can't be archived", async () => {
+  const { hooks, calls, listChanged, clientAction } = setup(
+    {},
+    { indexed: false },
+  );
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+
+  const rejection = clientAction(CHAT, {
+    type: ActionType.ChatIsArchivedChanged,
+    isArchived: true,
+  });
+  await settle();
+
+  assert.match(rejection ?? "", /can't archive/);
+  assert.equal(
+    calls.some(c => c.method === "archiveSession"),
+    false,
+  );
 });
