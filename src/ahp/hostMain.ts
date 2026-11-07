@@ -96,6 +96,10 @@ const host = new AcpAgentHost(pool, log, {
     load: () => readJson(files.configOptions) ?? {},
     save: cache => fs.writeFileSync(files.configOptions, JSON.stringify(cache)),
   },
+  directoryCache: {
+    load: () => readJson(files.directories) ?? {},
+    save: cache => fs.writeFileSync(files.directories, JSON.stringify(cache)),
+  },
   imageCache: {
     load: () => readJson(files.imageSupport) ?? {},
     save: cache => fs.writeFileSync(files.imageSupport, JSON.stringify(cache)),

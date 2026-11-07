@@ -30,6 +30,9 @@ export const hostFiles = (dir: string) => ({
   configOptions: path.join(dir, "configOptions.json"),
   /** Written by the host: whether each agent accepts image prompts. */
   imageSupport: path.join(dir, "imageSupport.json"),
+  /** Written by the host: the extra directories of each session, which the
+   *  agents' session lists don't report (`${agent}\0${sessionId}`). */
+  directories: path.join(dir, "directories.json"),
   windows: path.join(dir, "windows"),
   log: path.join(dir, "host.log"),
 });

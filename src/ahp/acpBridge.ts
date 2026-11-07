@@ -10,6 +10,8 @@ import type {
 import {
   ActionType,
   AhpErrorCodes,
+  ChatOriginKind,
+  ChatSourceKind,
   ConfirmationOptionKind,
   JsonRpcErrorCodes,
   MessageAttachmentKind,
@@ -24,8 +26,10 @@ import {
   type ChatSummary,
   type CompletionsParams,
   type CompletionsResult,
+  type CreateChatParams,
   type CreateSessionParams,
   type Message,
+  type SessionChatSummary,
   type SessionState,
   type SessionSummary,
   type StateAction,
@@ -33,8 +37,13 @@ import {
 } from "@microsoft/agent-host-protocol";
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
+import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { describeError, type AgentClient } from "../acp/agentClient.ts";
+import {
+  describeError,
+  type AgentClient,
+  type SessionListChanges,
+} from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
 import type { Disposable, Output } from "../shared/events.ts";
@@ -83,6 +92,22 @@ interface Binding {
   readonly sessionUri: string;
   readonly chatUri: string;
   readonly cwd: string;
+  /** The session's other directories (the `/add-dir` set); `cwd` is the
+   *  primary. Only agents that can take them (see `takesExtraDirectories`)
+   *  ever have any. */
+  additionalDirectories: string[];
+  /** The session's first chat. Forked chats (`createChat`) share its URI,
+   *  directories and config but each runs its own ACP session. */
+  readonly primary: boolean;
+  /** Set on a forked chat: where it branched off. */
+  readonly origin?: { chat: string; turnId: string };
+  /** Per turn, the ACP id of its last agent message: the point a fork of
+   *  that turn is cut at. */
+  readonly turnMessages: Map<string, string>;
+  /** The session's status as its last listing reported it (archived, ...). */
+  listedStatus?: SessionStatus;
+  /** The directory set changed during a turn; applied when it ends. */
+  directoriesDirty?: boolean;
   title: string;
   sessionId?: string;
   /** Settles once the ACP session is live on its connection (created, or its
@@ -102,6 +127,34 @@ interface Binding {
   /** The ACP session's slash commands, once the agent has announced them. */
   commands?: AvailableCommand[];
 }
+
+/** claude-agent-acp advertises `sessionCapabilities.additionalDirectories`;
+ *  codex-acp doesn't. */
+const takesExtraDirectories = (agent: AgentConfig): boolean =>
+  agent.kind === "claude";
+
+/** The bridge's session index (`sessionIndex`) reports each row's activity
+ *  and archive state in `_meta.jetbrains.air`. Without it, rows are idle. */
+export function rowStatus(info: SessionInfo): SessionStatus {
+  const air = (
+    info._meta?.jetbrains as
+      { air?: { state?: string; archived?: boolean } } | undefined
+  )?.air;
+  const state =
+    air?.state === "running"
+      ? SessionStatus.InProgress
+      : air?.state === "error"
+        ? SessionStatus.Error
+        : air?.state === "requires_action"
+          ? SessionStatus.InputNeeded
+          : SessionStatus.Idle;
+  return air?.archived ? state | SessionStatus.IsArchived : state;
+}
+
+const directoryUris = (binding: Binding): string[] =>
+  [binding.cwd, ...binding.additionalDirectories].map(
+    dir => pathToFileURL(dir).href,
+  );
 
 /** AHP provider IDs double as URI schemes VS Code builds draft-session
  *  resources from (`<provider>:/untitled-<uuid>`), so they must be
@@ -185,6 +238,13 @@ export interface AgentHostEnvironment {
     load(): Record<string, boolean>;
     save(cache: Record<string, boolean>): void;
   };
+  /** Per `${agent}\0${sessionId}`, a session's directories beyond its cwd:
+   *  the agents' session lists don't report them, so a reload would lose
+   *  them. */
+  directoryCache: {
+    load(): Record<string, string[]>;
+    save(cache: Record<string, string[]>): void;
+  };
 }
 
 /** Exposes the configured ACP agents through an `AhpServer`, so VS Code's
@@ -199,9 +259,15 @@ export class AcpAgentHost implements Disposable {
   private readonly bindings = new Map<string, Binding>(); // by session and chat URI
   private readonly byAcpSession = new Map<string, Binding>(); // by `${agent}\0${sessionId}`
   private readonly hookedClients = new WeakSet<AgentClient>();
+  /** `${agent}\0${cwd}` of the session lists the agent is pushing changes
+   *  for (`_session/list/subscribe`, one per directory). */
+  private readonly watchedLists = new Set<string>();
+  /** Agents whose bridge has no session index (nothing to subscribe to). */
+  private readonly unindexed = new Set<string>();
   private readonly env: AgentHostEnvironment;
   private readonly knownOptions: Record<string, SessionConfigOption[]>;
   private readonly imageSupport: Record<string, boolean>;
+  private readonly directories: Record<string, string[]>;
   // Agents whose last listing failed; see `bridgesChanged()`.
   private readonly unlisted = new Set<string>();
 
@@ -215,6 +281,7 @@ export class AcpAgentHost implements Disposable {
     this.env = env;
     this.knownOptions = env.configCache.load();
     this.imageSupport = env.imageCache.load();
+    this.directories = env.directoryCache.load();
     this.server = new AhpServer(
       {
         handlers: {
@@ -223,6 +290,9 @@ export class AcpAgentHost implements Disposable {
             this.createSession(params),
           disposeSession: ({ channel }: { channel: string }) =>
             this.disposeSession(channel),
+          createChat: (params: CreateChatParams) => this.createChat(params),
+          disposeChat: ({ channel }: { channel: string }) =>
+            this.disposeChat(channel),
           resolveSessionConfig: ({
             provider,
             config,
@@ -249,6 +319,8 @@ export class AcpAgentHost implements Disposable {
         materialize: channel => this.materialize(channel),
         onClientAction: (channel, action) =>
           this.onClientAction(channel, action),
+        rejectClientAction: (channel, action) =>
+          this.rejectClientAction(channel, action),
       },
       output,
       () => this.defaultCwd() && pathToFileURL(this.defaultCwd()).href,
@@ -285,6 +357,14 @@ export class AcpAgentHost implements Disposable {
         displayName: agent.name,
         description: `${agent.kind} via ACP`,
         models: models.map(model => ({ ...model, supportsVision })),
+        // The primary is the session's cwd, which fixes where its transcript
+        // lives, so only the rest of the set can change.
+        ...(takesExtraDirectories(agent) && {
+          capabilities: {
+            multipleWorkingDirectories: { immutablePrimary: true },
+            multipleChats: { fork: true },
+          },
+        }),
       };
     });
   }
@@ -347,6 +427,116 @@ export class AcpAgentHost implements Disposable {
     }
   }
 
+  /** Runs `call` on the session's connection if the bridge has a session
+   *  index; without one, the change stays in Chat only. */
+  private async withIndex(
+    binding: Binding,
+    call: (client: AgentClient) => Promise<void>,
+  ): Promise<void> {
+    try {
+      await binding.ready;
+      const client = await this.connect(binding);
+      if (client.canIndexSessions() && binding.sessionId) {
+        await call(client);
+      }
+    } catch (err) {
+      this.output.appendLine(`[sessionIndex] ${describeError(err)}`);
+    }
+  }
+
+  /** A client changed the session's directory set (already applied to its
+   *  state): hand the new set to every ACP session of the session's chats. */
+  private syncDirectories(sessionUri: string): void {
+    const state = this.server.stateOf(sessionUri) as SessionState;
+    const [, ...rest] = (state.workingDirectories ?? [])
+      .filter(uri => uri.startsWith("file:"))
+      .map(uri => fileURLToPath(uri));
+    // Chat's own list of the set follows what it just changed.
+    this.server.notify("root/sessionSummaryChanged", {
+      channel: ROOT_CHANNEL,
+      session: sessionUri,
+      changes: { workingDirectories: state.workingDirectories },
+    });
+    for (const chat of this.chatsOf(sessionUri)) {
+      // Adding a directory the session has, or removing one it lacks, is
+      // nothing to tell the agent (and resuming rebuilds its session).
+      if (
+        chat.additionalDirectories.length === rest.length &&
+        chat.additionalDirectories.every((dir, i) => dir === rest[i])
+      ) {
+        continue;
+      }
+      if (chat.turnId) {
+        // Resuming rebuilds the agent's session, which ends a running turn.
+        chat.directoriesDirty = true;
+      } else {
+        void this.applyDirectories(chat);
+      }
+    }
+  }
+
+  private async applyDirectories(binding: Binding): Promise<void> {
+    const state = this.server.stateOf(binding.sessionUri) as SessionState;
+    const [, ...rest] = (state.workingDirectories ?? [])
+      .filter(uri => uri.startsWith("file:"))
+      .map(uri => fileURLToPath(uri));
+    binding.additionalDirectories = rest;
+    this.rememberDirectories(binding);
+    try {
+      await binding.ready;
+      const client = await this.connect(binding);
+      await client.resumeSession(binding.sessionId!, binding.cwd, rest);
+    } catch (err) {
+      this.output.appendLine(`[directories] ${describeError(err)}`);
+    }
+  }
+
+  private rememberDirectories(binding: Binding): void {
+    if (!binding.sessionId || !takesExtraDirectories(binding.agent)) {
+      return;
+    }
+    const key = `${binding.agent.name}\0${binding.sessionId}`;
+    const before = JSON.stringify(this.directories[key] ?? []);
+    if (before === JSON.stringify(binding.additionalDirectories)) {
+      return;
+    }
+    if (binding.additionalDirectories.length) {
+      this.directories[key] = binding.additionalDirectories;
+    } else {
+      delete this.directories[key];
+    }
+    this.saveDirectories();
+  }
+
+  private saveDirectories(): void {
+    try {
+      this.env.directoryCache.save(this.directories);
+    } catch (err) {
+      this.output.appendLine(`[directories] ${describeError(err)}`);
+    }
+  }
+
+  /** The primary directory is the agent's cwd, which fixes where its session
+   *  lives: Chat may add to the set but not remove or replace the first. */
+  private rejectClientAction(
+    channel: string,
+    action: StateAction,
+  ): string | undefined {
+    const binding = this.bindings.get(channel);
+    if (
+      binding?.sessionUri !== channel ||
+      (action.type !== ActionType.SessionWorkingDirectoryRemoved &&
+        action.type !== ActionType.SessionWorkingDirectoryReplaced)
+    ) {
+      return undefined;
+    }
+    return action.directory.startsWith("file:") &&
+      path.resolve(fileURLToPath(action.directory)) ===
+        path.resolve(binding.cwd)
+      ? "the primary working directory can't be changed"
+      : undefined;
+  }
+
   /** Applies AHP config values (`acp.<id>` keys) to the ACP session, then
    *  publishes what the agent actually ended up with. */
   private async applyConfig(
@@ -397,6 +587,19 @@ export class AcpAgentHost implements Disposable {
           this.onSessionUpdate(target, update);
         }
       });
+      client.onSessionListChanges(changes =>
+        this.onListChanges(binding.agent, changes),
+      );
+      // A restarted bridge has no subscriptions; the next listing makes them.
+      client.onConnectionStateChanged(({ state }) => {
+        if (state !== "connected") {
+          for (const key of this.watchedLists) {
+            if (key.startsWith(`${agentName}\0`)) {
+              this.watchedLists.delete(key);
+            }
+          }
+        }
+      });
       client.onPermissionRequest(request => {
         const target = this.byAcpSession.get(
           `${agentName}\0${request.sessionId}`,
@@ -419,12 +622,16 @@ export class AcpAgentHost implements Disposable {
     sessionUri: string,
     chatUri: string,
     cwd: string,
+    additionalDirectories: string[] = [],
   ): Binding {
     const binding: Binding = {
       agent,
       sessionUri,
       chatUri,
       cwd,
+      additionalDirectories,
+      primary: true,
+      turnMessages: new Map(),
       replaying: false,
       turnStartedAt: 0,
       title: DEFAULT_CHAT_TITLE,
@@ -447,6 +654,7 @@ export class AcpAgentHost implements Disposable {
    *  Code only lists on connect. Agents that were listed keep the bridge
    *  they're connected to until the host restarts. */
   async bridgesChanged(): Promise<void> {
+    this.unindexed.clear(); // an updated bridge may have a session index now
     const agents = this.env.agents().filter(a => this.unlisted.has(a.name));
     for (const summary of await this.listAgents(agents)) {
       this.server.notify("root/sessionAdded", {
@@ -464,11 +672,13 @@ export class AcpAgentHost implements Disposable {
           const client = await this.pool.connect(agent, this.defaultCwd());
           const lists = await Promise.all(
             folders.length
-              ? folders.map(folder => client.listSessions(folder))
-              : [client.listSessions()],
+              ? folders.map(folder => client.listSessions(folder, true))
+              : [client.listSessions(undefined, true)],
           );
           this.unlisted.delete(agent.name);
-          return lists.flat().map(info => this.summaryFor(agent, info));
+          return lists
+            .flat()
+            .flatMap(info => this.summaryFor(agent, info) ?? []);
         } catch (err) {
           this.unlisted.add(agent.name);
           this.output.appendLine(
@@ -483,33 +693,178 @@ export class AcpAgentHost implements Disposable {
     return [...items.values()];
   }
 
+  /** A forked chat's ACP session is listed too, but it's a chat of its
+   *  parent's session, not a session of its own. */
+  private summaryFor(
+    agent: AgentConfig,
+    info: SessionInfo,
+  ): SessionSummary | undefined {
+    const { binding, summary } = this.bindRow(agent, info);
+    if (!binding.primary) {
+      return undefined;
+    }
+    this.watchList(agent, binding.cwd);
+    return summary;
+  }
+
   /** Listed sessions get URIs derived from their ACP identity, so the same
    *  session keeps the same URI across listings and VS Code reloads. */
-  private summaryFor(agent: AgentConfig, info: SessionInfo): SessionSummary {
+  private bindRow(
+    agent: AgentConfig,
+    info: SessionInfo,
+  ): { binding: Binding; summary: SessionSummary } {
     const key = `${providerId(agent)}/${encodeURIComponent(info.sessionId)}`;
     const sessionUri = `ahp-session:/${key}`;
     const chatUri = `ahp-chat:/${key}`;
+    // A session this host already runs (e.g. one Chat created, under its own
+    // URI) keeps its binding; its row only refreshes the status.
     const binding =
+      this.byAcpSession.get(`${agent.name}\0${info.sessionId}`) ??
       this.bindings.get(sessionUri) ??
-      this.register(agent, sessionUri, chatUri, info.cwd);
+      this.register(
+        agent,
+        sessionUri,
+        chatUri,
+        info.cwd,
+        info.additionalDirectories ??
+          this.directories[`${agent.name}\0${info.sessionId}`] ??
+          [],
+      );
     if (!binding.sessionId) {
       this.bind(binding, info.sessionId);
     }
-    binding.title = info.title || binding.title;
-    return this.summary(binding, info.updatedAt ?? new Date().toISOString());
+    const status = rowStatus(info);
+    binding.listedStatus = status;
+    if (binding.primary) {
+      binding.title = info.title || binding.title;
+    }
+    const summary = this.summary(
+      binding,
+      info.updatedAt ?? new Date().toISOString(),
+      status,
+    );
+    return { binding, summary };
   }
 
-  private summary(binding: Binding, modifiedAt: string): SessionSummary {
+  /** Asks an index-capable bridge to push changes of the sessions in `cwd`,
+   *  which keeps Chat's list fresh without it having to re-list. */
+  private watchList(agent: AgentConfig, cwd: string): void {
+    const key = `${agent.name}\0${cwd}`;
+    // The bridge allows 128 subscriptions per connection.
+    if (
+      this.unindexed.has(agent.name) ||
+      this.watchedLists.has(key) ||
+      this.watchedLists.size >= 100
+    ) {
+      return;
+    }
+    this.watchedLists.add(key);
+    void this.pool
+      .connect(agent, this.defaultCwd())
+      .then(client => {
+        if (!client.canIndexSessions()) {
+          this.unindexed.add(agent.name);
+          this.watchedLists.delete(key);
+          return;
+        }
+        return client.subscribeSessionList(cwd);
+      })
+      .catch(err => {
+        this.watchedLists.delete(key);
+        this.output.appendLine(`[listSubscribe] ${describeError(err)}`);
+      });
+  }
+
+  /** The session is open in Chat: its own channel follows a rename or an
+   *  archive made elsewhere, as the root list does. */
+  private mirrorRow(binding: Binding, summary: SessionSummary): void {
+    const state = this.server.stateOf(binding.sessionUri) as
+      SessionState | undefined;
+    if (!state) {
+      return;
+    }
+    if (summary.title !== state.title && !binding.turnId) {
+      this.setTitle(binding, summary.title);
+    }
+    const archived = (summary.status & SessionStatus.IsArchived) !== 0;
+    if (archived !== ((state.status & SessionStatus.IsArchived) !== 0)) {
+      this.server.dispatch(binding.sessionUri, {
+        type: ActionType.SessionIsArchivedChanged,
+        isArchived: archived,
+      });
+    }
+  }
+
+  private onListChanges(agent: AgentConfig, changes: SessionListChanges): void {
+    for (const info of changes.sessions) {
+      const live = this.byAcpSession.get(`${agent.name}\0${info.sessionId}`);
+      if (live && !live.primary) {
+        continue; // a forked chat isn't a row of the session list
+      }
+      const known =
+        live ??
+        this.bindings.get(
+          `ahp-session:/${providerId(agent)}/${encodeURIComponent(info.sessionId)}`,
+        );
+      const { binding, summary } = this.bindRow(agent, info);
+      if (known) {
+        // The row can't say what chats the session has: `chats` would
+        // replace the whole catalog.
+        const {
+          resource: _,
+          provider: __,
+          createdAt: ___,
+          chats: ____,
+          defaultChat: _____,
+          workingDirectories: ______, // Chat's own state is the authority
+          ...changed
+        } = summary;
+        this.mirrorRow(binding, summary);
+        this.server.notify("root/sessionSummaryChanged", {
+          channel: ROOT_CHANNEL,
+          session: binding.sessionUri,
+          changes: changed,
+        });
+      } else {
+        this.server.notify("root/sessionAdded", {
+          channel: ROOT_CHANNEL,
+          summary,
+        });
+      }
+    }
+    for (const sessionId of changes.removed) {
+      const gone =
+        this.byAcpSession.get(`${agent.name}\0${sessionId}`) ??
+        this.bindings.get(
+          `ahp-session:/${providerId(agent)}/${encodeURIComponent(sessionId)}`,
+        );
+      // Never from under a turn that's running.
+      if (gone?.primary && !gone.turnId) {
+        this.disposeSession(gone.sessionUri);
+      }
+      const key = `${agent.name}\0${sessionId}`;
+      if (key in this.directories) {
+        delete this.directories[key];
+        this.saveDirectories();
+      }
+    }
+  }
+
+  private summary(
+    binding: Binding,
+    modifiedAt: string,
+    status = SessionStatus.Idle,
+  ): SessionSummary {
     return {
       resource: binding.sessionUri,
       provider: providerId(binding.agent),
       title: binding.title,
-      status: SessionStatus.Idle,
+      status,
       createdAt: modifiedAt,
       modifiedAt,
-      workingDirectories: [pathToFileURL(binding.cwd).href],
+      workingDirectories: directoryUris(binding),
       defaultChat: binding.chatUri,
-      chats: [{ resource: binding.chatUri, title: binding.title }],
+      chats: this.chatCatalog(binding.sessionUri, binding),
     };
   }
 
@@ -526,12 +881,12 @@ export class AcpAgentHost implements Disposable {
     return {
       provider: providerId(binding.agent),
       title,
-      status: SessionStatus.Idle,
+      status: binding.listedStatus ?? SessionStatus.Idle,
       lifecycle: SessionLifecycle.Ready,
       activeClients: [],
       chats: [chat],
       defaultChat: binding.chatUri,
-      workingDirectories: [pathToFileURL(binding.cwd).href],
+      workingDirectories: directoryUris(binding),
       // AHP can't change a session's config schema later, only its values,
       // so a session created before its options are known uses the agent's
       // last-seen ones.
@@ -542,6 +897,42 @@ export class AcpAgentHost implements Disposable {
     };
   }
 
+  /** A session's chats, its first one first. */
+  private chatsOf(sessionUri: string): Binding[] {
+    const chats = new Map<string, Binding>();
+    for (const binding of this.bindings.values()) {
+      if (binding.sessionUri === sessionUri) {
+        chats.set(binding.chatUri, binding);
+      }
+    }
+    return [...chats.values()].sort(
+      (a, b) => Number(b.primary) - Number(a.primary),
+    );
+  }
+
+  private chatCatalog(
+    sessionUri: string,
+    fallback: Binding,
+  ): SessionChatSummary[] {
+    const chats = this.chatsOf(sessionUri);
+    return (chats.length ? chats : [fallback]).map(chat => ({
+      resource: chat.chatUri,
+      title: chat.title,
+      ...(chat.origin && {
+        origin: { kind: ChatOriginKind.Fork, ...chat.origin },
+      }),
+    }));
+  }
+
+  /** The root list carries each session's chat catalog. */
+  private announceChats(binding: Binding): void {
+    this.server.notify("root/sessionSummaryChanged", {
+      channel: ROOT_CHANNEL,
+      session: binding.sessionUri,
+      changes: { chats: this.chatCatalog(binding.sessionUri, binding) },
+    });
+  }
+
   private chatState(binding: Binding): ChatState {
     return {
       resource: binding.chatUri,
@@ -549,7 +940,137 @@ export class AcpAgentHost implements Disposable {
       status: SessionStatus.Idle,
       modifiedAt: new Date().toISOString(),
       turns: [],
+      ...(binding.origin && {
+        origin: { kind: ChatOriginKind.Fork, ...binding.origin },
+      }),
     };
+  }
+
+  /** Branches a chat off at a completed turn: forks the ACP session at that
+   *  turn's last agent message, then loads the fork so its history replays
+   *  into the new chat like any listed session's. */
+  private async createChat(params: CreateChatParams): Promise<null> {
+    const { source } = params;
+    const parent = source && this.bindings.get(source.chat);
+    if (source?.kind !== ChatSourceKind.Fork || !parent?.sessionId) {
+      throw new AhpRequestError(
+        JsonRpcErrorCodes.InvalidParams,
+        "Only forks of an open chat are supported",
+      );
+    }
+    if (this.bindings.has(params.chat)) {
+      throw new AhpRequestError(
+        JsonRpcErrorCodes.InvalidParams,
+        `Chat ${params.chat} already exists`,
+      );
+    }
+    const messageId = parent.turnMessages.get(source.turnId);
+    if (!messageId) {
+      throw new AhpRequestError(
+        JsonRpcErrorCodes.InvalidParams,
+        `Turn ${source.turnId} has no agent message to fork at`,
+      );
+    }
+    await parent.ready;
+    const client = await this.connect(parent);
+    const forked = await client.forkSession(parent.sessionId, parent.cwd, {
+      additionalDirectories: parent.additionalDirectories,
+      atMessageId: messageId,
+    });
+    const binding: Binding = {
+      ...parent,
+      additionalDirectories: [...parent.additionalDirectories],
+      chatUri: params.chat,
+      primary: false,
+      origin: { chat: source.chat, turnId: source.turnId },
+      turnMessages: new Map(),
+      toolCalls: new Map(),
+      directoriesDirty: false,
+      listedStatus: undefined,
+      sessionId: undefined,
+      ready: undefined,
+      turnId: undefined,
+      markdownPartId: undefined,
+      reasoningPartId: undefined,
+      pendingUserText: undefined,
+      replaying: false,
+    };
+    this.bind(binding, forked.sessionId);
+    this.rememberDirectories(binding);
+    this.bindings.set(params.chat, binding);
+    this.server.create(params.chat, "chat", this.chatState(binding));
+    const loaded = this.ensureLoaded(binding);
+    // A fork made with an edited message: the message is the new chat's
+    // first turn, so it starts once the copied history has replayed.
+    const { initialMessage } = params;
+    void loaded.then(
+      () => {
+        if (initialMessage) {
+          const turnId = randomUUID();
+          this.server.dispatch(binding.chatUri, {
+            type: ActionType.ChatTurnStarted,
+            turnId,
+            startedAt: new Date().toISOString(),
+            message: initialMessage,
+          });
+          void this.runTurn(binding, turnId, initialMessage);
+        }
+      },
+      err => {
+        this.output.appendLine(`[createChat] ${describeError(err)}`);
+        if (initialMessage) {
+          // Show the failure in the chat the message was meant for.
+          const turnId = randomUUID();
+          this.beginTurn(binding, turnId);
+          this.server.dispatch(binding.chatUri, {
+            type: ActionType.ChatTurnStarted,
+            turnId,
+            startedAt: new Date().toISOString(),
+            message: initialMessage,
+          });
+          this.failTurn(binding, turnId, describeError(err));
+        }
+      },
+    );
+    this.server.dispatch(binding.sessionUri, {
+      type: ActionType.SessionChatAdded,
+      summary: {
+        resource: binding.chatUri,
+        title: binding.title,
+        status: SessionStatus.Idle,
+        modifiedAt: new Date().toISOString(),
+        origin: { kind: ChatOriginKind.Fork, ...binding.origin! },
+      },
+    });
+    this.announceChats(binding);
+    return null;
+  }
+
+  /** Stops tracking a chat on this host; its ACP session is left alone,
+   *  apart from stopping a turn that's still running. */
+  private releaseChat(chat: Binding): void {
+    if (chat.turnId && chat.sessionId) {
+      this.pool.get(chat.agent.name)?.cancelPrompt(chat.sessionId);
+    }
+    this.bindings.delete(chat.chatUri);
+    if (chat.sessionId) {
+      this.byAcpSession.delete(`${chat.agent.name}\0${chat.sessionId}`);
+    }
+    this.server.delete(chat.chatUri);
+  }
+
+  /** Forgets a forked chat on this host; its ACP session stays listed. */
+  private disposeChat(chatUri: string): null {
+    const binding = this.bindings.get(chatUri);
+    if (binding && !binding.primary) {
+      this.releaseChat(binding);
+      this.server.dispatch(binding.sessionUri, {
+        type: ActionType.SessionChatRemoved,
+        chat: chatUri,
+      });
+      this.announceChats(binding);
+    }
+    return null;
   }
 
   /** First subscribe to a listed session/chat: load the ACP session so its
@@ -591,6 +1112,7 @@ export class AcpAgentHost implements Disposable {
         const response = await client.loadSession(
           binding.sessionId!,
           binding.cwd,
+          binding.additionalDirectories,
         );
         if (response?.configOptions) {
           this.rememberOptions(binding, response.configOptions);
@@ -620,21 +1142,24 @@ export class AcpAgentHost implements Disposable {
         `Unknown provider ${params.provider}`,
       );
     }
-    const directory = params.workingDirectories?.[0];
-    const cwd = directory?.startsWith("file:")
-      ? fileURLToPath(directory)
-      : this.defaultCwd();
+    const [cwd = this.defaultCwd(), ...additional] = (
+      params.workingDirectories ?? []
+    )
+      .filter(uri => uri.startsWith("file:"))
+      .map(uri => fileURLToPath(uri));
     const binding = this.register(
       agent,
       params.channel,
       `ahp-chat:/${randomUUID()}`,
       cwd,
+      takesExtraDirectories(agent) ? additional : [],
     );
     this.server.create(binding.chatUri, "chat", this.chatState(binding));
     const ready = this.connect(binding)
-      .then(client => client.newSession(cwd))
+      .then(client => client.newSession(cwd, binding.additionalDirectories))
       .then(response => {
         this.bind(binding, response.sessionId);
+        this.rememberDirectories(binding);
         if (response.configOptions) {
           this.rememberOptions(binding, response.configOptions);
         }
@@ -679,16 +1204,11 @@ export class AcpAgentHost implements Disposable {
   /** Forgets the session on this host only — the agent keeps its transcript,
    *  so it shows up again on the next listing. */
   private disposeSession(sessionUri: string): null {
-    const binding = this.bindings.get(sessionUri);
-    if (binding) {
-      this.bindings.delete(binding.sessionUri);
-      this.bindings.delete(binding.chatUri);
-      if (binding.sessionId) {
-        this.byAcpSession.delete(`${binding.agent.name}\0${binding.sessionId}`);
-      }
-      this.server.delete(binding.sessionUri);
-      this.server.delete(binding.chatUri);
+    for (const chat of this.chatsOf(sessionUri)) {
+      this.releaseChat(chat);
     }
+    this.bindings.delete(sessionUri);
+    this.server.delete(sessionUri);
     this.server.notify("root/sessionRemoved", {
       channel: ROOT_CHANNEL,
       session: sessionUri,
@@ -698,21 +1218,25 @@ export class AcpAgentHost implements Disposable {
 
   private setTitle(binding: Binding, title: string): void {
     binding.title = title;
-    this.server.dispatch(binding.sessionUri, {
-      type: ActionType.SessionTitleChanged,
-      title,
-    });
+    if (binding.primary) {
+      this.server.dispatch(binding.sessionUri, {
+        type: ActionType.SessionTitleChanged,
+        title,
+      });
+    }
     // VS Code's session list shows the *chat* title, not the session's.
     this.server.dispatch(binding.sessionUri, {
       type: ActionType.SessionChatUpdated,
       chat: binding.chatUri,
       changes: { title },
     });
-    this.server.notify("root/sessionSummaryChanged", {
-      channel: ROOT_CHANNEL,
-      session: binding.sessionUri,
-      changes: { title },
-    });
+    if (binding.primary) {
+      this.server.notify("root/sessionSummaryChanged", {
+        channel: ROOT_CHANNEL,
+        session: binding.sessionUri,
+        changes: { title },
+      });
+    }
   }
 
   // --- input completions -----------------------------------------------------
@@ -750,6 +1274,26 @@ export class AcpAgentHost implements Disposable {
     if (channel === binding.sessionUri) {
       if (action.type === ActionType.SessionConfigChanged) {
         void this.applyConfig(binding, action.config);
+      } else if (action.type === ActionType.SessionTitleChanged) {
+        binding.title = action.title;
+        this.server.dispatch(binding.sessionUri, {
+          type: ActionType.SessionChatUpdated,
+          chat: binding.chatUri,
+          changes: { title: action.title },
+        });
+        void this.withIndex(binding, client =>
+          client.renameSession(binding.sessionId!, action.title),
+        );
+      } else if (action.type === ActionType.SessionIsArchivedChanged) {
+        void this.withIndex(binding, client =>
+          client.archiveSession(binding.sessionId!, action.isArchived),
+        );
+      } else if (
+        action.type === ActionType.SessionWorkingDirectorySet ||
+        action.type === ActionType.SessionWorkingDirectoryRemoved ||
+        action.type === ActionType.SessionWorkingDirectoryReplaced
+      ) {
+        this.syncDirectories(binding.sessionUri);
       }
       return;
     }
@@ -761,7 +1305,7 @@ export class AcpAgentHost implements Disposable {
         if (binding.sessionId) {
           this.pool.get(binding.agent.name)?.cancelPrompt(binding.sessionId);
         }
-        binding.turnId = undefined;
+        this.clearTurn(binding);
         return;
       case ActionType.ChatToolCallConfirmed: {
         const tracking = binding.toolCalls.get(action.toolCallId);
@@ -836,7 +1380,17 @@ export class AcpAgentHost implements Disposable {
       turnId,
       duration: Date.now() - binding.turnStartedAt,
     });
+    this.clearTurn(binding);
+  }
+
+  /** A turn is over, however it ended: a directory change that arrived
+   *  during it can be applied now. */
+  private clearTurn(binding: Binding): void {
     binding.turnId = undefined;
+    if (binding.directoriesDirty) {
+      binding.directoriesDirty = false;
+      void this.applyDirectories(binding);
+    }
   }
 
   private failTurn(binding: Binding, turnId: string, message: string): void {
@@ -850,7 +1404,7 @@ export class AcpAgentHost implements Disposable {
       },
     });
     if (binding.turnId === turnId) {
-      binding.turnId = undefined;
+      this.clearTurn(binding);
     }
   }
 
@@ -901,10 +1455,12 @@ export class AcpAgentHost implements Disposable {
     }
     if (update.sessionUpdate === "config_option_update") {
       this.rememberOptions(binding, update.configOptions);
-      this.server.dispatch(binding.sessionUri, {
-        type: ActionType.SessionConfigChanged,
-        config: configValues(update.configOptions, binding.agent.kind),
-      });
+      if (binding.primary) {
+        this.server.dispatch(binding.sessionUri, {
+          type: ActionType.SessionConfigChanged,
+          config: configValues(update.configOptions, binding.agent.kind),
+        });
+      }
       return;
     }
     if (update.sessionUpdate === "session_info_update") {
@@ -929,6 +1485,12 @@ export class AcpAgentHost implements Disposable {
     switch (update.sessionUpdate) {
       case "agent_message_chunk":
       case "agent_thought_chunk":
+        if (
+          update.sessionUpdate === "agent_message_chunk" &&
+          update.messageId
+        ) {
+          binding.turnMessages.set(turnId, update.messageId);
+        }
         if (update.content.type === "text") {
           this.appendText(
             binding,

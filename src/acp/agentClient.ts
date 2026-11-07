@@ -75,6 +75,13 @@ export type ConnectionState = {
   state: "connecting" | "connected" | "error";
   error?: string;
 };
+/** `_session/list/changes`: rows that changed, and ids that are gone. */
+export interface SessionListChanges {
+  subscriptionId: string;
+  sessions: SessionInfo[];
+  removed: string[];
+}
+
 export type SessionUpdateEvent = {
   sessionId: SessionId;
   update: SessionUpdate;
@@ -139,6 +146,9 @@ export class AgentClient implements Disposable {
   // `resource_link` are baseline (every agent MUST accept them per the ACP
   // spec), everything else needs this check before it's safe to send.
   private promptCapabilities: PromptCapabilities = {};
+  /** `_meta.jetbrains.air.capabilities` the bridge advertised back, e.g.
+   *  `sessionIndex` once we've declared it (claude-agent-acp only). */
+  private airCapabilities = new Set<string>();
 
   private readonly connectionStateEmitter = new Emitter<ConnectionState>();
   private readonly sessionUpdateEmitter = new Emitter<SessionUpdateEvent>();
@@ -151,6 +161,10 @@ export class AgentClient implements Disposable {
 
   readonly onConnectionStateChanged = this.connectionStateEmitter.event;
   readonly onSessionUpdate = this.sessionUpdateEmitter.event;
+  private readonly sessionListChangesEmitter =
+    new Emitter<SessionListChanges>();
+  /** Pushed rows of the lists subscribed with `subscribeSessionList`. */
+  readonly onSessionListChanges = this.sessionListChangesEmitter.event;
   readonly onPermissionRequest = this.permissionRequestEmitter.event;
   readonly onPermissionResolved = this.permissionResolvedEmitter.event;
   // Fired instead of (just before) the normal echo when `prompt()` recognizes
@@ -233,6 +247,11 @@ export class AgentClient implements Disposable {
           });
         });
       })
+      .onNotification(
+        "_session/list/changes",
+        { parse: params => params as SessionListChanges },
+        ctx => this.sessionListChangesEmitter.fire(ctx.params),
+      )
       .onNotification(methods.client.session.update, ctx => {
         const update = ctx.params.update;
         this.sessionUpdateEmitter.fire({
@@ -262,7 +281,13 @@ export class AgentClient implements Disposable {
         clientCapabilities: {
           _meta: {
             jetbrains: {
-              air: { version: 1, capabilities: ["sessionFailure"] },
+              air: {
+                version: 1,
+                // sessionIndex: session/list rows carry `_meta.jetbrains.air`
+                // (forkedFrom, lastPromptAt, model, state, archived) and
+                // the bridge offers rename/archive/list-change methods.
+                capabilities: ["sessionFailure", "sessionIndex"],
+              },
             },
           },
         },
@@ -283,6 +308,11 @@ export class AgentClient implements Disposable {
         (steeringMeta as { supported?: unknown }).supported === true;
       this.promptCapabilities =
         response.agentCapabilities?.promptCapabilities ?? {};
+      const air = (
+        response._meta?.jetbrains as
+          { air?: { capabilities?: string[] } } | undefined
+      )?.air;
+      this.airCapabilities = new Set(air?.capabilities);
       this.connectionStateEmitter.fire({ state: "connected" });
     } catch (err) {
       this.connectionStateEmitter.fire({ state: "error", error: String(err) });
@@ -303,6 +333,31 @@ export class AgentClient implements Disposable {
     } finally {
       client.disconnectChild();
     }
+  }
+
+  /** Whether session/list rows carry the index metadata, and the
+   *  `_session/*` methods below exist. */
+  canIndexSessions(): boolean {
+    return this.airCapabilities.has("sessionIndex");
+  }
+
+  async renameSession(sessionId: SessionId, title: string): Promise<void> {
+    await this.requireAgent().request("_session/rename", { sessionId, title });
+  }
+
+  async archiveSession(sessionId: SessionId, archived: boolean): Promise<void> {
+    await this.requireAgent().request(
+      archived ? "_session/archive" : "_session/unarchive",
+      { sessionId },
+    );
+  }
+
+  /** Starts pushing `onSessionListChanges` for the sessions of `cwd`. */
+  async subscribeSessionList(cwd: string): Promise<string> {
+    const response = await this.requireAgent().request<{
+      subscriptionId: string;
+    }>("_session/list/subscribe", { cwd });
+    return response.subscriptionId;
   }
 
   canSteer(): boolean {
@@ -326,22 +381,70 @@ export class AgentClient implements Disposable {
 
   /** `cwd` filters to that project directory (and its git worktrees); omit
    *  it to list sessions across every project the agent knows about. */
-  async listSessions(cwd?: string): Promise<SessionInfo[]> {
-    const response = await this.requireAgent().request(
-      methods.agent.session.list,
-      cwd ? { cwd } : {},
-    );
-    return response.sessions;
+  async listSessions(
+    cwd?: string,
+    includeArchived = false,
+  ): Promise<SessionInfo[]> {
+    // The bridge pages its list (at most 200 rows a page with its session
+    // index, see `sessionIndex` below).
+    const sessions: SessionInfo[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      seen.add(cursor ?? "");
+      const response = await this.requireAgent().request(
+        methods.agent.session.list,
+        {
+          ...(cwd ? { cwd } : {}),
+          ...(cursor ? { cursor } : {}),
+          // Archived rows come too when asked (flagged in `_meta`); the index
+          // lists 50 rows a page unless told otherwise.
+          _meta: {
+            jetbrains: {
+              air: {
+                list: {
+                  limit: 200,
+                  ...(includeArchived && { archived: "all" }),
+                },
+              },
+            },
+          },
+        },
+      );
+      sessions.push(...response.sessions);
+      cursor = response.nextCursor ?? undefined;
+    } while (cursor && !seen.has(cursor)); // a repeated cursor would loop
+    return sessions;
   }
 
-  async newSession(cwd?: string): Promise<NewSessionResponse> {
+  async newSession(
+    cwd?: string,
+    additionalDirectories?: string[],
+  ): Promise<NewSessionResponse> {
     return this.requireAgent().request<NewSessionResponse>(
       methods.agent.session.new,
       {
         cwd: cwd ?? this.cwd,
         mcpServers: [],
+        ...(additionalDirectories?.length && { additionalDirectories }),
       },
     );
+  }
+
+  /** Re-applies a live session's directory set: the bridge rebuilds the
+   *  session (keeping its history and permission mode) when it differs from
+   *  the one it runs with, which is how `/add-dir` takes effect. */
+  async resumeSession(
+    sessionId: SessionId,
+    cwd: string,
+    additionalDirectories: string[],
+  ): Promise<void> {
+    await this.requireAgent().request(methods.agent.session.resume, {
+      sessionId,
+      cwd,
+      mcpServers: [],
+      additionalDirectories,
+    });
   }
 
   /** Only available if the agent advertises the `sessionCapabilities.delete`
@@ -364,6 +467,7 @@ export class AgentClient implements Disposable {
   async loadSession(
     sessionId: SessionId,
     cwd?: string,
+    additionalDirectories?: string[],
   ): Promise<LoadSessionResponse | void> {
     return this.requireAgent().request<LoadSessionResponse | void>(
       methods.agent.session.load,
@@ -371,6 +475,7 @@ export class AgentClient implements Disposable {
         sessionId,
         cwd: cwd ?? this.cwd,
         mcpServers: [],
+        ...(additionalDirectories?.length && { additionalDirectories }),
       },
     );
   }
@@ -383,13 +488,25 @@ export class AgentClient implements Disposable {
   async forkSession(
     sessionId: SessionId,
     cwd?: string,
+    options: { additionalDirectories?: string[]; atMessageId?: string } = {},
   ): Promise<ForkSessionResponse> {
+    const { additionalDirectories, atMessageId } = options;
     return this.requireAgent().request<ForkSessionResponse>(
       methods.agent.session.fork,
       {
         sessionId,
         cwd: cwd ?? this.cwd,
         mcpServers: [],
+        ...(additionalDirectories?.length && { additionalDirectories }),
+        // claude-agent-acp's fork point (its AIR extension): copy the history
+        // up to this message instead of all of it.
+        ...(atMessageId && {
+          _meta: {
+            jetbrains: {
+              air: { fork: { version: 1, messageId: atMessageId } },
+            },
+          },
+        }),
       },
     );
   }

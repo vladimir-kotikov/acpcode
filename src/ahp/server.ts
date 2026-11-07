@@ -55,6 +55,12 @@ export interface AhpServerHooks {
   readonly materialize: (channel: string) => Promise<void>;
   /** Called after a client-dispatched action has been applied. */
   readonly onClientAction: (channel: string, action: StateAction) => void;
+  /** Called before a client-dispatched action is applied; a returned reason
+   *  rejects it (broadcast with `rejectionReason`, state untouched). */
+  readonly rejectClientAction?: (
+    channel: string,
+    action: StateAction,
+  ) => string | undefined;
   /** Characters that make the client ask for `completions` while typing. */
   readonly completionTriggerCharacters?: string[];
 }
@@ -128,6 +134,10 @@ export class AhpServer implements Disposable {
 
   get connectionCount(): number {
     return this.connections.size;
+  }
+
+  stateOf(channel: string): ChannelState | undefined {
+    return this.states.get(channel);
   }
 
   has(channel: string): boolean {
@@ -317,6 +327,14 @@ export class AhpServer implements Disposable {
         origin,
         `${params.action.type} is not client-dispatchable`,
       );
+      return;
+    }
+    const rejection = this.hooks.rejectClientAction?.(
+      params.channel,
+      params.action,
+    );
+    if (rejection) {
+      this.apply(params.channel, params.action, origin, rejection);
       return;
     }
     this.apply(params.channel, params.action, origin);
