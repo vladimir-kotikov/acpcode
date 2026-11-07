@@ -30,8 +30,7 @@ import { fileURLToPath } from "node:url";
 import { Emitter, type Disposable, type Output } from "../shared/events.ts";
 import type { Attachment } from "../shared/sessionViewProtocol.ts";
 import type { AgentConfig } from "./agents/config.ts";
-import { agentEnv } from "./agents/config.ts";
-import { bridgeEntryPoint, withAgentCli } from "./bridges.ts";
+import { agentProcessEnv, bridgeEntryPoint } from "./bridges.ts";
 
 /** Pulls the AIR extension's session-failure title out of a response's
  *  `_meta`, but only when `severity` is "error" — see `prompt()`'s doc
@@ -188,11 +187,7 @@ export class AgentClient implements Disposable {
 
     let env: NodeJS.ProcessEnv;
     try {
-      env = withAgentCli(agent.kind, {
-        ...process.env,
-        ...agentEnv(agent),
-        ELECTRON_RUN_AS_NODE: "1",
-      });
+      env = { ...agentProcessEnv(agent), ELECTRON_RUN_AS_NODE: "1" };
       entryPoint ??= await bridgeEntryPoint(agent.kind);
     } catch (err) {
       this.connectionStateEmitter.fire({ state: "error", error: String(err) });

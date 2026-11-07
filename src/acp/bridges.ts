@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import type { AgentConfig } from "./agents/config.ts";
+import { type AgentConfig, agentEnv } from "./agents/config.ts";
 
 type Kind = AgentConfig["kind"];
 
@@ -104,6 +104,13 @@ export function withAgentCli(
     );
   }
   return withDirOnPath({ ...env, [cliEnv]: found }, found);
+}
+
+/** The env an agent's processes run with — its bridge, and the CLI when run
+ *  directly: ours, overlaid with the agent's configured env, with its CLI
+ *  found. */
+export function agentProcessEnv(agent: AgentConfig): NodeJS.ProcessEnv {
+  return withAgentCli(agent.kind, { ...process.env, ...agentEnv(agent) });
 }
 
 let bridgesDir: string | undefined;
