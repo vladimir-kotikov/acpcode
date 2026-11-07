@@ -165,9 +165,9 @@ const bridgesDir = (context: vscode.ExtensionContext): string =>
 /** Stable and Insiders keep separate host state (and tokens), so each needs
  *  its own default port or the second one to start finds the first's taken. */
 const agentHostPort = (): number =>
-  vscode.workspace
-    .getConfiguration("acpcode.agentHost")
-    .get<number>("port", vscode.env.appName.includes("Insiders") ? 8766 : 8765);
+  // An unset number setting with no schema default reads as 0, not undefined.
+  vscode.workspace.getConfiguration("acpcode.agentHost").get<number>("port") ||
+  (vscode.env.appName.includes("Insiders") ? 8766 : 8765);
 
 /** Changes with every install, so a reinstall or update restarts the host:
  *  the version alone doesn't change on dev reinstalls. */
