@@ -934,15 +934,14 @@ export class AcpAgentHost implements Disposable {
         this.bindings.get(
           `ahp-session:/${providerId(agent)}/${encodeURIComponent(info.sessionId)}`,
         );
+      const previousTitle = known?.title;
       const { binding, summary } = this.bindRow(agent, info);
       if (known) {
-        // The row can't say what chats the session has: `chats` would
-        // replace the whole catalog.
         const {
           resource: _,
           provider: __,
           createdAt: ___,
-          chats: ____,
+          chats,
           defaultChat: _____,
           workingDirectories: ______, // Chat's own state is the authority
           ...changed
@@ -951,7 +950,10 @@ export class AcpAgentHost implements Disposable {
         this.server.notify("root/sessionSummaryChanged", {
           channel: ROOT_CHANNEL,
           session: binding.sessionUri,
-          changes: changed,
+          // Chat's list labels a session with its default chat's title. The
+          // catalog is the host's own, so it's only resent when that changes.
+          changes:
+            binding.title === previousTitle ? changed : { ...changed, chats },
         });
       } else {
         this.server.notify("root/sessionAdded", {
@@ -1441,19 +1443,21 @@ export class AcpAgentHost implements Disposable {
         title,
       });
     }
-    // VS Code's session list shows the *chat* title, not the session's.
+    // VS Code's session list shows the *chat* title, not the session's, and
+    // reads it from the root list's chat catalog.
     this.server.dispatch(binding.sessionUri, {
       type: ActionType.SessionChatUpdated,
       chat: binding.chatUri,
       changes: { title },
     });
-    if (binding.primary) {
-      this.server.notify("root/sessionSummaryChanged", {
-        channel: ROOT_CHANNEL,
-        session: binding.sessionUri,
-        changes: { title },
-      });
-    }
+    this.server.notify("root/sessionSummaryChanged", {
+      channel: ROOT_CHANNEL,
+      session: binding.sessionUri,
+      changes: {
+        ...(binding.primary && { title }),
+        chats: this.chatCatalog(binding.sessionUri, binding),
+      },
+    });
   }
 
   // --- input completions -----------------------------------------------------

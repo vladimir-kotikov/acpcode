@@ -161,6 +161,7 @@ function setup(
     notified,
     listChanged,
     clientAction,
+    replay,
   };
 }
 
@@ -179,17 +180,28 @@ test("list changes add, update and remove session rows", () => {
 
   listChanged({ sessions: [row("s1", "First")] });
   listChanged({ sessions: [row("s1", "Renamed")] });
+  listChanged({ sessions: [row("s1", "Renamed")] });
   listChanged({ removed: ["s1"] });
 
   assert.deepEqual(
     notified.map(n => n.method),
-    ["root/sessionAdded", "root/sessionSummaryChanged", "root/sessionRemoved"],
+    [
+      "root/sessionAdded",
+      "root/sessionSummaryChanged",
+      "root/sessionSummaryChanged",
+      "root/sessionRemoved",
+    ],
   );
   const changes = notified[1].params.changes as Record<string, unknown>;
   assert.equal(changes.title, "Renamed");
-  // A row can't say what chats the session has, and Chat owns its directories.
-  assert.equal("chats" in changes, false);
+  // Chat labels the row with its default chat's title.
+  assert.deepEqual(
+    (changes.chats as SessionChatSummary[]).map(c => c.title),
+    ["Renamed"],
+  );
+  // Chat owns the session's directories; an unchanged title resends no chats.
   assert.equal("workingDirectories" in changes, false);
+  assert.equal("chats" in (notified[2].params.changes as object), false);
   // The removed session's extra directories are forgotten on disk too.
   assert.deepEqual(saved.at(-1), {});
 });
@@ -489,6 +501,51 @@ test("a listed fork that stops running is listed as idle", async () => {
     c => c.resource === "ahp-chat:/acp-claude/f1",
   );
   assert.equal(fork?.status, SessionStatus.Idle);
+});
+
+const lastSummaryChange = (
+  notified: { method: string; params: Record<string, unknown> }[],
+) =>
+  notified.findLast(n => n.method === "root/sessionSummaryChanged")!.params
+    .changes as { title?: string; chats: SessionChatSummary[] };
+
+test("a title the agent announces relabels the session's row", async () => {
+  const { hooks, notified, listChanged, replay } = setup();
+  listChanged({ sessions: [row("s1", "the whole first prompt")] });
+  await hooks.materialize(CHAT);
+
+  replay("s1", { sessionUpdate: "session_info_update", title: "Short title" });
+
+  const changes = lastSummaryChange(notified);
+  assert.equal(changes.title, "Short title");
+  assert.deepEqual(
+    changes.chats.map(c => [c.resource, c.title]),
+    [[CHAT, "Short title"]],
+  );
+});
+
+test("a title the agent announces for a fork relabels only its chat", async () => {
+  const { host, hooks, notified, listChanged, replay } = setup();
+  listChanged({ sessions: [row("s1", "Root")] });
+  await hooks.materialize(CHAT);
+  const [turn] = (host.server.stateOf(CHAT) as ChatState).turns;
+  await (hooks.handlers.createChat as (p: unknown) => Promise<null>)({
+    channel: SESSION,
+    chat: "ahp-chat:/fork",
+    source: { kind: ChatSourceKind.Fork, chat: CHAT, turnId: turn.id },
+  });
+
+  replay("fork-1", { sessionUpdate: "session_info_update", title: "Fork" });
+
+  const changes = lastSummaryChange(notified);
+  assert.equal("title" in changes, false);
+  assert.deepEqual(
+    changes.chats.map(c => [c.resource, c.title]),
+    [
+      [CHAT, "Root"],
+      ["ahp-chat:/fork", "Fork"],
+    ],
+  );
 });
 
 test("a session listed as running doesn't keep its chat running", async () => {
