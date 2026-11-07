@@ -59,8 +59,11 @@ process.on("unhandledRejection", err =>
 
 let agentsJson = "";
 let agents: AgentConfig[] = [];
+let filterByWorkspace = false;
 const loadAgents = (): boolean => {
-  const next = JSON.stringify(readJson<HostConfig>(files.config)?.agents ?? []);
+  const config = readJson<HostConfig>(files.config);
+  filterByWorkspace = config?.filterSessionsByWorkspace ?? false;
+  const next = JSON.stringify(config?.agents ?? []);
   const changed = next !== agentsJson;
   agentsJson = next;
   agents = JSON.parse(next) as AgentConfig[];
@@ -88,6 +91,7 @@ const pool = new AgentConnectionPool(name => output(`[${name}] `));
 const host = new AcpAgentHost(pool, log, {
   agents: () => agents,
   folders,
+  filterByWorkspace: () => filterByWorkspace,
   configCache: {
     load: () => readJson(files.configOptions) ?? {},
     save: cache => fs.writeFileSync(files.configOptions, JSON.stringify(cache)),

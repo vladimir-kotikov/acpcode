@@ -191,7 +191,12 @@ function startAgentHost(context: vscode.ExtensionContext): void {
   const files = hostFiles(agentHostDir(context));
   fs.mkdirSync(files.windows, { recursive: true });
   const writeConfig = () => {
-    const config: HostConfig = { agents: getAgents() };
+    const config: HostConfig = {
+      agents: getAgents(),
+      filterSessionsByWorkspace: vscode.workspace
+        .getConfiguration("acpcode.agentHost")
+        .get<boolean>("filterSessionsByWorkspace", false),
+    };
     fs.writeFileSync(files.config, JSON.stringify(config));
   };
   const windowFile = path.join(files.windows, `${process.pid}.json`);
@@ -205,7 +210,10 @@ function startAgentHost(context: vscode.ExtensionContext): void {
   writeWindow();
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(e => {
-      if (e.affectsConfiguration("acpcode.agents")) {
+      if (
+        e.affectsConfiguration("acpcode.agents") ||
+        e.affectsConfiguration("acpcode.agentHost.filterSessionsByWorkspace")
+      ) {
         writeConfig();
       }
     }),

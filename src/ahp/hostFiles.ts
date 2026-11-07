@@ -14,6 +14,8 @@ export interface HostInfo {
 /** Written by the extension (every window writes the same thing). */
 export interface HostConfig {
   agents: AgentConfig[];
+  /** List only the sessions of the open windows' folders, not every project's. */
+  filterSessionsByWorkspace?: boolean;
 }
 
 /** One per window, named after its extension host's pid. */

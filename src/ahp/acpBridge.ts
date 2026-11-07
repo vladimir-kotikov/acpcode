@@ -171,6 +171,8 @@ export interface AgentHostEnvironment {
   agents(): AgentConfig[];
   /** Folders whose sessions to list; the first one is the default cwd. */
   folders(): string[];
+  /** Whether to list only the sessions of `folders()`, not every project's. */
+  filterByWorkspace(): boolean;
   /** Last-seen ACP config options per agent name, persisted so model lists
    *  and config pickers are there before any of its sessions is opened. */
   configCache: {
@@ -455,7 +457,7 @@ export class AcpAgentHost implements Disposable {
   }
 
   private async listAgents(agents: AgentConfig[]): Promise<SessionSummary[]> {
-    const folders = this.env.folders();
+    const folders = this.env.filterByWorkspace() ? this.env.folders() : [];
     const perAgent = await Promise.all(
       agents.map(async agent => {
         try {
