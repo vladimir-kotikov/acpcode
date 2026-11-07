@@ -208,6 +208,7 @@ function startAgentHost(context: vscode.ExtensionContext): void {
   };
   writeConfig();
   writeWindow();
+  warnIfChatPointsElsewhere(context);
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(e => {
       if (
@@ -215,6 +216,9 @@ function startAgentHost(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("acpcode.agentHost.filterSessionsByWorkspace")
       ) {
         writeConfig();
+      }
+      if (e.affectsConfiguration("chat.workspaceRemoteAgentHosts")) {
+        warnIfChatPointsElsewhere(context);
       }
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(writeWindow),
@@ -233,6 +237,29 @@ function startAgentHost(context: vscode.ExtensionContext): void {
   // ponytail: an update restarts the host even mid-turn; wait for it to go
   // idle first if that bites.
   void restartAgentHost(context);
+}
+
+/** Chat's failed connections never reach the extension, so a stale entry
+ *  (old port, another profile's token, a workspace-level override) would
+ *  otherwise just make the agents silently vanish from the picker. */
+function warnIfChatPointsElsewhere(context: vscode.ExtensionContext): void {
+  const entry = vscode.workspace
+    .getConfiguration("chat")
+    .get<{ name: string; address: string; connectionToken?: string }[]>(
+      "workspaceRemoteAgentHosts",
+      [],
+    )
+    .find(h => h.name === AGENT_HOST_NAME);
+  if (
+    !entry ||
+    (entry.address === `127.0.0.1:${agentHostPort()}` &&
+      entry.connectionToken === agentHostToken(context))
+  ) {
+    return;
+  }
+  void vscode.window.showWarningMessage(
+    `Chat's "${AGENT_HOST_NAME}" agent host entry (chat.workspaceRemoteAgentHosts) doesn't match the running host (127.0.0.1:${agentHostPort()}), so Chat can't connect to it. Check workspace settings for an override, or run "ACP Code: Connect VS Code Chat to ACP Agents".`,
+  );
 }
 
 function restartAgentHost(context: vscode.ExtensionContext): Promise<void> {
