@@ -1382,13 +1382,27 @@ export class AcpAgentHost implements Disposable {
     if (!chat.sessionId) {
       return;
     }
+    // The job first: one that stops writes to its transcript, which would
+    // bring it back.
+    await this.removeJob(chat);
     try {
       const client = await this.connect(chat);
       await client.deleteSession(chat.sessionId);
     } catch (err) {
       this.output.appendLine(`[delete] ${describeError(err)}`);
     }
-    await this.removeJob(chat);
+  }
+
+  /** Archives or unarchives a chat's ACP session; archiving removes its
+   *  `claude agents` job first. A job that stops writes its own title last,
+   *  which would unarchive the session. */
+  private async archive(binding: Binding, archived: boolean): Promise<void> {
+    if (archived) {
+      await this.removeJob(binding);
+    }
+    await this.withIndex(binding, client =>
+      client.archiveSession(binding.sessionId!, archived),
+    );
   }
 
   /** Removes the session's `claude agents` job, as ctrl+x there does; its
@@ -1506,12 +1520,7 @@ export class AcpAgentHost implements Disposable {
           client.renameSession(binding.sessionId!, action.title),
         );
       } else if (action.type === ActionType.SessionIsArchivedChanged) {
-        void this.withIndex(binding, client =>
-          client.archiveSession(binding.sessionId!, action.isArchived),
-        );
-        if (action.isArchived) {
-          void this.removeJob(binding);
-        }
+        void this.archive(binding, action.isArchived);
       } else if (
         action.type === ActionType.SessionWorkingDirectorySet ||
         action.type === ActionType.SessionWorkingDirectoryRemoved ||
@@ -1535,12 +1544,7 @@ export class AcpAgentHost implements Disposable {
             ? status | SessionStatus.IsArchived
             : status & ~SessionStatus.IsArchived,
         );
-        void this.withIndex(binding, client =>
-          client.archiveSession(binding.sessionId!, action.isArchived),
-        );
-        if (action.isArchived) {
-          void this.removeJob(binding);
-        }
+        void this.archive(binding, action.isArchived);
         return;
       }
       case ActionType.ChatTurnCancelled:

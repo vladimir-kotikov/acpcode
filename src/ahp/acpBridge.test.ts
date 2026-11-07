@@ -298,7 +298,8 @@ test("archiving a fork archives its ACP session and its catalog entry", async ()
     type: ActionType.ChatIsArchivedChanged,
     isArchived: true,
   });
-  await settle();
+  // After looking for its `claude agents` job.
+  await waitFor(() => calls.some(c => c.method === "archiveSession"));
 
   assert.deepEqual(
     calls.filter(c => c.method === "archiveSession").map(c => c.args),
@@ -421,7 +422,7 @@ test("archiving the primary chat archives the session's ACP session", async () =
     type: ActionType.ChatIsArchivedChanged,
     isArchived: true,
   });
-  await settle();
+  await waitFor(() => calls.some(c => c.method === "archiveSession"));
 
   assert.deepEqual(
     calls.filter(c => c.method === "archiveSession").map(c => c.args),
@@ -705,8 +706,7 @@ test("deleting a session removes its job even if its transcript can't be", async
   const { claude, hooks, logged } = await withJob(ctx, { deleteFails: true });
 
   (hooks.handlers.disposeSession as (p: unknown) => null)({ channel: SESSION });
-  await waitFor(() => claude.calls().includes("rm abc12345"));
+  await waitFor(() => logged.some(line => line.startsWith("[delete]")));
 
   assert.deepEqual(claude.calls(), ["stop abc12345", "rm abc12345"]);
-  assert.ok(logged.some(line => line.startsWith("[delete]")));
 });
