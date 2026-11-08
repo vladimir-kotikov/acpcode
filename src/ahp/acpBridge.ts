@@ -132,10 +132,8 @@ interface Binding {
   commands?: AvailableCommand[];
 }
 
-/** claude-agent-acp advertises `sessionCapabilities.additionalDirectories`;
- *  codex-acp doesn't. */
 const takesExtraDirectories = (agent: AgentConfig): boolean =>
-  agent.kind === "claude";
+  agent.kind === "claude" || agent.kind === "codex";
 
 /** The bridge's session index (`sessionIndex`) reports each row's activity
  *  and archive state in `_meta.jetbrains.air`. Without it, rows are idle. */

@@ -37,14 +37,21 @@ function setup(
     indexed = true,
     claudeEnv,
     deleteFails = false,
+    agentKind = "claude",
   }: {
     indexed?: boolean;
     /** The agent's env: a fake `claude` and its config dir. */
     claudeEnv?: Record<string, string>;
     deleteFails?: boolean;
+    agentKind?: AgentConfig["kind"];
   } = {},
 ) {
-  const theAgent = claudeEnv ? { ...agent, env: claudeEnv } : agent;
+  const theAgent = {
+    ...agent,
+    name: agentKind === "codex" ? "Codex" : agent.name,
+    kind: agentKind,
+    ...(claudeEnv && { env: claudeEnv }),
+  };
   const calls: { method: string; args: unknown[] }[] = [];
   const logged: string[] = [];
   /** What the agent's session list returns. */
@@ -253,6 +260,28 @@ test("an added directory resumes the idle session with the new set", async () =>
     [["s1", "/w", ["/more"]]],
   );
   assert.deepEqual(saved.at(-1), { "Claude\0s1": ["/more"] });
+});
+
+test("Codex resumes the idle session when an extra directory is added", async () => {
+  const { hooks, calls, saved, listChanged, clientAction } = setup(
+    {},
+    { agentKind: "codex" },
+  );
+  const session = "ahp-session:/acp-codex/s1";
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(session);
+
+  clientAction(session, {
+    type: ActionType.SessionWorkingDirectorySet,
+    directory: "file:///more",
+  });
+  await settle();
+
+  assert.deepEqual(
+    calls.filter(c => c.method === "resumeSession").map(c => c.args),
+    [["s1", "/w", ["/more"]]],
+  );
+  assert.deepEqual(saved.at(-1), { "Codex\0s1": ["/more"] });
 });
 
 test("a fork branches at its turn's last agent message and isn't listed", async () => {
