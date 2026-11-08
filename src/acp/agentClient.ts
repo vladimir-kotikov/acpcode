@@ -95,6 +95,12 @@ export type TranscriptResetEvent = {
   sessionId: SessionId;
 };
 
+export type SteeringResponse =
+  | { outcome: "injected" }
+  | { outcome: "startedNewTurn" }
+  | { outcome: "promptRequired"; reason: "noRunningTurn" }
+  | { outcome: "failed" };
+
 /** `RequestError`'s `message` is often just the generic JSON-RPC category
  *  (e.g. "Internal error") — the agent-specific detail, when present, is in
  *  `.data`, which `String(err)` drops entirely. An *uncaught* exception in the
@@ -139,14 +145,14 @@ export class AgentClient implements Disposable {
   // Advertised via InitializeResponse._meta.steering.supported (the agreed
   // ACP steering wire protocol, "_session/steering" — not yet a built-in
   // method in the SDK's schema, called through the generic request() escape
-  // hatch). Not every agent kind implements it (e.g. codex-acp doesn't).
+  // hatch).
   private steeringSupported = false;
   // From InitializeResponse.agentCapabilities.promptCapabilities — `text` and
   // `resource_link` are baseline (every agent MUST accept them per the ACP
   // spec), everything else needs this check before it's safe to send.
   private promptCapabilities: PromptCapabilities = {};
   /** `_meta.jetbrains.air.capabilities` the bridge advertised back, e.g.
-   *  `sessionIndex` once we've declared it (claude-agent-acp only). */
+   *  `sessionIndex` once we've declared it. */
   private airCapabilities = new Set<string>();
 
   private readonly connectionStateEmitter = new Emitter<ConnectionState>();
@@ -442,8 +448,6 @@ export class AgentClient implements Disposable {
     });
   }
 
-  /** Only available if the agent advertises the `sessionCapabilities.delete`
-   *  capability (claude-agent-acp always does; codex-acp may not). */
   async deleteSession(sessionId: SessionId): Promise<void> {
     await this.requireAgent().request(methods.agent.session.delete, {
       sessionId,
@@ -623,13 +627,23 @@ export class AgentClient implements Disposable {
     sessionId: SessionId,
     text: string,
     attachments: Attachment[] = [],
-  ): Promise<void> {
+  ): Promise<SteeringResponse> {
     const blocks = await this.buildContentBlocks(text, attachments);
-    await this.requireAgent().request("_session/steering", {
-      sessionId,
-      prompt: blocks,
-    });
-    this.echoUserMessage(sessionId, blocks);
+    const response = await this.requireAgent().request<SteeringResponse>(
+      "_session/steering",
+      {
+        sessionId,
+        prompt: blocks,
+        _meta: { steering: { idleBehavior: "promptRequired" } },
+      },
+    );
+    if (
+      response.outcome === "injected" ||
+      response.outcome === "startedNewTurn"
+    ) {
+      this.echoUserMessage(sessionId, blocks);
+    }
+    return response;
   }
 
   /** ACP doesn't echo a prompt you send back as a `user_message_chunk` (that

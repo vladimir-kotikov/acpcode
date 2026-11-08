@@ -503,8 +503,20 @@ class SessionViewSession implements vscode.Disposable {
     this.pendingPrompts += 1;
     try {
       if (steering) {
-        await client.steer(target.sessionId, text, attachments);
-        return;
+        const { outcome } = await client.steer(
+          target.sessionId,
+          text,
+          attachments,
+        );
+        if (outcome === "injected" || outcome === "startedNewTurn") {
+          return;
+        }
+        if (outcome === "failed") {
+          throw new Error("The agent could not apply the message.");
+        }
+        // The turn ended after our busy check. The agent deliberately leaves
+        // the prompt to us when idleBehavior is promptRequired, so send it as
+        // a normal prompt and let that request own its turn lifecycle.
       }
       const result = await client.prompt(target.sessionId, text, attachments);
       if (result.failureTitle) {
