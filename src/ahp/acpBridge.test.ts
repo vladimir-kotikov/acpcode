@@ -699,7 +699,7 @@ test("a session deleted during its unanswered first turn is deleted on the agent
   (t.hooks.handlers.disposeSession as (p: unknown) => null)({
     channel: draft,
   });
-  await settle();
+  await waitFor(() => deleted(t.calls).length > 0);
 
   assert.deepEqual(deleted(t.calls), [["draft"]]);
 });
