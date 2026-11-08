@@ -200,11 +200,18 @@ function startAgentHost(context: vscode.ExtensionContext): void {
     fs.writeFileSync(files.config, JSON.stringify(config));
   };
   const windowFile = path.join(files.windows, `${process.pid}.json`);
+  let focusedAt = vscode.window.state.focused ? Date.now() : 0;
   const writeWindow = () => {
     const info: WindowInfo = {
       folders: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
+      focusedAt,
     };
-    fs.writeFileSync(windowFile, JSON.stringify(info));
+    // Atomic, as it's rewritten on every focus change and a half-written file
+    // would drop this window from the host's folders. The temp file sits
+    // outside windows/, where the host would read (or prune) it as a window.
+    const tmp = path.join(agentHostDir(context), `window.${process.pid}.tmp`);
+    fs.writeFileSync(tmp, JSON.stringify(info));
+    fs.renameSync(tmp, windowFile);
   };
   writeConfig();
   writeWindow();
@@ -222,6 +229,12 @@ function startAgentHost(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(writeWindow),
+    vscode.window.onDidChangeWindowState(state => {
+      if (state.focused) {
+        focusedAt = Date.now();
+        writeWindow();
+      }
+    }),
     { dispose: () => fs.rmSync(windowFile, { force: true }) },
   );
 

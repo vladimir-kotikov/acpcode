@@ -21,6 +21,8 @@ export interface HostConfig {
 /** One per window, named after its extension host's pid. */
 export interface WindowInfo {
   folders: string[];
+  /** When the window last gained focus (ms epoch); orders the host's folders. */
+  focusedAt?: number;
 }
 
 export const hostFiles = (dir: string) => ({
@@ -36,6 +38,19 @@ export const hostFiles = (dir: string) => ({
   windows: path.join(dir, "windows"),
   log: path.join(dir, "host.log"),
 });
+
+/** Every window's folders, deduped, the most recently focused window's first:
+ *  chat sends no directory for a new session, so the host's first folder is
+ *  its cwd — and the window creating it is the focused one.
+ *  ponytail: focus heuristic, wrong only if a chat is created from an
+ *  unfocused window; needs a per-window connection to know for sure. */
+export const windowFolders = (windows: WindowInfo[]): string[] => [
+  ...new Set(
+    windows
+      .toSorted((a, b) => (b.focusedAt ?? 0) - (a.focusedAt ?? 0))
+      .flatMap(w => w.folders),
+  ),
+];
 
 export function readJson<T>(file: string): T | undefined {
   try {

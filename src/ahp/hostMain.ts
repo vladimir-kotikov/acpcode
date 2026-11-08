@@ -13,6 +13,7 @@ import {
   hostFiles,
   isAlive,
   readJson,
+  windowFolders,
   type HostConfig,
   type HostInfo,
   type WindowInfo,
@@ -71,20 +72,22 @@ const loadAgents = (): boolean => {
 };
 loadAgents();
 
-/** Union of every live window's workspace folders; prunes dead windows. */
+/** Every live window's workspace folders (see `windowFolders`); prunes dead
+ *  windows. */
 const folders = (): string[] => {
-  const result = new Set<string>();
+  const windows: WindowInfo[] = [];
   for (const name of fs.readdirSync(files.windows)) {
     const file = path.join(files.windows, name);
     if (!isAlive(Number.parseInt(name, 10))) {
       fs.rmSync(file, { force: true });
       continue;
     }
-    for (const folder of readJson<WindowInfo>(file)?.folders ?? []) {
-      result.add(folder);
+    const info = readJson<WindowInfo>(file);
+    if (info) {
+      windows.push(info);
     }
   }
-  return [...result];
+  return windowFolders(windows);
 };
 
 const pool = new AgentConnectionPool(name => output(`[${name}] `));
