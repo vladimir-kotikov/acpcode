@@ -679,6 +679,9 @@ test("deleting a session deletes its chats' ACP sessions, not an unsent draft", 
   const dispose = hooks.handlers.disposeSession as (p: unknown) => null;
   dispose({ channel: SESSION });
   dispose({ channel: "ahp-session:/acp-claude/draft" });
+  await waitFor(
+    () => calls.filter(c => c.method === "deleteSession").length >= 2,
+  );
   await settle();
 
   assert.deepEqual(
@@ -725,6 +728,7 @@ test("deleting a fork deletes only its ACP session; the primary chat can't be", 
 
   disposeChat({ channel: CHAT });
   disposeChat({ channel: "ahp-chat:/fork" });
+  await waitFor(() => deleted(t.calls).length > 0);
   await settle();
 
   assert.deepEqual(deleted(t.calls), [["fork-1"]]);
