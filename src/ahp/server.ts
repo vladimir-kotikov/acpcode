@@ -25,6 +25,22 @@ import { WebSocketServer, type WebSocket } from "ws";
 
 export const ROOT_CHANNEL = "ahp-root://";
 const PROTOCOL_VERSION = "1.0.0";
+
+/** The offered version to answer with — it must be one of them: ours, or
+ *  else the lowest 1.x, the closest to ours (minor versions only add). */
+export function negotiate(offered: readonly string[]): string | undefined {
+  if (offered.includes(PROTOCOL_VERSION)) {
+    return PROTOCOL_VERSION;
+  }
+  const parts = (version: string) => version.split(".").map(Number);
+  return offered
+    .filter(version => /^1\.\d+\.\d+$/.test(version))
+    .sort((a, b) => {
+      const [x, y] = [parts(a), parts(b)];
+      return x[1] - y[1] || x[2] - y[2];
+    })[0];
+}
+
 // How many recent action envelopes `reconnect` can replay before falling back
 // to fresh snapshots.
 const REPLAY_BUFFER_SIZE = 2000;
@@ -238,7 +254,8 @@ export class AhpServer implements Disposable {
   ): Promise<InitializeResult> {
     connection.clientId = params.clientId;
     this.servedClients.add(params.clientId);
-    if (!params.protocolVersions.some(v => v.startsWith("1."))) {
+    const protocolVersion = negotiate(params.protocolVersions);
+    if (!protocolVersion) {
       throw Object.assign(
         new AhpRequestError(
           AhpErrorCodes.UnsupportedProtocolVersion,
@@ -255,7 +272,7 @@ export class AhpServer implements Disposable {
       }
     }
     return {
-      protocolVersion: PROTOCOL_VERSION,
+      protocolVersion,
       serverSeq: this.serverSeq,
       serverInfo: { name: "acpcode", title: "ACP Code" },
       snapshots,
