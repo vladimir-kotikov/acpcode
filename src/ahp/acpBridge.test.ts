@@ -1265,3 +1265,27 @@ test("an edit shows as a file edit whose sides Chat reads from the host", async 
   });
   assert.throws(() => read({ uri: edit.after!.content.uri }), /not found/);
 });
+
+test("a tool call keeps the agent's tool name and a failure its error", async () => {
+  const t = await withRunningTurn();
+
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "b1",
+    title: "Run the tests",
+    kind: "execute",
+    _meta: { claudeCode: { toolName: "Bash" } },
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b1",
+    status: "failed",
+    rawOutput: [{ type: "text", text: "npm ERR! missing script: tests" }],
+  });
+
+  const part = t.state().activeTurn?.responseParts[0] as {
+    toolCall: { toolName: string; error?: { message: string } };
+  };
+  assert.equal(part.toolCall.toolName, "Bash");
+  assert.equal(part.toolCall.error?.message, "npm ERR! missing script: tests");
+});

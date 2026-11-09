@@ -194,6 +194,37 @@ const directoryUris = (binding: Binding): string[] =>
 /** AHP provider IDs double as URI schemes VS Code builds draft-session
  *  resources from (`<provider>:/untitled-<uuid>`), so they must be
  *  scheme-safe — agent display names aren't. */
+/** The agent's own name for the tool (claude-agent-acp sends it in
+ *  `_meta.claudeCode.toolName`), else ACP's coarse kind. */
+const toolNameOf = (call: ToolCallUpdate): string => {
+  const name = (call._meta?.claudeCode as { toolName?: unknown } | undefined)
+    ?.toolName;
+  return typeof name === "string" ? name : (call.kind ?? "other");
+};
+
+/** A failed tool call's own error: its text content, else its raw output's
+ *  text — capped. */
+function failureText(update: ToolCallUpdate): string | undefined {
+  const texts = (update.content ?? []).flatMap(item =>
+    item.type === "content" && item.content.type === "text"
+      ? [item.content.text]
+      : [],
+  );
+  const raw = update.rawOutput;
+  if (!texts.length && typeof raw === "string") {
+    texts.push(raw);
+  } else if (!texts.length && Array.isArray(raw)) {
+    for (const item of raw) {
+      if (typeof item?.text === "string") {
+        texts.push(item.text);
+      }
+    }
+  }
+  const text = texts.join("\n").trim();
+  // A failed command's output can be huge; the result content has it whole.
+  return text.length > 500 ? `${text.slice(0, 500)}…` : text || undefined;
+}
+
 /** Content URIs of diff sides; see `storeContent`. */
 const CONTENT_SCHEME = "acpcode-content";
 
@@ -2077,7 +2108,7 @@ export class AcpAgentHost implements Disposable {
       type: ActionType.ChatToolCallStart,
       turnId,
       toolCallId: call.toolCallId,
-      toolName: call.kind ?? "other",
+      toolName: toolNameOf(call),
       displayName: title,
     });
     this.server.dispatch(binding.chatUri, {
@@ -2201,7 +2232,7 @@ export class AcpAgentHost implements Disposable {
           content:
             this.toolContent(binding, update.content) ?? tracking.content,
           ...(update.status === "failed"
-            ? { error: { message: tracking.title } }
+            ? { error: { message: failureText(update) ?? tracking.title } }
             : {}),
         },
       });
