@@ -299,3 +299,61 @@ test("an inline image an agent can't take fails the prompt instead of vanishing"
     /can't take shot\.png/,
   );
 });
+
+test("a replayed compaction summary shows as the Compact conversation tool call", async t => {
+  const summary =
+    "This session is being continued from a previous conversation that ran out of context.\n\nSummary: ...";
+  const entryPoint = fakeAgent(t, (message, send) => {
+    if (message.method !== "session/prompt") {
+      return;
+    }
+    const pasted =
+      "This session is being continued from a previous conversation, see notes.";
+    for (const text of [pasted, message.params.prompt[0].text]) {
+      send({
+        method: "session/update",
+        params: {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: { type: "text", text },
+          },
+        },
+      });
+    }
+    send({ id: message.id, result: { stopReason: "end_turn" } });
+  });
+  const client = new AgentClient("/", {
+    append: () => undefined,
+    appendLine: () => undefined,
+    dispose: () => undefined,
+  });
+  t.after(() => client.dispose());
+  await client.connect(
+    {
+      name: "fake",
+      kind: "claude",
+      env: { CLAUDE_CODE_EXECUTABLE: "/bin/false" },
+    },
+    entryPoint,
+  );
+  const got: unknown[] = [];
+  client.onSessionUpdate(({ update }) => {
+    got.push(
+      update.sessionUpdate === "tool_call"
+        ? [update.title, update.status, update.content]
+        : update.sessionUpdate,
+    );
+  });
+  await client.prompt("s1", summary);
+
+  assert.deepEqual(got, [
+    "user_message_chunk", // our prompt's own echo is never touched
+    "user_message_chunk", // a prompt without the summary's framing
+    [
+      "Compact conversation",
+      "completed",
+      [{ type: "content", content: { type: "text", text: summary } }],
+    ],
+  ]);
+});

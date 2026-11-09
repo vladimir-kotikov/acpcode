@@ -71,6 +71,34 @@ const RESET_COMMANDS: Partial<Record<AgentConfig["kind"], AvailableCommand>> = {
   },
 };
 
+/** Claude Code keeps a compaction's summary as a user message, and
+ *  claude-agent-acp replays it as one: a huge prompt nobody typed. It's shown
+ *  as the completed "Compact conversation" tool call a live compaction is
+ *  instead. (ACP's `session.compaction` doesn't help: claude-agent-acp
+ *  0.100.0 only recognises an older framing of the summary.) */
+// ponytail: the record's `isCompactSummary` doesn't reach ACP, so a prompt
+// pasted with this exact framing shows as a card too.
+const COMPACT_SUMMARY =
+  /^\s*This session is being continued from a previous conversation[^\n]*\n[\s\S]*?^Summary:/m;
+function compactSummaryAsToolCall(update: SessionUpdate): SessionUpdate {
+  if (
+    update.sessionUpdate !== "user_message_chunk" ||
+    update.content.type !== "text" ||
+    !COMPACT_SUMMARY.test(update.content.text)
+  ) {
+    return update;
+  }
+  return {
+    sessionUpdate: "tool_call",
+    toolCallId: update.messageId ?? randomUUID(),
+    title: "Compact conversation",
+    kind: "think",
+    status: "completed",
+    content: [{ type: "content", content: update.content }],
+    _meta: { claudeCode: { toolName: "compact" } },
+  };
+}
+
 export type ConnectionState = {
   state: "connecting" | "connected" | "error";
   error?: string;
@@ -278,7 +306,9 @@ export class AgentClient implements Disposable {
                     update.availableCommands,
                   ),
                 }
-              : update,
+              : this.kind === "claude"
+                ? compactSummaryAsToolCall(update)
+                : update,
         });
       });
 
