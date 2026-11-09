@@ -128,6 +128,10 @@ interface Binding {
   readonly turnMessages: Map<string, string>;
   /** The session's status as its last listing reported it (archived, ...). */
   listedStatus?: SessionStatus;
+  /** When the chat last saw activity: its listing's `updatedAt`, else when
+   *  this host made it. Chat opens a session on its most recently modified
+   *  chat. */
+  modifiedAt: string;
   /** The directory set changed during a turn; applied when it ends. */
   directoriesDirty?: boolean;
   title: string;
@@ -731,6 +735,7 @@ export class AcpAgentHost implements Disposable {
       turnMessages: new Map(),
       replaying: false,
       turnStartedAt: 0,
+      modifiedAt: new Date().toISOString(),
       title: DEFAULT_CHAT_TITLE,
       toolCalls: new Map(),
     };
@@ -843,6 +848,7 @@ export class AcpAgentHost implements Disposable {
     const live = this.byAcpSession.get(`${agent.name}\0${info.sessionId}`);
     if (live) {
       live.listedStatus = status;
+      live.modifiedAt = info.updatedAt ?? live.modifiedAt;
       return live;
     }
     const binding = this.register(
@@ -858,6 +864,7 @@ export class AcpAgentHost implements Disposable {
     this.bind(binding, info.sessionId);
     binding.title = info.title || binding.title;
     binding.listedStatus = status;
+    binding.modifiedAt = info.updatedAt ?? binding.modifiedAt;
     return binding;
   }
 
@@ -906,11 +913,8 @@ export class AcpAgentHost implements Disposable {
     if (binding.primary) {
       binding.title = info.title || binding.title;
     }
-    const summary = this.summary(
-      binding,
-      info.updatedAt ?? new Date().toISOString(),
-      status,
-    );
+    binding.modifiedAt = info.updatedAt ?? binding.modifiedAt;
+    const summary = this.summary(binding, binding.modifiedAt, status);
     return { binding, summary };
   }
 
@@ -1088,7 +1092,7 @@ export class AcpAgentHost implements Disposable {
       status: chat.primary
         ? SessionStatus.Idle | (status & SessionStatus.IsArchived)
         : status,
-      modifiedAt: new Date().toISOString(),
+      modifiedAt: chat.modifiedAt,
       ...(chat.origin && {
         origin: { kind: ChatOriginKind.Fork, ...chat.origin },
       }),
@@ -1162,7 +1166,7 @@ export class AcpAgentHost implements Disposable {
       resource: binding.chatUri,
       title: binding.title,
       status: SessionStatus.Idle,
-      modifiedAt: new Date().toISOString(),
+      modifiedAt: binding.modifiedAt,
       turns: [],
       ...(binding.origin && {
         origin: { kind: ChatOriginKind.Fork, ...binding.origin },
@@ -1218,6 +1222,7 @@ export class AcpAgentHost implements Disposable {
       reasoningPartId: undefined,
       pendingUserText: undefined,
       replaying: false,
+      modifiedAt: new Date().toISOString(),
     };
     this.bind(binding, forked.sessionId);
     this.rememberDirectories(binding);
@@ -1458,7 +1463,7 @@ export class AcpAgentHost implements Disposable {
         );
         this.server.notify("root/sessionAdded", {
           channel: ROOT_CHANNEL,
-          summary: this.summary(binding, new Date().toISOString()),
+          summary: this.summary(binding, binding.modifiedAt),
         });
         return null;
       },

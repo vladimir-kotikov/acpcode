@@ -367,6 +367,25 @@ test("a fork branches at its turn's last agent message and isn't listed", async 
   assert.equal(notified.length, before);
 });
 
+test("a fork made here is its session's most recently modified chat", async () => {
+  const { host, hooks, listChanged } = setup();
+  listChanged({
+    sessions: [{ ...row("s1"), updatedAt: "2026-01-01T00:00:00.000Z" }],
+  });
+  await hooks.materialize(CHAT);
+  const [turn] = (host.server.stateOf(CHAT) as ChatState).turns;
+
+  await (hooks.handlers.createChat as (p: unknown) => Promise<null>)({
+    channel: SESSION,
+    chat: "ahp-chat:/fork",
+    source: { kind: ChatSourceKind.Fork, chat: CHAT, turnId: turn.id },
+  });
+
+  const [primary, fork] = (host.server.stateOf(SESSION) as SessionState).chats;
+  assert.equal(fork.resource, "ahp-chat:/fork");
+  assert.ok(fork.modifiedAt > primary.modifiedAt);
+});
+
 test("archiving a fork archives its ACP session and its catalog entry", async () => {
   const { host, hooks, calls, notified, listChanged, clientAction } = setup();
   listChanged({ sessions: [row("s1")] });
@@ -480,6 +499,28 @@ test("listed forks are chats of their earliest listed ancestor's session", async
   };
   assert.equal(session.defaultChat, CHAT);
   assert.equal(session.chats.length, 3);
+});
+
+test("a session's chats carry their listed activity time, so Chat opens the latest", async () => {
+  const { host, hooks, listed } = setup();
+  listed.push(
+    { ...row("s1", "Root"), updatedAt: "2026-01-01T00:00:00.000Z" },
+    { ...forkRow("f1", "s1"), updatedAt: "2026-02-01T00:00:00.000Z" },
+  );
+
+  await listSessions(hooks);
+  await hooks.materialize(SESSION);
+
+  assert.deepEqual(
+    (host.server.stateOf(SESSION) as SessionState).chats.map(c => [
+      c.resource,
+      c.modifiedAt,
+    ]),
+    [
+      [CHAT, "2026-01-01T00:00:00.000Z"],
+      ["ahp-chat:/acp-claude/f1", "2026-02-01T00:00:00.000Z"],
+    ],
+  );
 });
 
 test("a fork's row added or removed later adds or removes its chat", () => {
