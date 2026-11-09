@@ -8,15 +8,22 @@ import type {
 import {
   ActionType,
   ChatSourceKind,
+  PendingMessageKind,
+  ResponsePartKind,
   type ChatState,
   type SessionChatSummary,
   type SessionState,
   SessionStatus,
   type StateAction,
+  ToolCallStatus,
 } from "@microsoft/agent-host-protocol";
 import assert from "node:assert/strict";
 import { type TestContext, test } from "node:test";
-import type { AgentClient, SessionListChanges } from "../acp/agentClient.ts";
+import type {
+  AgentClient,
+  SessionListChanges,
+  SteeringResponse,
+} from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
 import { AcpAgentHost } from "./acpBridge.ts";
@@ -43,12 +50,18 @@ function setup(
     claudeEnv,
     deleteFails = false,
     agentKind = "claude",
+    steering,
+    duringLoad,
   }: {
     indexed?: boolean;
     /** The agent's env: a fake `claude` and its config dir. */
     claudeEnv?: Record<string, string>;
     deleteFails?: boolean;
     agentKind?: AgentConfig["kind"];
+    /** What the agent answers a steering message; none can't steer. */
+    steering?: SteeringResponse | Promise<SteeringResponse>;
+    /** Runs while `s1`'s history replays. */
+    duringLoad?: () => void;
   } = {},
 ) {
   const theAgent = {
@@ -77,6 +90,10 @@ function setup(
   const askPermission = (
     request: Parameters<(typeof permissionListeners)[number]>[0],
   ) => permissionListeners.forEach(l => l(request));
+  const prompts: ((result: { stopReason: string }) => void)[] = [];
+  /** The agent ending its oldest unanswered prompt. */
+  const endPrompt = (stopReason = "end_turn") =>
+    prompts.shift()!({ stopReason });
   const disposable = { dispose: () => undefined };
   const client = {
     canSendImages: () => false,
@@ -105,6 +122,7 @@ function setup(
         content: { type: "text", text: "hi" },
         messageId: "m1",
       });
+      duringLoad?.();
       return Promise.resolve(undefined);
     },
     forkSession: (...args: unknown[]) => {
@@ -124,8 +142,16 @@ function setup(
       calls.push({ method: "newSession", args: [] });
       return Promise.resolve({ sessionId: "draft" });
     },
-    // A first turn the agent never answers.
-    prompt: () => new Promise(() => undefined),
+    // Turns run until the test ends them with `endPrompt`.
+    prompt: (...args: unknown[]) => {
+      calls.push({ method: "prompt", args });
+      return new Promise(resolve => prompts.push(resolve));
+    },
+    canSteer: () => steering !== undefined,
+    steer: (...args: unknown[]) => {
+      calls.push({ method: "steer", args });
+      return Promise.resolve(steering);
+    },
     cancelPrompt: () => undefined,
     deleteSession: (...args: unknown[]) => {
       calls.push({ method: "deleteSession", args });
@@ -191,6 +217,7 @@ function setup(
     clientAction,
     replay,
     askPermission,
+    endPrompt,
   };
 }
 
@@ -809,4 +836,222 @@ test("a plain approve or deny picks the one-time option, never an always one", a
       ["perm-denied", "plan"],
     ],
   );
+});
+
+/** A new session's chat with turn `t1` running. */
+async function withRunningTurn(options: Parameters<typeof setup>[1] = {}) {
+  const t = setup({}, options);
+  const draft = "ahp-session:/acp-claude/draft";
+  await (t.hooks.handlers.createSession as (p: unknown) => Promise<null>)({
+    channel: draft,
+    provider: "acp-claude",
+  });
+  const chat = (t.host.server.stateOf(draft) as SessionState).defaultChat!;
+  t.clientAction(chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId: "t1",
+    startedAt: new Date().toISOString(),
+    message: { text: "first" },
+  } as StateAction);
+  await settle();
+  const pend = (kind: PendingMessageKind, id: string, text: string) =>
+    t.clientAction(chat, {
+      type: ActionType.ChatPendingMessageSet,
+      kind,
+      id,
+      message: { text },
+    } as StateAction);
+  const state = () => t.host.server.stateOf(chat) as ChatState;
+  const prompted = () =>
+    t.calls.filter(c => c.method === "prompt").map(c => c.args[1]);
+  return { ...t, chat, pend, state, prompted };
+}
+
+test("a queued message runs as the next turn once the running one completes", async () => {
+  const t = await withRunningTurn();
+
+  t.pend(PendingMessageKind.Queued, "q1", "second");
+  await settle();
+  const promptedWhileBusy = t.prompted();
+  t.endPrompt();
+  await settle();
+
+  assert.deepEqual(promptedWhileBusy, ["first"]);
+  assert.deepEqual(t.prompted(), ["first", "second"]);
+  assert.equal(t.state().activeTurn?.message.text, "second");
+  assert.equal(t.state().queuedMessages, undefined);
+});
+
+test("a queued message waits out a cancelled turn", async () => {
+  const t = await withRunningTurn();
+
+  t.pend(PendingMessageKind.Queued, "q1", "second");
+  t.endPrompt("cancelled");
+  await settle();
+
+  assert.deepEqual(t.prompted(), ["first"]);
+  assert.equal(t.state().queuedMessages?.length, 1);
+});
+
+test("a message queued in an idle chat runs right away", async () => {
+  const t = await withRunningTurn();
+  t.endPrompt();
+  await settle();
+
+  t.pend(PendingMessageKind.Queued, "q1", "second");
+  await settle();
+
+  assert.deepEqual(t.prompted(), ["first", "second"]);
+});
+
+test("a steering message the agent takes completes the turn and answers a new one", async () => {
+  const t = await withRunningTurn({ steering: { outcome: "injected" } });
+
+  t.pend(PendingMessageKind.Steering, "s1", "also this");
+  await settle();
+  t.replay("draft", {
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text: "on it" },
+  });
+  t.endPrompt();
+  await settle();
+
+  assert.deepEqual(
+    t.calls.filter(c => c.method === "steer").map(c => c.args[1]),
+    ["also this"],
+  );
+  assert.deepEqual(t.prompted(), ["first"]);
+  const turns = t.state().turns;
+  assert.deepEqual(
+    turns.map(turn => turn.message.text),
+    ["first", "also this"],
+  );
+  assert.equal(turns[0].responseParts.length, 0);
+  assert.equal(turns[1].responseParts.length, 1);
+  assert.equal(t.state().steeringMessage, undefined);
+  assert.equal(t.state().activeTurn, undefined);
+});
+
+test("a steering message an agent can't take runs as the next turn", async () => {
+  const t = await withRunningTurn();
+
+  t.pend(PendingMessageKind.Steering, "s1", "also this");
+  await settle();
+  t.endPrompt();
+  await settle();
+
+  assert.deepEqual(t.prompted(), ["first", "also this"]);
+  assert.equal(t.state().steeringMessage, undefined);
+});
+
+test("a steering message taken during a tool call waits for it to finish", async () => {
+  const t = await withRunningTurn({ steering: { outcome: "injected" } });
+  t.askPermission({
+    sessionId: "draft",
+    requestId: "perm-1",
+    toolCall: { toolCallId: "tc1", title: "Run tests" },
+    options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+  });
+
+  t.pend(PendingMessageKind.Steering, "s1", "also this");
+  await settle();
+  const turnWhileAsking = t.state().activeTurn?.id;
+  t.clientAction(t.chat, {
+    type: ActionType.ChatToolCallConfirmed,
+    turnId: "t1",
+    toolCallId: "tc1",
+    approved: true,
+  } as StateAction);
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tc1",
+    status: "completed",
+  });
+
+  assert.equal(turnWhileAsking, "t1");
+  const [first] = t.state().turns;
+  assert.equal(first.id, "t1");
+  assert.deepEqual(
+    first.responseParts.map(part =>
+      part.kind === ResponsePartKind.ToolCall
+        ? part.toolCall.status
+        : part.kind,
+    ),
+    [ToolCallStatus.Completed],
+  );
+  assert.equal(t.state().activeTurn?.message.text, "also this");
+});
+
+test("a cancelled turn doesn't run the queue when its steering message is back", async () => {
+  let answer!: (response: SteeringResponse) => void;
+  const t = await withRunningTurn({
+    steering: new Promise(resolve => (answer = resolve)),
+  });
+  t.pend(PendingMessageKind.Queued, "q1", "second");
+  t.pend(PendingMessageKind.Steering, "s1", "also this");
+  await settle();
+
+  t.clientAction(t.chat, {
+    type: ActionType.ChatTurnCancelled,
+    turnId: "t1",
+    duration: 0,
+  } as StateAction);
+  t.endPrompt("cancelled");
+  await settle();
+  answer({ outcome: "injected" });
+  await settle();
+
+  assert.deepEqual(t.prompted(), ["first"]);
+  assert.equal(t.state().steeringMessage, undefined);
+  assert.equal(t.state().queuedMessages?.length, 1);
+});
+
+test("a message queued while the history replays runs after it", async () => {
+  let pend = () => {};
+  const t = setup({}, { duringLoad: () => pend() });
+  pend = () =>
+    t.clientAction(CHAT, {
+      type: ActionType.ChatPendingMessageSet,
+      kind: PendingMessageKind.Queued,
+      id: "q1",
+      message: { text: "later" },
+    } as StateAction);
+  t.listChanged({ sessions: [row("s1")] });
+
+  await t.hooks.materialize(CHAT);
+  await settle();
+
+  assert.deepEqual(
+    t.calls.filter(c => c.method === "prompt").map(c => c.args[1]),
+    ["later"],
+  );
+});
+
+test("a steering message replaced before its turn starts is sent once that turn has", async () => {
+  const t = await withRunningTurn({ steering: { outcome: "injected" } });
+  t.askPermission({
+    sessionId: "draft",
+    requestId: "perm-1",
+    toolCall: { toolCallId: "tc1", title: "Run tests" },
+    options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+  });
+  t.pend(PendingMessageKind.Steering, "s1", "also this");
+  await settle();
+
+  t.pend(PendingMessageKind.Steering, "s2", "and that");
+  await settle();
+  const steeredWhileWaiting = t.calls.filter(c => c.method === "steer").length;
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tc1",
+    status: "completed",
+  });
+  await settle();
+
+  assert.equal(steeredWhileWaiting, 1);
+  assert.deepEqual(
+    t.state().turns.map(turn => turn.message.text),
+    ["first", "also this"],
+  );
+  assert.equal(t.state().activeTurn?.message.text, "and that");
 });

@@ -16,6 +16,7 @@ import {
   JsonRpcErrorCodes,
   MessageAttachmentKind,
   MessageKind,
+  PendingMessageKind,
   ResponsePartKind,
   SessionLifecycle,
   SessionStatus,
@@ -23,6 +24,7 @@ import {
   ToolResultContentType,
   type AgentInfo,
   type ChatState,
+  type PendingMessage,
   type ChatSummary,
   type CompletionsParams,
   type CompletionsResult,
@@ -80,12 +82,23 @@ const TITLE_FROM_PROMPT_LENGTH = 60;
  *  (e.g. re-sending `toolCallReady` with `confirmed` would silently approve
  *  a call that's still waiting on the user). */
 interface ToolCallTracking {
+  /** The turn it started in. */
+  turnId: string;
   title: string;
   phase: "running" | "pending" | "done";
   permission?: { requestId: string; options: PermissionOption[] };
   // ACP's completing update usually omits content, and an absent `content`
   // in `toolCallComplete` would wipe what was shown while it ran.
   content?: ToolResultContent[];
+}
+
+/** A prompt this host is running. */
+interface Run {
+  /** The turn it answers now: steering moves the rest of the prompt on to a
+   *  turn of the steering message. */
+  turnId: string;
+  /** A steering message the agent took, still to get its turn. */
+  steered?: PendingMessage;
 }
 
 /** One ACP session exposed as one AHP session with exactly one chat. */
@@ -122,6 +135,13 @@ interface Binding {
   /** A turn was sent from this host, so the agent stores the session. */
   prompted?: boolean;
   turnId?: string;
+  /** The prompt this host is running. */
+  run?: Run;
+  /** A steering message is on its way to the agent. */
+  steering?: boolean;
+  /** A turn completed while a steering message was on its way: the pending
+   *  messages run once it's back. */
+  drainPending?: boolean;
   turnStartedAt: number;
   markdownPartId?: string;
   reasoningPartId?: string;
@@ -499,20 +519,27 @@ export class AcpAgentHost implements Disposable {
     }
   }
 
-  private async applyDirectories(binding: Binding): Promise<void> {
+  private applyDirectories(binding: Binding): Promise<void> {
     const state = this.server.stateOf(binding.sessionUri) as SessionState;
     const [, ...rest] = (state.workingDirectories ?? [])
       .filter(uri => uri.startsWith("file:"))
       .map(uri => fileURLToPath(uri));
     binding.additionalDirectories = rest;
     this.rememberDirectories(binding);
-    try {
-      await binding.ready;
-      const client = await this.connect(binding);
-      await client.resumeSession(binding.sessionId!, binding.cwd, rest);
-    } catch (err) {
-      this.output.appendLine(`[directories] ${describeError(err)}`);
+    const resume = () =>
+      this.connect(binding)
+        .then(client =>
+          client.resumeSession(binding.sessionId!, binding.cwd, rest),
+        )
+        .catch(err =>
+          this.output.appendLine(`[directories] ${describeError(err)}`),
+        );
+    if (!binding.ready) {
+      return resume();
     }
+    // Turns wait on `ready`: one sent meanwhile goes to the resumed session.
+    binding.ready = binding.ready.then(resume);
+    return binding.ready.catch(() => undefined);
   }
 
   private rememberDirectories(binding: Binding): void {
@@ -1282,6 +1309,8 @@ export class AcpAgentHost implements Disposable {
       } finally {
         binding.replaying = false;
       }
+      // Chat queues what's sent while the history replays.
+      this.runPending(binding);
     })().catch(err => {
       binding.ready = undefined; // let the next subscribe retry
       throw new AhpRequestError(
@@ -1546,6 +1575,13 @@ export class AcpAgentHost implements Disposable {
       case ActionType.ChatTurnStarted:
         void this.runTurn(binding, action.turnId, action.message);
         return;
+      case ActionType.ChatPendingMessageSet:
+        if (!binding.turnId) {
+          this.runPending(binding);
+        } else if (action.kind === PendingMessageKind.Steering) {
+          this.steer(binding);
+        }
+        return;
       case ActionType.ChatIsArchivedChanged: {
         // A chat is its own ACP session: a fork's, or for the primary chat
         // the session's, whose row then archives the session as well.
@@ -1580,6 +1616,9 @@ export class AcpAgentHost implements Disposable {
           ?.resolvePermission(permission.requestId, optionId);
         tracking.permission = undefined;
         tracking.phase = action.approved ? "running" : "done";
+        if (binding.run) {
+          this.promoteSteered(binding, binding.run);
+        }
         return;
       }
     }
@@ -1591,6 +1630,9 @@ export class AcpAgentHost implements Disposable {
     message: Message,
   ): Promise<void> {
     this.beginTurn(binding, turnId);
+    const run: Run = { turnId };
+    binding.run = run;
+    let completed = false;
     binding.prompted = true;
     if (binding.title === DEFAULT_CHAT_TITLE && message.text.trim()) {
       this.setTitle(
@@ -1608,19 +1650,155 @@ export class AcpAgentHost implements Disposable {
         toAttachments(message),
       );
       if (failureTitle) {
-        this.failTurn(binding, turnId, failureTitle);
+        this.failTurn(binding, run.turnId, failureTitle);
+      } else if (stopReason === "cancelled") {
+        this.endTurn(binding, ActionType.ChatTurnCancelled, run.turnId);
       } else {
-        this.endTurn(
-          binding,
-          stopReason === "cancelled"
-            ? ActionType.ChatTurnCancelled
-            : ActionType.ChatTurnComplete,
-          turnId,
-        );
+        this.promoteSteered(binding, run, true);
+        this.endTurn(binding, ActionType.ChatTurnComplete, run.turnId);
+        completed = true;
       }
     } catch (err) {
-      this.failTurn(binding, turnId, describeError(err));
+      this.failTurn(binding, run.turnId, describeError(err));
+    } finally {
+      if (binding.run === run) {
+        binding.run = undefined;
+      }
+      if (run.steered) {
+        // Handed to the agent, but its turn didn't complete.
+        this.server.dispatch(binding.chatUri, {
+          type: ActionType.ChatPendingMessageRemoved,
+          kind: PendingMessageKind.Steering,
+          id: run.steered.id,
+        });
+      }
     }
+    if (completed) {
+      this.runPending(binding);
+    }
+  }
+
+  /** The next pending message, steering first, as a turn of its own: Chat
+   *  leaves running them to the host once the chat is idle. Queued messages
+   *  wait out a cancelled or failed turn, as with Chat's own hosts. */
+  private runPending(binding: Binding): void {
+    if (binding.turnId || binding.run) {
+      return;
+    }
+    if (binding.steering) {
+      binding.drainPending = true;
+      return;
+    }
+    const chat = this.server.stateOf(binding.chatUri) as ChatState | undefined;
+    const next = chat?.steeringMessage ?? chat?.queuedMessages?.[0];
+    if (!next) {
+      return;
+    }
+    const turnId = randomUUID();
+    this.server.dispatch(binding.chatUri, {
+      type: ActionType.ChatTurnStarted,
+      turnId,
+      startedAt: new Date().toISOString(),
+      message: next.message,
+      queuedMessageId: next.id,
+    });
+    void this.runTurn(binding, turnId, next.message);
+  }
+
+  /** Injects the steering message into the running prompt; see
+   *  `promoteSteered`. One the agent doesn't take stays pending, to run as
+   *  the next turn. */
+  private steer(binding: Binding): void {
+    const run = binding.run;
+    const client = this.pool.get(binding.agent.name);
+    const pending = (
+      this.server.stateOf(binding.chatUri) as ChatState | undefined
+    )?.steeringMessage;
+    if (
+      !run ||
+      run.steered || // one at a time: `promoteSteered` sends the next
+      !pending ||
+      binding.steering ||
+      !binding.sessionId ||
+      !client?.canSteer()
+    ) {
+      return;
+    }
+    binding.steering = true;
+    void client
+      .steer(
+        binding.sessionId,
+        pending.message.text,
+        toAttachments(pending.message),
+      )
+      .then(
+        ({ outcome }) => {
+          if (outcome !== "injected" && outcome !== "startedNewTurn") {
+            return;
+          }
+          if (binding.run !== run || binding.turnId !== run.turnId) {
+            // Taken, but the turn ended meanwhile.
+            this.server.dispatch(binding.chatUri, {
+              type: ActionType.ChatPendingMessageRemoved,
+              kind: PendingMessageKind.Steering,
+              id: pending.id,
+            });
+            return;
+          }
+          run.steered = pending;
+          this.promoteSteered(binding, run);
+        },
+        err => this.output.appendLine(`[steering] ${describeError(err)}`),
+      )
+      .finally(() => {
+        binding.steering = false;
+        const latest = (
+          this.server.stateOf(binding.chatUri) as ChatState | undefined
+        )?.steeringMessage;
+        if (binding.drainPending) {
+          binding.drainPending = false;
+          this.runPending(binding);
+        } else if (binding.run && latest && latest.id !== pending.id) {
+          this.steer(binding); // replaced while this one was on its way
+        }
+      });
+  }
+
+  /** Once the agent took a steering message, the turn so far completes and
+   *  the rest of the prompt answers a turn of the message, as with Chat's
+   *  own hosts. That waits for the turn's tool calls (`force` aside, at the
+   *  prompt's end): ending a turn cancels its unfinished ones. */
+  private promoteSteered(binding: Binding, run: Run, force = false): void {
+    const steered = run.steered;
+    if (
+      !steered ||
+      binding.run !== run ||
+      binding.turnId !== run.turnId ||
+      (!force &&
+        [...binding.toolCalls.values()].some(
+          call => call.turnId === run.turnId && call.phase !== "done",
+        ))
+    ) {
+      return;
+    }
+    run.steered = undefined;
+    // Not `endTurn`: the prompt goes on, so nothing waiting on its end
+    // (directory changes) may run yet.
+    this.server.dispatch(binding.chatUri, {
+      type: ActionType.ChatTurnComplete,
+      turnId: run.turnId,
+      duration: Date.now() - binding.turnStartedAt,
+    });
+    run.turnId = randomUUID();
+    this.beginTurn(binding, run.turnId);
+    this.server.dispatch(binding.chatUri, {
+      type: ActionType.ChatTurnStarted,
+      turnId: run.turnId,
+      startedAt: new Date().toISOString(),
+      message: steered.message,
+      queuedMessageId: steered.id,
+    });
+    this.steer(binding); // one that replaced it meanwhile
   }
 
   private endTurn(
@@ -1816,6 +1994,7 @@ export class AcpAgentHost implements Disposable {
     binding.markdownPartId = undefined;
     binding.reasoningPartId = undefined;
     binding.toolCalls.set(call.toolCallId, {
+      turnId,
       title,
       phase: "running",
     });
@@ -1886,6 +2065,9 @@ export class AcpAgentHost implements Disposable {
             : {}),
         },
       });
+      if (binding.run) {
+        this.promoteSteered(binding, binding.run);
+      }
       return;
     }
     if (tracking.phase !== "running") {
