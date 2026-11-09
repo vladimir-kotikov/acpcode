@@ -1,6 +1,6 @@
 // node --test src/acp/agentClient.test.ts
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { type TestContext, test } from "node:test";
 import { AgentClient, type SteeringResponse } from "./agentClient.ts";
 import { fakeAgent } from "./fakeAgent.test-util.ts";
 
@@ -148,4 +148,58 @@ test("cancelling a prompt answers its session's pending permission request as ca
   assert.deepEqual(resolved, [requestId]);
   assert.equal((await turn).stopReason, "cancelled");
   assert.deepEqual(answers, [JSON.stringify({ outcome: "cancelled" })]);
+});
+
+/** A client of an agent advertising `agentCapabilities`, which answers
+ *  session/new with the directories it got, and session/load. */
+async function clientOf(t: TestContext, agentCapabilities: object) {
+  const entryPoint = fakeAgent(
+    t,
+    (message, send) => {
+      if (message.method === "session/new") {
+        send({
+          id: message.id,
+          result: {
+            sessionId: JSON.stringify(
+              message.params.additionalDirectories ?? null,
+            ),
+          },
+        });
+      } else if (message.method === "session/load") {
+        send({ id: message.id, result: {} });
+      }
+    },
+    agentCapabilities,
+  );
+  const client = new AgentClient("/", {
+    append: () => undefined,
+    appendLine: () => undefined,
+    dispose: () => undefined,
+  });
+  t.after(() => client.dispose());
+  await client.connect(
+    {
+      name: "fake",
+      kind: "claude",
+      env: { CLAUDE_CODE_EXECUTABLE: "/bin/false" },
+    },
+    entryPoint,
+  );
+  return client;
+}
+
+test("optional session methods go only to an agent that advertises them", async t => {
+  const bare = await clientOf(t, {});
+  const capable = await clientOf(t, {
+    loadSession: true,
+    sessionCapabilities: { additionalDirectories: {} },
+  });
+
+  await assert.rejects(bare.loadSession("s1"), /doesn't support session\/load/);
+  await capable.loadSession("s1");
+  assert.equal((await bare.newSession("/w", ["/x"])).sessionId, "null");
+  assert.equal(
+    (await capable.newSession("/w", ["/x"])).sessionId,
+    JSON.stringify(["/x"]),
+  );
 });

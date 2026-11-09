@@ -4,6 +4,7 @@ import {
   ndJsonStream,
   PROTOCOL_VERSION,
   RequestError,
+  type AgentCapabilities,
   type AvailableCommand,
   type ClientContext,
   type ContentBlock,
@@ -154,6 +155,9 @@ export class AgentClient implements Disposable {
   // `resource_link` are baseline (every agent MUST accept them per the ACP
   // spec), everything else needs this check before it's safe to send.
   private promptCapabilities: PromptCapabilities = {};
+  /** What the agent advertised in `initialize`; ACP's optional session
+   *  methods are only called when it did. */
+  private agentCapabilities: AgentCapabilities = {};
   /** `_meta.jetbrains.air.capabilities` the bridge advertised back, e.g.
    *  `sessionIndex` once we've declared it. */
   private airCapabilities = new Set<string>();
@@ -313,6 +317,7 @@ export class AgentClient implements Disposable {
         !!steeringMeta &&
         typeof steeringMeta === "object" &&
         (steeringMeta as { supported?: unknown }).supported === true;
+      this.agentCapabilities = response.agentCapabilities ?? {};
       this.promptCapabilities =
         response.agentCapabilities?.promptCapabilities ?? {};
       const air = (
@@ -325,6 +330,24 @@ export class AgentClient implements Disposable {
       this.connectionStateEmitter.fire({ state: "error", error: String(err) });
       throw err;
     }
+  }
+
+  /** ACP: a client MUST NOT call an optional method the agent didn't
+   *  advertise — fails here instead. */
+  private requireCapability(method: string, advertised: unknown): void {
+    if (!advertised) {
+      throw new Error(`the agent doesn't support ${method}`);
+    }
+  }
+
+  /** `additionalDirectories`, for an agent that takes them. */
+  private directories(additionalDirectories: string[] | undefined): {
+    additionalDirectories?: string[];
+  } {
+    return additionalDirectories?.length &&
+      this.agentCapabilities.sessionCapabilities?.additionalDirectories
+      ? { additionalDirectories }
+      : {};
   }
 
   /** A throwaway connection to a freshly installed bridge; see `BridgeProbe`. */
@@ -394,6 +417,10 @@ export class AgentClient implements Disposable {
   ): Promise<SessionInfo[]> {
     // The bridge pages its list (at most 200 rows a page with its session
     // index, see `sessionIndex` below).
+    this.requireCapability(
+      "session/list",
+      this.agentCapabilities.sessionCapabilities?.list,
+    );
     const sessions: SessionInfo[] = [];
     const seen = new Set<string>();
     let cursor: string | undefined;
@@ -433,7 +460,7 @@ export class AgentClient implements Disposable {
       {
         cwd: cwd ?? this.cwd,
         mcpServers: [],
-        ...(additionalDirectories?.length && { additionalDirectories }),
+        ...this.directories(additionalDirectories),
       },
     );
   }
@@ -448,14 +475,29 @@ export class AgentClient implements Disposable {
     cwd: string,
     additionalDirectories: string[],
   ): Promise<SessionConfigOption[] | undefined> {
+    this.requireCapability(
+      "session/resume",
+      this.agentCapabilities.sessionCapabilities?.resume,
+    );
     const response = await this.requireAgent().request(
       methods.agent.session.resume,
-      { sessionId, cwd, mcpServers: [], additionalDirectories },
+      {
+        sessionId,
+        cwd,
+        mcpServers: [],
+        // Sent even when empty: that drops the ones the session had.
+        ...(this.agentCapabilities.sessionCapabilities
+          ?.additionalDirectories && { additionalDirectories }),
+      },
     );
     return response.configOptions ?? undefined;
   }
 
   async deleteSession(sessionId: SessionId): Promise<void> {
+    this.requireCapability(
+      "session/delete",
+      this.agentCapabilities.sessionCapabilities?.delete,
+    );
     await this.requireAgent().request(methods.agent.session.delete, {
       sessionId,
     });
@@ -475,13 +517,14 @@ export class AgentClient implements Disposable {
     cwd?: string,
     additionalDirectories?: string[],
   ): Promise<LoadSessionResponse | void> {
+    this.requireCapability("session/load", this.agentCapabilities.loadSession);
     return this.requireAgent().request<LoadSessionResponse | void>(
       methods.agent.session.load,
       {
         sessionId,
         cwd: cwd ?? this.cwd,
         mcpServers: [],
-        ...(additionalDirectories?.length && { additionalDirectories }),
+        ...this.directories(additionalDirectories),
       },
     );
   }
@@ -497,13 +540,17 @@ export class AgentClient implements Disposable {
     options: { additionalDirectories?: string[]; atMessageId?: string } = {},
   ): Promise<ForkSessionResponse> {
     const { additionalDirectories, atMessageId } = options;
+    this.requireCapability(
+      "session/fork",
+      this.agentCapabilities.sessionCapabilities?.fork,
+    );
     return this.requireAgent().request<ForkSessionResponse>(
       methods.agent.session.fork,
       {
         sessionId,
         cwd: cwd ?? this.cwd,
         mcpServers: [],
-        ...(additionalDirectories?.length && { additionalDirectories }),
+        ...this.directories(additionalDirectories),
         // claude-agent-acp's fork point (its AIR extension): copy the history
         // up to this message instead of all of it.
         ...(atMessageId && {
