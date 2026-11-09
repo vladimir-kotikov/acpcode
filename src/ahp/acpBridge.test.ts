@@ -1758,3 +1758,57 @@ test("a watched chat nobody shows any more is forgotten, not loaded again", asyn
   assert.equal(calls.filter(c => c.method === "loadSession").length, 1);
   assert.equal(host.server.has(CHAT), false);
 });
+
+test("a deleted session's row arriving while the agent deletes it doesn't bring it back", async () => {
+  const t = setup();
+  t.listChanged({ sessions: [row("s1")] });
+  await t.hooks.materialize(CHAT);
+
+  (t.hooks.handlers.disposeSession as (p: unknown) => null)({
+    channel: SESSION,
+  });
+  // A job stopping writes its transcript, so the index sends the row again.
+  t.listChanged({ sessions: [row("s1")] });
+  t.listed.push(row("s1"));
+  const { items } = await (
+    t.hooks.handlers.listSessions as () => Promise<{ items: unknown[] }>
+  )();
+  await waitFor(() => deleted(t.calls).length > 0);
+
+  assert.deepEqual(items, []);
+  assert.equal(t.host.server.has(SESSION), false);
+  assert.equal(t.notified.at(-1)?.method, "root/sessionRemoved");
+});
+
+test("a session the agent couldn't delete is listed again", async () => {
+  const t = setup({}, { deleteFails: true });
+  t.listChanged({ sessions: [row("s1")] });
+  await t.hooks.materialize(CHAT);
+
+  (t.hooks.handlers.disposeSession as (p: unknown) => null)({
+    channel: SESSION,
+  });
+  await waitFor(() => t.logged.some(line => line.startsWith("[delete]")));
+  t.listChanged({ sessions: [row("s1")] });
+
+  assert.equal(t.notified.at(-1)?.method, "root/sessionAdded");
+});
+
+test("a deleted session whose row comes back after its delete is deleted again", async () => {
+  const t = setup();
+  t.listChanged({ sessions: [row("s1")] });
+  await t.hooks.materialize(CHAT);
+  (t.hooks.handlers.disposeSession as (p: unknown) => null)({
+    channel: SESSION,
+  });
+  await waitFor(() => deleted(t.calls).length > 0);
+  await settle();
+
+  // A stopped job's last write recreated the transcript.
+  t.listChanged({ sessions: [row("s1")] });
+  t.listChanged({ sessions: [row("s1")] });
+  await settle();
+
+  assert.deepEqual(deleted(t.calls), [["s1"], ["s1"]]);
+  assert.equal(t.notified.at(-1)?.method, "root/sessionRemoved");
+});

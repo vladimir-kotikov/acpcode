@@ -414,6 +414,12 @@ export class AcpAgentHost implements Disposable {
   private readonly hookedClients = new WeakSet<AgentClient>();
   /** `claude agents` job removals in flight, by `${agent}\0${sessionId}`. */
   private readonly removingJobs = new Map<string, Promise<void>>();
+  /** Sessions Chat deleted, by `${agent}\0${sessionId}`. Their rows are
+   *  ignored: one can still arrive while the agent deletes it (a stopping job
+   *  writes its transcript), which would bring it back. */
+  private readonly deleted = new Set<string>();
+  /** Those of `deleted` the agent is deleting right now. */
+  private readonly deleting = new Set<string>();
   /** `${agent}\0${cwd}` of the session lists the agent is pushing changes
    *  for (`_session/list/subscribe`, one per directory). */
   private readonly watchedLists = new Set<string>();
@@ -873,7 +879,12 @@ export class AcpAgentHost implements Disposable {
               : [client.listSessions(undefined, true)],
           );
           this.unlisted.delete(agent.name);
-          const listed = new Map(lists.flat().map(i => [i.sessionId, i]));
+          const listed = new Map(
+            lists
+              .flat()
+              .filter(i => !this.wasDeleted(agent, i.sessionId))
+              .map(i => [i.sessionId, i]),
+          );
           // Forks first, so their sessions' summaries list them as chats.
           const sessions = [...listed.values()].filter(info => {
             // A fork already shown as a session of its own (listed before its
@@ -1091,6 +1102,9 @@ export class AcpAgentHost implements Disposable {
 
   private onListChanges(agent: AgentConfig, changes: SessionListChanges): void {
     for (const info of changes.sessions) {
+      if (this.wasDeleted(agent, info.sessionId)) {
+        continue;
+      }
       const live = this.byAcpSession.get(`${agent.name}\0${info.sessionId}`);
       if (live && !live.primary) {
         // A forked chat isn't a row of the session list.
@@ -1765,20 +1779,58 @@ export class AcpAgentHost implements Disposable {
     if (chat.listedStatus === undefined && !chat.origin && !chat.prompted) {
       return;
     }
+    const key = () => `${chat.agent.name}\0${chat.sessionId}`;
+    if (chat.sessionId) {
+      // A load can take long.
+      this.deleted.add(key());
+      this.deleting.add(key());
+    }
     // Not while it's still being created or loaded: the session id may only
     // be known then. The agent ends a loaded session itself.
     await chat.ready?.catch(() => undefined);
     if (!chat.sessionId) {
       return;
     }
+    this.deleted.add(key());
+    this.deleting.add(key());
     // The job first: one that stops writes to its transcript, which would
     // bring it back.
     await this.removeJob(chat);
+    await this.deleteAcpSession(this.connect(chat), chat.sessionId, key());
+  }
+
+  /** Whether Chat deleted `sessionId`. One whose row comes back once its
+   *  delete is over (a job's last write recreated the transcript) is deleted
+   *  again; otherwise it would be listed again after a host restart. */
+  private wasDeleted(agent: AgentConfig, sessionId: string): boolean {
+    const key = `${agent.name}\0${sessionId}`;
+    if (!this.deleted.has(key)) {
+      return false;
+    }
+    if (!this.deleting.has(key)) {
+      this.deleting.add(key);
+      void this.deleteAcpSession(
+        this.pool.connect(agent, this.defaultCwd()),
+        sessionId,
+        key,
+      );
+    }
+    return true;
+  }
+
+  private async deleteAcpSession(
+    client: Promise<AgentClient>,
+    sessionId: string,
+    key: string,
+  ): Promise<void> {
     try {
-      const client = await this.connect(chat);
-      await client.deleteSession(chat.sessionId);
+      await (await client).deleteSession(sessionId);
     } catch (err) {
+      // Not deleted after all: its next row shows it again.
+      this.deleted.delete(key);
       this.output.appendLine(`[delete] ${describeError(err)}`);
+    } finally {
+      this.deleting.delete(key);
     }
   }
 
