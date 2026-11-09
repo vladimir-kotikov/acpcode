@@ -173,6 +173,20 @@ const providerId = (agent: AgentConfig): string =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")}`;
 
+/** The option a plain approve or deny stands for: the one-time kind first,
+ *  so a confirmation without an explicit choice never grants "always" (Claude
+ *  lists "Yes, and use auto mode" first when leaving plan mode). */
+const plainChoice = (
+  options: PermissionOption[],
+  approved: boolean,
+): PermissionOption | undefined => {
+  const kind = approved ? "allow" : "reject";
+  return (
+    options.find(o => o.kind === `${kind}_once`) ??
+    options.find(o => o.kind.startsWith(kind))
+  );
+};
+
 function toolContent(
   content: ToolCallContent[] | null | undefined,
 ): ToolResultContent[] | undefined {
@@ -1557,11 +1571,9 @@ export class AcpAgentHost implements Disposable {
         if (!tracking || !permission) {
           return;
         }
-        const wantedKind = action.approved ? "allow" : "reject";
         const optionId =
           action.selectedOptionId ??
-          permission.options.find(o => o.kind.startsWith(wantedKind))
-            ?.optionId ??
+          plainChoice(permission.options, action.approved)?.optionId ??
           null;
         this.pool
           .get(binding.agent.name)

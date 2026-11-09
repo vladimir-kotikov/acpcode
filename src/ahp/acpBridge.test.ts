@@ -1,5 +1,10 @@
 // node --test src/ahp/acpBridge.test.ts
-import type { SessionInfo, SessionUpdate } from "@agentclientprotocol/sdk";
+import type {
+  PermissionOption,
+  SessionInfo,
+  SessionUpdate,
+  ToolCallUpdate,
+} from "@agentclientprotocol/sdk";
 import {
   ActionType,
   ChatSourceKind,
@@ -62,6 +67,16 @@ function setup(
   }) => void)[] = [];
   const replay = (sessionId: string, update: SessionUpdate) =>
     updateListeners.forEach(l => l({ sessionId, update }));
+  const permissionListeners: ((request: {
+    sessionId: string;
+    requestId: string;
+    toolCall: ToolCallUpdate;
+    options: PermissionOption[];
+  }) => void)[] = [];
+  /** The agent asking permission for a tool call. */
+  const askPermission = (
+    request: Parameters<(typeof permissionListeners)[number]>[0],
+  ) => permissionListeners.forEach(l => l(request));
   const disposable = { dispose: () => undefined };
   const client = {
     canSendImages: () => false,
@@ -72,7 +87,13 @@ function setup(
     },
     onSessionListChanges: () => disposable,
     onConnectionStateChanged: () => disposable,
-    onPermissionRequest: () => disposable,
+    onPermissionRequest: (l: (typeof permissionListeners)[number]) => {
+      permissionListeners.push(l);
+      return disposable;
+    },
+    resolvePermission: (...args: unknown[]) => {
+      calls.push({ method: "resolvePermission", args });
+    },
     subscribeSessionList: () => Promise.resolve("sub"),
     loadSession: (sessionId: string) => {
       replay(sessionId, {
@@ -169,6 +190,7 @@ function setup(
     listChanged,
     clientAction,
     replay,
+    askPermission,
   };
 }
 
@@ -738,4 +760,53 @@ test("deleting a session removes its job even if its transcript can't be", async
   await waitFor(() => logged.some(line => line.startsWith("[delete]")));
 
   assert.deepEqual(claude.calls(), ["stop abc12345", "rm abc12345"]);
+});
+
+test("a plain approve or deny picks the one-time option, never an always one", async () => {
+  const t = setup();
+  const draft = "ahp-session:/acp-claude/draft";
+  await (t.hooks.handlers.createSession as (p: unknown) => Promise<null>)({
+    channel: draft,
+    provider: "acp-claude",
+  });
+  const chat = (t.host.server.stateOf(draft) as SessionState).defaultChat!;
+  t.clientAction(chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId: "t1",
+    message: { text: "plan it" },
+  } as StateAction);
+  await settle();
+  // Claude's options for leaving plan mode, in its order, plus a reject
+  // "always" ahead of the one-time reject.
+  const options: PermissionOption[] = [
+    { kind: "allow_always", name: "Yes, and use auto mode", optionId: "auto" },
+    { kind: "allow_once", name: "Yes, and approve edits", optionId: "default" },
+    { kind: "reject_always", name: "No, and stop asking", optionId: "never" },
+    { kind: "reject_once", name: "No, keep planning", optionId: "plan" },
+  ];
+  const decide = (toolCallId: string, approved: boolean) => {
+    t.askPermission({
+      sessionId: "draft",
+      requestId: `perm-${toolCallId}`,
+      toolCall: { toolCallId, title: "Ready to code?" },
+      options,
+    });
+    t.clientAction(chat, {
+      type: ActionType.ChatToolCallConfirmed,
+      turnId: "t1",
+      toolCallId,
+      approved,
+    } as StateAction);
+  };
+
+  decide("approved", true);
+  decide("denied", false);
+
+  assert.deepEqual(
+    t.calls.filter(c => c.method === "resolvePermission").map(c => c.args),
+    [
+      ["perm-approved", "default"],
+      ["perm-denied", "plan"],
+    ],
+  );
 });
