@@ -9,6 +9,21 @@ import type {
   ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
 
+/** What to tell the user when a turn stopped short; a normal end or a
+ *  cancel needs no word. */
+export function stopNotice(stopReason: StopReason): string | undefined {
+  switch (stopReason) {
+    case "refusal":
+      return "Stopped: the agent refused to continue.";
+    case "max_tokens":
+      return "Stopped: the response reached the token limit.";
+    case "max_turn_requests":
+      return "Stopped: the turn reached its request limit.";
+    default:
+      return undefined;
+  }
+}
+
 export interface SessionViewMeta {
   agentName: string;
   sessionId: SessionId;

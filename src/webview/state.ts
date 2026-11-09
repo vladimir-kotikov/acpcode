@@ -1,8 +1,8 @@
 import { match } from "ts-pattern";
 
 import {
-  ContentBlock,
-  ToolKind,
+  type ContentBlock,
+  type ToolKind,
   type AvailableCommand,
   type PermissionOption,
   type SessionConfigOption,
@@ -12,9 +12,10 @@ import {
   type ToolCallUpdate,
   type UsageUpdate,
 } from "@agentclientprotocol/sdk";
-import type {
-  Attachment,
-  SessionViewMeta,
+import {
+  type Attachment,
+  type SessionViewMeta,
+  stopNotice,
 } from "../shared/sessionViewProtocol.ts";
 
 export type Action =
@@ -279,11 +280,23 @@ export const reduce = (state: ViewState, action: Action): ViewState =>
       busy: true,
       statusText: undefined,
     }))
-    .with({ type: "promptStopped" }, action =>
-      action.sessionId === state.meta?.sessionId
-        ? { ...state, busy: false, statusText: undefined }
-        : state,
-    )
+    .with({ type: "promptStopped" }, action => {
+      if (action.sessionId !== state.meta?.sessionId) {
+        return state;
+      }
+      const notice = stopNotice(action.stopReason);
+      return {
+        ...state,
+        busy: false,
+        statusText: undefined,
+        blocks: notice
+          ? [
+              ...state.blocks,
+              { type: "note", id: genId(), kind: "info", text: notice },
+            ]
+          : state.blocks,
+      };
+    })
     // The user bubble itself now always arrives through "sessionUpdate" (see
     // AgentClient.echoUserMessage) so every view showing this session gets
     // it, not just whichever one sent it — this action only clears the

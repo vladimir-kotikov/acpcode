@@ -51,7 +51,7 @@ import type { AgentConfig } from "../acp/agents/config.ts";
 import { agentProcessEnv } from "../acp/bridges.ts";
 import { removeClaudeJob } from "../acp/claudeJobs.ts";
 import type { Disposable, Output } from "../shared/events.ts";
-import type { Attachment } from "../shared/sessionViewProtocol.ts";
+import { type Attachment, stopNotice } from "../shared/sessionViewProtocol.ts";
 import { buildDiffText } from "../webview/diffText.ts";
 import {
   accepts,
@@ -1707,6 +1707,17 @@ export class AcpAgentHost implements Disposable {
         this.endTurn(binding, ActionType.ChatTurnCancelled, run.turnId);
       } else {
         this.promoteSteered(binding, run, true);
+        const notice = stopNotice(stopReason);
+        if (notice && binding.turnId === run.turnId) {
+          this.server.dispatch(binding.chatUri, {
+            type: ActionType.ChatResponsePart,
+            turnId: run.turnId,
+            part: {
+              kind: ResponsePartKind.SystemNotification,
+              content: notice,
+            },
+          });
+        }
         this.endTurn(binding, ActionType.ChatTurnComplete, run.turnId);
         completed = true;
       }

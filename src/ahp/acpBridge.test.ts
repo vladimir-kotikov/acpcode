@@ -1159,3 +1159,18 @@ test("a turn in a chat whose history didn't load resumes the session instead", a
   assert.equal(chat.activeTurn?.id, "t1");
   assert.deepEqual(chat.turns, []);
 });
+
+test("a turn the agent stops short says why", async () => {
+  const t = await withRunningTurn();
+
+  t.endPrompt("max_tokens");
+  await settle();
+
+  const [turn] = t.state().turns;
+  assert.deepEqual(turn.responseParts, [
+    {
+      kind: ResponsePartKind.SystemNotification,
+      content: "Stopped: the response reached the token limit.",
+    },
+  ]);
+});
