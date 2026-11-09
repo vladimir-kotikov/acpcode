@@ -20,4 +20,4 @@ prod: deps lint
 	cd $(STAGE) && npx @vscode/vsce package --no-dependencies -o ../../acpcode.vsix
 
 install:
-	code-insiders --install-extension acpcode.vsix
+	code-insiders --install-extension acpcode.vsix --force
