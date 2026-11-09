@@ -300,6 +300,128 @@ test("an inline image an agent can't take fails the prompt instead of vanishing"
   );
 });
 
+test("compaction updates reach frontends as the Compact conversation tool call", async t => {
+  // A live compaction streaming its summary, then one replayed terminal-first.
+  const entryPoint = fakeAgent(t, (message, send) => {
+    if (message.method !== "session/prompt") {
+      return;
+    }
+    const updates = [
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "c1",
+        status: "in_progress",
+      },
+      {
+        sessionUpdate: "compaction_summary_chunk",
+        compactionId: "c1",
+        content: { type: "text", text: "Sum" },
+      },
+      {
+        sessionUpdate: "compaction_summary_chunk",
+        compactionId: "c1",
+        content: { type: "text", text: "mary" },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "c1",
+        status: "completed",
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "c2",
+        status: "completed",
+        summary: [{ type: "text", text: "Old" }],
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "c3",
+        status: "in_progress",
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "c3",
+        status: "failed",
+        error: "too long",
+      },
+      // A duplicate terminal update: the error stays.
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "c3",
+        status: "failed",
+      },
+      // Cancelled halfway through its summary.
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "c4",
+        status: "in_progress",
+      },
+      {
+        sessionUpdate: "compaction_summary_chunk",
+        compactionId: "c4",
+        content: { type: "text", text: "Half" },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "c4",
+        status: "cancelled",
+      },
+    ];
+    for (const update of updates) {
+      send({ method: "session/update", params: { sessionId: "s1", update } });
+    }
+    send({ id: message.id, result: { stopReason: "end_turn" } });
+  });
+  const client = new AgentClient("/", {
+    append: () => undefined,
+    appendLine: () => undefined,
+    dispose: () => undefined,
+  });
+  t.after(() => client.dispose());
+  await client.connect(
+    {
+      name: "fake",
+      kind: "claude",
+      env: { CLAUDE_CODE_EXECUTABLE: "/bin/false" },
+    },
+    entryPoint,
+  );
+  const got: unknown[] = [];
+  client.onSessionUpdate(({ update }) => {
+    if (
+      update.sessionUpdate === "tool_call" ||
+      update.sessionUpdate === "tool_call_update"
+    ) {
+      const [part] = update.content ?? [];
+      const text =
+        part?.type === "content" && part.content.type === "text"
+          ? part.content.text
+          : undefined;
+      got.push([update.sessionUpdate, update.toolCallId, update.status, text]);
+      if (update.title) {
+        assert.equal(update.title, "Compact conversation");
+        assert.equal(update.kind, "think");
+      }
+    }
+  });
+  await client.prompt("s1", "hi");
+
+  assert.deepEqual(got, [
+    ["tool_call", "c1", "in_progress", undefined],
+    // Chunks carry nothing: the summary so far comes with the next update.
+    ["tool_call_update", "c1", undefined, undefined],
+    ["tool_call_update", "c1", undefined, undefined],
+    ["tool_call_update", "c1", "completed", "Summary"],
+    ["tool_call", "c2", "completed", "Old"],
+    ["tool_call", "c3", "in_progress", undefined],
+    ["tool_call_update", "c3", "failed", "Compaction failed: too long"],
+    ["tool_call_update", "c3", "failed", "Compaction failed: too long"],
+    ["tool_call", "c4", "in_progress", undefined],
+    ["tool_call_update", "c4", undefined, undefined],
+    ["tool_call_update", "c4", "failed", "Compaction cancelled"],
+  ]);
+});
+
 test("a replayed compaction summary shows as the Compact conversation tool call", async t => {
   const summary =
     "This session is being continued from a previous conversation that ran out of context.\n\nSummary: ...";

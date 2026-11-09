@@ -71,13 +71,15 @@ const RESET_COMMANDS: Partial<Record<AgentConfig["kind"], AvailableCommand>> = {
   },
 };
 
-/** Claude Code keeps a compaction's summary as a user message, and
- *  claude-agent-acp replays it as one: a huge prompt nobody typed. It's shown
- *  as the completed "Compact conversation" tool call a live compaction is
- *  instead. (ACP's `session.compaction` doesn't help: claude-agent-acp
- *  0.100.0 only recognises an older framing of the summary.) */
-// ponytail: the record's `isCompactSummary` doesn't reach ACP, so a prompt
-// pasted with this exact framing shows as a card too.
+/** The fallback for a compaction `compactionAsToolCall` never sees: Claude
+ *  Code keeps the summary as a user message, and a bridge that doesn't map it
+ *  to a compaction replays it as one, a huge prompt nobody typed. It's shown as
+ *  the completed "Compact conversation" tool call instead. claude-agent-acp
+ *  0.100.0 needs this: it only recognises an older framing of the summary.
+ *  Once it maps the summary, it no longer arrives as a user message. */
+// ponytail: the record's `isCompactSummary` doesn't reach ACP, so this
+// matches Claude Code's framing, and a prompt pasted with it shows as a card
+// too.
 const COMPACT_SUMMARY =
   /^\s*This session is being continued from a previous conversation[^\n]*\n[\s\S]*?^Summary:/m;
 function compactSummaryAsToolCall(update: SessionUpdate): SessionUpdate {
@@ -98,6 +100,71 @@ function compactSummaryAsToolCall(update: SessionUpdate): SessionUpdate {
     _meta: { claudeCode: { toolName: "compact" } },
   };
 }
+
+type CompactionEvent = Extract<
+  SessionUpdate,
+  { sessionUpdate: "compaction_update" | "compaction_summary_chunk" }
+>;
+
+/** ACP compaction updates turned into the "Compact conversation" tool call
+ *  claude-agent-acp sends to clients without `session.compaction`, so both
+ *  frontends show them as before. We advertise the capability for replay:
+ *  without it, a compacted session's history shows the summary as a huge user
+ *  message (see `compactSummaryAsToolCall` for bridges that still do).
+ *  `compactions` holds each one's summary so far and error, keyed by session
+ *  and compaction id; a missing key means a new compaction. */
+function compactionAsToolCall(
+  sessionId: SessionId,
+  update: CompactionEvent,
+  compactions: Map<string, Compaction>,
+): SessionUpdate {
+  const key = `${sessionId}\0${update.compactionId}`;
+  const known = compactions.get(key);
+  const compaction = known ?? { summary: "" };
+  compactions.set(key, compaction);
+  const card = {
+    sessionUpdate: known ? "tool_call_update" : "tool_call",
+    toolCallId: update.compactionId,
+    title: "Compact conversation",
+    kind: "think",
+    _meta: { claudeCode: { toolName: "compact" } },
+  } as const;
+  if (update.sessionUpdate === "compaction_summary_chunk") {
+    if (update.content.type === "text") {
+      compaction.summary += update.content.text;
+    }
+    // The summary so far is only sent with the next compaction update: each
+    // chunk resending all of it would grow quadratically.
+    return known
+      ? { sessionUpdate: "tool_call_update", toolCallId: update.compactionId }
+      : { ...card, status: "in_progress" };
+  }
+  // `summary` and `error` are patches: absent keeps, null clears.
+  if (update.summary !== undefined) {
+    compaction.summary = (update.summary ?? [])
+      .map(block => (block.type === "text" ? block.text : ""))
+      .join("");
+  }
+  if (update.error !== undefined) {
+    compaction.error = update.error ?? undefined;
+  }
+  const { status } = update;
+  const text =
+    status === "cancelled"
+      ? "Compaction cancelled"
+      : compaction.error
+        ? `Compaction failed: ${compaction.error}`
+        : compaction.summary;
+  return {
+    ...card,
+    // ACP tool calls can't be cancelled.
+    status:
+      status === "in_progress" || status === "completed" ? status : "failed",
+    content: text ? [{ type: "content", content: { type: "text", text } }] : [],
+  };
+}
+
+type Compaction = { summary: string; error?: string };
 
 export type ConnectionState = {
   state: "connecting" | "connected" | "error";
@@ -176,6 +243,9 @@ export class AgentClient implements Disposable {
   >();
   private readonly output: Output;
   private permissionCounter = 0;
+  /** See `compactionAsToolCall`. */
+  // ponytail: kept for the connection's lifetime, a few KB per compaction.
+  private readonly compactions = new Map<string, Compaction>();
   private readonly cwd: string;
   // Advertised via InitializeResponse._meta.steering.supported (the agreed
   // ACP steering wire protocol, "_session/steering" — not yet a built-in
@@ -295,9 +365,9 @@ export class AgentClient implements Disposable {
         ctx => this.sessionListChangesEmitter.fire(ctx.params),
       )
       .onNotification(methods.client.session.update, ctx => {
-        const update = ctx.params.update;
+        const { sessionId, update } = ctx.params;
         this.sessionUpdateEmitter.fire({
-          sessionId: ctx.params.sessionId,
+          sessionId,
           update:
             update.sessionUpdate === "available_commands_update"
               ? {
@@ -306,9 +376,12 @@ export class AgentClient implements Disposable {
                     update.availableCommands,
                   ),
                 }
-              : this.kind === "claude"
-                ? compactSummaryAsToolCall(update)
-                : update,
+              : update.sessionUpdate === "compaction_update" ||
+                  update.sessionUpdate === "compaction_summary_chunk"
+                ? compactionAsToolCall(sessionId, update, this.compactions)
+                : this.kind === "claude"
+                  ? compactSummaryAsToolCall(update)
+                  : update,
         });
       });
 
@@ -323,6 +396,8 @@ export class AgentClient implements Disposable {
         // silently drops connection/retry status (e.g. "Retrying Claude,
         // attempt 2 of 10") instead of sending it as a session_info_update.
         clientCapabilities: {
+          // See `compactionAsToolCall`.
+          session: { compaction: {} },
           _meta: {
             jetbrains: {
               air: {
