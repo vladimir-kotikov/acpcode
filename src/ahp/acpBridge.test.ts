@@ -1378,3 +1378,81 @@ test("a shell command shows as a terminal once its streamed input has the comman
   assert.deepEqual(toolCall("b1")!._meta, { toolKind: "terminal" });
   assert.equal(toolCall("d1")!._meta, undefined);
 });
+
+test("a shell command is titled with its input's description, not its command line", async () => {
+  const t = await withRunningTurn();
+  const call = (id: string) =>
+    t
+      .state()
+      .activeTurn?.responseParts.map(
+        p =>
+          (
+            p as {
+              toolCall: {
+                toolCallId: string;
+                invocationMessage?: string;
+                intention?: string;
+                confirmationTitle?: string;
+                pastTenseMessage?: string;
+              };
+            }
+          ).toolCall,
+      )
+      .find(c => c.toolCallId === id);
+  const titleOf = (id: string) => call(id)?.invocationMessage;
+
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "b1",
+    title: "Terminal",
+    kind: "execute",
+    rawInput: {},
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b1",
+    title: "npm test -- --long --flags",
+    rawInput: {
+      command: "npm test -- --long --flags",
+      description: "Run the tests",
+    },
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b1",
+    title: "npm test -- --long --flags",
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "i1",
+    title: "Create an issue",
+    kind: "other",
+    rawInput: { description: "A long issue body" },
+  });
+  t.askPermission({
+    sessionId: "draft",
+    requestId: "perm-p1",
+    toolCall: {
+      toolCallId: "p1",
+      title: "rm -rf build",
+      kind: "execute",
+      rawInput: { command: "rm -rf build", description: "Remove the build" },
+    },
+    options: [{ optionId: "ok", name: "Allow", kind: "allow_once" }],
+  });
+  const asked = { ...call("p1") };
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b1",
+    status: "completed",
+  });
+
+  assert.equal(titleOf("b1"), "Run the tests");
+  assert.equal(titleOf("i1"), "Create an issue");
+  assert.equal(asked.confirmationTitle, "Remove the build");
+  // What Chat's terminal card is labelled with.
+  assert.equal(asked.intention, "Remove the build");
+  assert.equal(call("b1")?.intention, "Run the tests");
+  assert.equal(call("i1")?.intention, undefined);
+  assert.equal(call("b1")?.pastTenseMessage, "Run the tests");
+});

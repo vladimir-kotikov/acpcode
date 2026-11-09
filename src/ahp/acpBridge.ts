@@ -90,6 +90,8 @@ interface ToolCallTracking {
   title: string;
   phase: "running" | "pending" | "done";
   kind?: ToolKind;
+  /** The title is the input's short `description`, not the agent's. */
+  described?: boolean;
   permission?: { requestId: string; options: PermissionOption[] };
   // ACP's completing update usually omits content, and an absent `content`
   // in `toolCallComplete` would wipe what was shown while it ran.
@@ -220,6 +222,24 @@ const inputFields = (
           typeof (rawInput as { command?: unknown } | null)?.command ===
             "string" && { _meta: { toolKind: "terminal" } }),
       };
+
+/** Takes a call's new title and kind. Claude titles a shell command with
+ *  the whole command line, which Chat's terminal card shows anyway; its
+ *  input's `description` is the short one, and sticks. */
+function retitle(tracking: ToolCallTracking, call: ToolCallUpdate): void {
+  tracking.kind = call.kind ?? tracking.kind;
+  const description =
+    tracking.kind === "execute"
+      ? (call.rawInput as { description?: unknown } | null | undefined)
+          ?.description
+      : undefined;
+  if (typeof description === "string" && description) {
+    tracking.title = description;
+    tracking.described = true;
+  } else if (call.title && !tracking.described) {
+    tracking.title = call.title;
+  }
+}
 
 /** A failed tool call's own error: its text content, else its raw output's
  *  text — capped. */
@@ -2119,15 +2139,16 @@ export class AcpAgentHost implements Disposable {
     turnId: string,
     call: ToolCallUpdate,
   ): void {
-    const title = call.title ?? "Tool call";
     binding.markdownPartId = undefined;
     binding.reasoningPartId = undefined;
-    binding.toolCalls.set(call.toolCallId, {
+    const tracking: ToolCallTracking = {
       turnId,
-      title,
+      title: "Tool call",
       phase: "running",
-      kind: call.kind ?? undefined,
-    });
+    };
+    retitle(tracking, call);
+    const { title } = tracking;
+    binding.toolCalls.set(call.toolCallId, tracking);
     this.server.dispatch(binding.chatUri, {
       type: ActionType.ChatToolCallStart,
       turnId,
@@ -2140,6 +2161,7 @@ export class AcpAgentHost implements Disposable {
       turnId,
       toolCallId: call.toolCallId,
       invocationMessage: title,
+      ...(tracking.described && { intention: title }),
       ...inputFields(call.kind ?? undefined, call.rawInput),
       confirmed: ToolCallConfirmationReason.NotNeeded,
     });
@@ -2238,9 +2260,7 @@ export class AcpAgentHost implements Disposable {
     if (!tracking || tracking.phase === "done") {
       return;
     }
-    if (update.title) {
-      tracking.title = update.title;
-    }
+    retitle(tracking, update);
     if (update.status === "completed" || update.status === "failed") {
       tracking.phase = "done";
       this.server.dispatch(binding.chatUri, {
@@ -2265,7 +2285,6 @@ export class AcpAgentHost implements Disposable {
     if (tracking.phase !== "running") {
       return;
     }
-    tracking.kind = update.kind ?? tracking.kind;
     // Agents that stream a tool's input send it whole in a later update.
     if (update.title || update.rawInput !== undefined) {
       this.server.dispatch(binding.chatUri, {
@@ -2273,6 +2292,7 @@ export class AcpAgentHost implements Disposable {
         turnId,
         toolCallId: update.toolCallId,
         invocationMessage: tracking.title,
+        ...(tracking.described && { intention: tracking.title }),
         ...inputFields(tracking.kind, update.rawInput),
         confirmed: ToolCallConfirmationReason.NotNeeded,
       });
@@ -2304,10 +2324,7 @@ export class AcpAgentHost implements Disposable {
       this.startToolCall(binding, turnId, toolCall);
     }
     const tracking = binding.toolCalls.get(toolCall.toolCallId)!;
-    if (toolCall.title) {
-      tracking.title = toolCall.title;
-    }
-    tracking.kind = toolCall.kind ?? tracking.kind;
+    retitle(tracking, toolCall);
     tracking.phase = "pending";
     tracking.permission = {
       requestId: request.requestId,
@@ -2319,6 +2336,7 @@ export class AcpAgentHost implements Disposable {
       toolCallId: toolCall.toolCallId,
       invocationMessage: tracking.title,
       confirmationTitle: tracking.title,
+      ...(tracking.described && { intention: tracking.title }),
       ...inputFields(tracking.kind, toolCall.rawInput),
       options: request.options.map(option => ({
         id: option.optionId,
