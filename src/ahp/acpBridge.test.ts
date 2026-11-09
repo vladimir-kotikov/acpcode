@@ -138,7 +138,10 @@ function setup(
       calls.push({ method: "forkSession", args });
       return Promise.resolve({ sessionId: "fork-1" });
     },
-    listSessions: () => Promise.resolve(listed),
+    listSessions: (...args: unknown[]) => {
+      calls.push({ method: "listSessions", args });
+      return Promise.resolve(listed);
+    },
     resumeSession: (...args: unknown[]) => {
       calls.push({ method: "resumeSession", args });
       return Promise.resolve();
@@ -1493,4 +1496,29 @@ test("a shell command is titled with its input's description, not its command li
   assert.equal(call("b1")?.intention, "Run the tests");
   assert.equal(call("i1")?.intention, undefined);
   assert.equal(call("b1")?.pastTenseMessage, "Run the tests");
+});
+
+test("a chat Chat resubscribes to before any listing is restored from the agent's", async () => {
+  const { host, hooks, listed, calls } = setup();
+  listed.push(row("s1", "Root"), forkRow("f1", "s1"));
+
+  await Promise.all([
+    hooks.materialize("ahp-chat:/acp-claude/f1"),
+    hooks.materialize("ahp-session:/acp-claude/s1"),
+  ]);
+  await hooks.materialize("ahp-chat:/acp-nope/s1");
+  await hooks.materialize("ahp-chat:/acp-claude/gone");
+  await hooks.materialize("ahp-chat:/acp-claude/gone");
+
+  assert.equal(host.server.has("ahp-chat:/acp-claude/f1"), true);
+  // A fork's session is its parent's.
+  assert.equal(host.server.has(SESSION), true);
+  assert.deepEqual(
+    calls.filter(c => c.method === "loadSession").map(c => c.args[0]),
+    ["f1", "s1"],
+  );
+  assert.equal(host.server.has("ahp-chat:/acp-nope/s1"), false);
+  assert.equal(host.server.has("ahp-chat:/acp-claude/gone"), false);
+  // Once for both chats, and once for the one it doesn't list.
+  assert.equal(calls.filter(c => c.method === "listSessions").length, 2);
 });

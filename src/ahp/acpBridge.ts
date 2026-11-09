@@ -400,6 +400,9 @@ export class AcpAgentHost implements Disposable {
   private readonly directories: Record<string, string[]>;
   // Agents whose last listing failed; see `bridgesChanged()`.
   private readonly unlisted = new Set<string>();
+  /** Listings run to restore the sessions Chat resubscribes to, by agent. */
+  private readonly restoring = new Map<string, Promise<void>>();
+  private readonly unrestorable = new Set<string>();
 
   constructor(
     pool: AgentConnectionPool,
@@ -1362,6 +1365,9 @@ export class AcpAgentHost implements Disposable {
    *  before either snapshot is taken. Unknown URIs (incl. VS Code's
    *  `<provider>:/untitled-…` drafts) are left alone and answer NotFound. */
   private async materialize(channel: string): Promise<void> {
+    if (!this.bindings.has(channel)) {
+      await this.restore(channel);
+    }
     const binding = this.bindings.get(channel);
     if (!binding) {
       return;
@@ -1384,6 +1390,43 @@ export class AcpAgentHost implements Disposable {
     if (channel === binding.chatUri) {
       await loaded;
     }
+  }
+
+  /** After a host restart, Chat resubscribes to the sessions it shows before
+   *  it lists them again. Their URIs name the agent, whose listing binds them
+   *  as it would have, directories and forks included. A URI the listing
+   *  doesn't bind (a deleted session, one outside the workspace) isn't
+   *  listed for again. */
+  private restore(channel: string): Promise<void> {
+    const provider = /^ahp-(?:chat|session):\/([^/]+)\//.exec(channel)?.[1];
+    const agents = this.env.agents().filter(a => providerId(a) === provider);
+    if (agents.length !== 1 || this.unrestorable.has(channel)) {
+      return Promise.resolve(); // none, or names that collide
+    }
+    const [agent] = agents;
+    let listing = this.restoring.get(agent.name);
+    if (!listing) {
+      // Chat missed its sessions when the host last failed to list them.
+      const missed = this.unlisted.has(agent.name);
+      listing = this.listAgents([agent])
+        .then(summaries => {
+          if (missed && !this.unlisted.has(agent.name)) {
+            for (const summary of summaries) {
+              this.server.notify("root/sessionAdded", {
+                channel: ROOT_CHANNEL,
+                summary,
+              });
+            }
+          }
+        })
+        .finally(() => this.restoring.delete(agent.name));
+      this.restoring.set(agent.name, listing);
+    }
+    return listing.then(() => {
+      if (!this.bindings.has(channel)) {
+        this.unrestorable.add(channel);
+      }
+    });
   }
 
   /** `ready`, or else the session loaded — resumed instead, without its
