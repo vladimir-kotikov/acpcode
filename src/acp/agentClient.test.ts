@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentClient, type SteeringResponse } from "./agentClient.ts";
+import { fakeAgent } from "./fakeAgent.test-util.ts";
 
 function clientForSteering(response: SteeringResponse) {
   const client = new AgentClient("/workspace", {
@@ -72,4 +73,79 @@ test("failed steering does not echo a message the agent did not accept", async (
 
   assert.deepEqual(response, { outcome: "failed" });
   assert.deepEqual(updates, []);
+});
+
+test("cancelling a prompt answers its session's pending permission request as cancelled", async t => {
+  // Asks permission on every prompt, then reports the answer it got as a
+  // message chunk and ends the turn.
+  const entryPoint = fakeAgent(t, (message, send) => {
+    if (message.method === "session/prompt") {
+      send({
+        id: `permission-${message.id}`,
+        method: "session/request_permission",
+        params: {
+          sessionId: message.params.sessionId,
+          toolCall: { toolCallId: "t1" },
+          options: [{ optionId: "allow", kind: "allow_once", name: "Allow" }],
+        },
+      });
+    } else if (String(message.id).startsWith("permission-")) {
+      send({
+        method: "session/update",
+        params: {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: JSON.stringify(message.result.outcome),
+            },
+          },
+        },
+      });
+      send({
+        id: Number(String(message.id).slice("permission-".length)),
+        result: { stopReason: "cancelled" },
+      });
+    }
+  });
+  const client = new AgentClient("/", {
+    append: () => undefined,
+    appendLine: () => undefined,
+    dispose: () => undefined,
+  });
+  t.after(() => client.dispose());
+  await client.connect(
+    {
+      name: "fake",
+      kind: "claude",
+      env: { CLAUDE_CODE_EXECUTABLE: "/bin/false" },
+    },
+    entryPoint,
+  );
+  const answers: string[] = [];
+  client.onSessionUpdate(({ update }) => {
+    if (
+      update.sessionUpdate === "agent_message_chunk" &&
+      update.content.type === "text"
+    ) {
+      answers.push(update.content.text);
+    }
+  });
+  const resolved: string[] = [];
+  client.onPermissionResolved(({ requestId }) => resolved.push(requestId));
+  const asked = new Promise<{ requestId: string }>(resolve =>
+    client.onPermissionRequest(resolve),
+  );
+
+  const turn = client.prompt("s1", "hi");
+  const { requestId } = await asked;
+  client.cancelPrompt("s2");
+  const resolvedByOtherSession = [...resolved];
+  client.cancelPrompt("s1");
+
+  assert.deepEqual(resolvedByOtherSession, []);
+  assert.deepEqual(resolved, [requestId]);
+  assert.equal((await turn).stopReason, "cancelled");
+  assert.deepEqual(answers, [JSON.stringify({ outcome: "cancelled" })]);
 });

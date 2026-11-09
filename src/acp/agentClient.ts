@@ -137,7 +137,10 @@ export class AgentClient implements Disposable {
   private kind?: AgentConfig["kind"];
   private readonly pendingPermissions = new Map<
     string,
-    (response: RequestPermissionResponse) => void
+    {
+      sessionId: SessionId;
+      resolve: (response: RequestPermissionResponse) => void;
+    }
   >();
   private readonly output: Output;
   private permissionCounter = 0;
@@ -233,7 +236,10 @@ export class AgentClient implements Disposable {
       .onRequest(methods.client.session.requestPermission, ctx => {
         return new Promise<RequestPermissionResponse>(resolve => {
           const requestId = `perm-${++this.permissionCounter}`;
-          this.pendingPermissions.set(requestId, resolve);
+          this.pendingPermissions.set(requestId, {
+            sessionId: ctx.params.sessionId,
+            resolve,
+          });
           ctx.signal.addEventListener("abort", () => {
             if (this.pendingPermissions.delete(requestId)) {
               resolve({ outcome: { outcome: "cancelled" } });
@@ -694,6 +700,13 @@ export class AgentClient implements Disposable {
     void this.requireAgent().notify(methods.agent.session.cancel, {
       sessionId,
     });
+    // ACP prompt-turn: the client MUST answer the session's pending
+    // permission requests with `cancelled` once it has cancelled the turn.
+    for (const [requestId, pending] of this.pendingPermissions) {
+      if (pending.sessionId === sessionId) {
+        this.resolvePermission(requestId, null);
+      }
+    }
   }
 
   async setConfigOption(
@@ -714,12 +727,12 @@ export class AgentClient implements Disposable {
   }
 
   resolvePermission(requestId: string, optionId: string | null): void {
-    const resolve = this.pendingPermissions.get(requestId);
-    if (!resolve) {
+    const pending = this.pendingPermissions.get(requestId);
+    if (!pending) {
       return;
     }
     this.pendingPermissions.delete(requestId);
-    resolve({
+    pending.resolve({
       outcome: optionId
         ? { outcome: "selected", optionId }
         : { outcome: "cancelled" },
@@ -738,7 +751,7 @@ export class AgentClient implements Disposable {
       this.child = undefined;
     }
     this.agent = undefined;
-    for (const resolve of this.pendingPermissions.values()) {
+    for (const { resolve } of this.pendingPermissions.values()) {
       resolve({ outcome: { outcome: "cancelled" } });
     }
     this.pendingPermissions.clear();
