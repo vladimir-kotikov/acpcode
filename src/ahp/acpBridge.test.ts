@@ -8,6 +8,7 @@ import type {
 import {
   ActionType,
   AhpErrorCodes,
+  ChatInteractivity,
   ChatSourceKind,
   PendingMessageKind,
   ResponsePartKind,
@@ -1535,6 +1536,7 @@ test("a load the agent never answers ends its replayed turn and keeps the queue"
   listChanged({ sessions: [row("s1")] });
 
   const loading = hooks.materialize(CHAT);
+  await waitFor(() => host.server.has(CHAT));
   await settle();
   clientAction(CHAT, {
     type: ActionType.ChatPendingMessageSet,
@@ -1589,7 +1591,11 @@ test("a load's history settles once the agent says it has replayed, not when it 
   t.listChanged({ sessions: [row("s1")] });
 
   const loading = t.hooks.materialize(CHAT);
-  await settle();
+  await waitFor(
+    () =>
+      (t.host.server.stateOf(CHAT) as ChatState | undefined)?.turns.length ===
+      1,
+  );
   const state = t.host.server.stateOf(CHAT) as ChatState;
 
   assert.equal(state.activeTurn, undefined);
@@ -1618,4 +1624,137 @@ test("a load retried after one timed out replays the history once", async () => 
     (host.server.stateOf(CHAT) as ChatState).turns.map(t => t.message.text),
     ["hello"],
   );
+});
+
+test("a chat whose session runs in a background job opens read-only with its history", async ctx => {
+  const claude = fakeClaude(ctx);
+  claude.running("s1");
+  const { host, hooks, listChanged, clientAction } = setup(
+    {},
+    {
+      claudeEnv: claude.env,
+      afterReplay: () =>
+        Promise.reject(new Error("That session is running in the background")),
+    },
+  );
+  listChanged({ sessions: [row("s1")] });
+
+  await hooks.materialize(CHAT);
+  const state = host.server.stateOf(CHAT) as ChatState;
+  const rejection = clientAction(CHAT, {
+    type: ActionType.ChatTurnStarted,
+    turnId: "t1",
+    startedAt: new Date().toISOString(),
+    message: { text: "hi" },
+  } as StateAction);
+
+  assert.equal(state.interactivity, ChatInteractivity.ReadOnly);
+  assert.deepEqual(
+    state.turns.map(t => t.message.text),
+    ["hello"],
+  );
+  assert.match(rejection ?? "", /running in background job s1/);
+});
+
+test("a watched chat follows its session, and opens as Chat's own once its owner is gone", async ctx => {
+  const claude = fakeClaude(ctx);
+  const gone = claude.running("s1", "interactive");
+  const { host, hooks, listChanged, calls } = setup(
+    {},
+    { claudeEnv: claude.env },
+  );
+  host.server.isSubscribed = () => true;
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+
+  // A turn there ends, and the session's row says so.
+  listChanged({ sessions: [{ ...row("s1"), updatedAt: "later" }] });
+  await waitFor(
+    () => calls.filter(c => c.method === "loadSession").length === 2,
+  );
+  assert.deepEqual(
+    (host.server.stateOf(CHAT) as ChatState).turns.map(t => t.message.text),
+    ["hello"],
+  );
+  gone();
+  hooks.unsubscribed?.(CHAT);
+  await hooks.materialize(CHAT);
+
+  assert.equal(
+    (host.server.stateOf(CHAT) as ChatState).interactivity,
+    undefined,
+  );
+  assert.deepEqual(
+    (host.server.stateOf(CHAT) as ChatState).turns.map(t => t.message.text),
+    ["hello"],
+  );
+});
+
+test("a watched chat subscribed to with its session at once keeps its history", async ctx => {
+  const claude = fakeClaude(ctx);
+  claude.running("s1");
+  const { host, hooks, listChanged } = setup({}, { claudeEnv: claude.env });
+  listChanged({ sessions: [row("s1")] });
+
+  await Promise.all([hooks.materialize(SESSION), hooks.materialize(CHAT)]);
+
+  assert.deepEqual(
+    (host.server.stateOf(CHAT) as ChatState).turns.map(t => t.message.text),
+    ["hello"],
+  );
+});
+
+test("a watched chat's session changing while it loads loads it once more after", async ctx => {
+  const claude = fakeClaude(ctx);
+  claude.running("s1");
+  let finish: (() => void) | undefined;
+  const { host, hooks, listChanged, calls } = setup(
+    {},
+    {
+      claudeEnv: claude.env,
+      afterReplay: () =>
+        finish
+          ? Promise.resolve(undefined)
+          : new Promise<undefined>(resolve => {
+              finish = () => resolve(undefined);
+            }),
+    },
+  );
+  host.server.isSubscribed = () => true;
+  listChanged({ sessions: [row("s1")] });
+  const loading = hooks.materialize(CHAT);
+  await waitFor(() => !!finish);
+  const loads = () => calls.filter(c => c.method === "loadSession").length;
+
+  listChanged({ sessions: [{ ...row("s1"), updatedAt: "later" }] });
+  listChanged({ sessions: [{ ...row("s1"), updatedAt: "later still" }] });
+  const whileLoading = loads();
+  finish!();
+  await loading;
+  await waitFor(() => loads() === 2);
+  await settle();
+
+  assert.equal(whileLoading, 1);
+  assert.equal(loads(), 2);
+  assert.deepEqual(
+    (host.server.stateOf(CHAT) as ChatState).turns.map(t => t.message.text),
+    ["hello"],
+  );
+});
+
+test("a watched chat nobody shows any more is forgotten, not loaded again", async ctx => {
+  const claude = fakeClaude(ctx);
+  claude.running("s1");
+  const { host, hooks, listChanged, calls } = setup(
+    {},
+    { claudeEnv: claude.env },
+  );
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+
+  listChanged({ sessions: [{ ...row("s1"), updatedAt: "later" }] });
+  await settle();
+
+  assert.equal(calls.filter(c => c.method === "loadSession").length, 1);
+  assert.equal(host.server.has(CHAT), false);
 });

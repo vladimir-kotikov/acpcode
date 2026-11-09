@@ -22,6 +22,22 @@ export function fakeClaude(t: TestContext, failOn?: "stop" | "rm") {
   );
   return {
     env: { CLAUDE_CONFIG_DIR: dir, CLAUDE_CODE_EXECUTABLE: cli },
+    /** Registers this process as a `claude` running `sessionId`, as a
+     *  terminal or background one does; answers how to unregister it. */
+    running(sessionId: string, kind: "bg" | "interactive" = "bg") {
+      const file = path.join(dir, "sessions", `${process.pid}.json`);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          pid: process.pid,
+          sessionId,
+          kind,
+          entrypoint: "cli",
+        }),
+      );
+      return () => fs.rmSync(file);
+    },
     /** Adds a job dir whose `state.json` is `state`. */
     job(id: string, state: string) {
       fs.mkdirSync(path.join(dir, "jobs", id), { recursive: true });

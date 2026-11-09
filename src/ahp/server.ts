@@ -77,6 +77,8 @@ export interface AhpServerHooks {
     channel: string,
     action: StateAction,
   ) => string | undefined;
+  /** Called when a channel's last subscriber unsubscribes from it. */
+  readonly unsubscribed?: (channel: string) => void;
   /** Characters that make the client ask for `completions` while typing. */
   readonly completionTriggerCharacters?: string[];
 }
@@ -150,6 +152,10 @@ export class AhpServer implements Disposable {
 
   get connectionCount(): number {
     return this.connections.size;
+  }
+
+  isSubscribed(channel: string): boolean {
+    return !!this.subscribers.get(channel)?.size;
   }
 
   stateOf(channel: string): ChannelState | undefined {
@@ -382,9 +388,7 @@ export class AhpServer implements Disposable {
         return { snapshot };
       }
       case "unsubscribe":
-        this.subscribers
-          .get((params as { channel: string }).channel)
-          ?.delete(connection);
+        this.leave((params as { channel: string }).channel, connection);
         return null;
       case "dispatchAction":
         this.dispatchFromClient(params, connection);
@@ -403,11 +407,20 @@ export class AhpServer implements Disposable {
     return handler(params);
   }
 
+  private leave(channel: string, connection: AhpConnection): void {
+    const set = this.subscribers.get(channel);
+    if (set?.delete(connection) && !set.size) {
+      this.hooks.unsubscribed?.(channel);
+    }
+  }
+
   private accept(ws: WebSocket): void {
     const connection: AhpConnection = { ws };
     this.connections.add(connection);
     ws.on("close", () => {
       this.connections.delete(connection);
+      // Not leaving them: the client reconnects to them, with the state
+      // it had.
       for (const set of this.subscribers.values()) {
         set.delete(connection);
       }

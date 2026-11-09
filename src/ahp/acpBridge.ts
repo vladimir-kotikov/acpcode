@@ -12,6 +12,7 @@ import {
   ActionType,
   AhpErrorCodes,
   ChatOriginKind,
+  ChatInteractivity,
   ChatSourceKind,
   ConfirmationOptionKind,
   ContentEncoding,
@@ -53,7 +54,7 @@ import {
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
 import { agentProcessEnv } from "../acp/bridges.ts";
-import { removeClaudeJob } from "../acp/claudeJobs.ts";
+import { removeClaudeJob, sessionOwner } from "../acp/claudeJobs.ts";
 import type { Disposable, Output } from "../shared/events.ts";
 import { type Attachment, stopNotice } from "../shared/sessionViewProtocol.ts";
 import {
@@ -138,6 +139,14 @@ interface Binding {
    *  this host made it. Chat opens a session on its most recently modified
    *  chat. */
   modifiedAt: string;
+  /** What else runs the session, e.g. "a terminal": Chat only watches it
+   *  then. Settled when Chat opens the chat. */
+  owner?: string;
+  /** Its history is loading; `stale` asks for another load once it's done,
+   *  `forgetLater` for `unsubscribed` then. */
+  loading?: boolean;
+  stale?: boolean;
+  forgetLater?: boolean;
   /** The directory set changed during a turn; applied when it ends. */
   directoriesDirty?: boolean;
   title: string;
@@ -475,6 +484,7 @@ export class AcpAgentHost implements Disposable {
           this.onClientAction(channel, action),
         rejectClientAction: (channel, action) =>
           this.rejectClientAction(channel, action),
+        unsubscribed: channel => this.unsubscribed(channel),
       },
       output,
       () => this.defaultCwd() && pathToFileURL(this.defaultCwd()).href,
@@ -689,6 +699,15 @@ export class AcpAgentHost implements Disposable {
     action: StateAction,
   ): string | undefined {
     const binding = this.bindings.get(channel);
+    if (
+      binding?.owner &&
+      (action.type === ActionType.ChatTurnStarted ||
+        action.type === ActionType.ChatPendingMessageSet ||
+        action.type === ActionType.ChatTruncated ||
+        action.type === ActionType.SessionConfigChanged)
+    ) {
+      return `This session is running in ${binding.owner}. Continue it there, or stop it and open this chat again.`;
+    }
     if (
       binding &&
       action.type === ActionType.ChatIsArchivedChanged &&
@@ -1076,6 +1095,7 @@ export class AcpAgentHost implements Disposable {
       if (live && !live.primary) {
         // A forked chat isn't a row of the session list.
         this.mirrorChatRow(live, rowStatus(info));
+        this.refreshWatched(live);
         continue;
       }
       const forkOf = live ? undefined : this.forkRoot(agent, info, new Map());
@@ -1101,6 +1121,7 @@ export class AcpAgentHost implements Disposable {
           ...changed
         } = summary;
         this.mirrorRow(binding, summary);
+        this.refreshWatched(binding);
         this.server.notify("root/sessionSummaryChanged", {
           channel: ROOT_CHANNEL,
           session: binding.sessionUri,
@@ -1167,6 +1188,7 @@ export class AcpAgentHost implements Disposable {
         ? SessionStatus.Idle | (status & SessionStatus.IsArchived)
         : status,
       modifiedAt: chat.modifiedAt,
+      ...(chat.owner && { interactivity: ChatInteractivity.ReadOnly }),
       ...(chat.origin && {
         origin: { kind: ChatOriginKind.Fork, ...chat.origin },
       }),
@@ -1242,6 +1264,7 @@ export class AcpAgentHost implements Disposable {
       status: SessionStatus.Idle,
       modifiedAt: binding.modifiedAt,
       turns: [],
+      ...(binding.owner && { interactivity: ChatInteractivity.ReadOnly }),
       ...(binding.origin && {
         origin: { kind: ChatOriginKind.Fork, ...binding.origin },
       }),
@@ -1393,7 +1416,19 @@ export class AcpAgentHost implements Disposable {
       return;
     }
     if (!this.server.has(binding.chatUri)) {
-      this.server.create(binding.chatUri, "chat", this.chatState(binding));
+      const owner = await this.ownerOf(binding);
+      // Another subscribe may have made it meanwhile.
+      if (!this.server.has(binding.chatUri)) {
+        binding.owner = owner;
+        this.server.create(binding.chatUri, "chat", this.chatState(binding));
+        if (owner && this.server.has(binding.sessionUri)) {
+          this.server.dispatch(binding.sessionUri, {
+            type: ActionType.SessionChatUpdated,
+            chat: binding.chatUri,
+            changes: { interactivity: ChatInteractivity.ReadOnly },
+          });
+        }
+      }
     }
     const loaded = this.ensureLoaded(binding);
     // The session opens even if its history can't be loaded; subscribing to
@@ -1409,6 +1444,84 @@ export class AcpAgentHost implements Disposable {
     }
     if (channel === binding.chatUri) {
       await loaded;
+    }
+  }
+
+  /** What else runs a chat's ACP session, per `sessionOwner`. Only Claude
+   *  sessions have one. */
+  private ownerOf(binding: Binding): Promise<string | undefined> {
+    if (binding.agent.kind !== "claude" || !binding.sessionId) {
+      return Promise.resolve(undefined);
+    }
+    return sessionOwner(
+      agentProcessEnv(binding.agent),
+      binding.sessionId,
+    ).catch(err => {
+      this.output.appendLine(`[owner] ${describeError(err)}`);
+      return undefined;
+    });
+  }
+
+  /** Chat stopped showing a chat that something else runs: it's forgotten
+   *  here, so opening it again shows it as it is then — its own, if its
+   *  owner is gone. Chat can't be told a chat stopped being read-only. */
+  private unsubscribed(channel: string): void {
+    const binding = this.bindings.get(channel);
+    if (!binding?.owner || channel !== binding.chatUri) {
+      return;
+    }
+    if (binding.loading) {
+      binding.forgetLater = true;
+      return;
+    }
+    this.server.delete(binding.chatUri);
+    binding.owner = undefined;
+    binding.ready = undefined;
+    binding.toolCalls.clear();
+    binding.turnMessages.clear();
+    if (this.server.has(binding.sessionUri)) {
+      this.server.dispatch(binding.sessionUri, {
+        type: ActionType.SessionChatUpdated,
+        chat: binding.chatUri,
+        changes: { interactivity: ChatInteractivity.Full },
+      });
+    }
+  }
+
+  /** A chat something else runs follows it: its history loads again as the
+   *  session's row changes, e.g. as a turn there ends. */
+  private refreshWatched(binding: Binding): void {
+    if (!binding.owner || !this.server.has(binding.chatUri)) {
+      return;
+    }
+    if (!this.server.isSubscribed(binding.chatUri)) {
+      // Not shown: not loaded again, which starts `claude` on it, until it is.
+      this.unsubscribed(binding.chatUri);
+      return;
+    }
+    if (binding.loading) {
+      binding.stale = true; // once this load is done
+      return;
+    }
+    binding.ready = undefined;
+    this.ensureLoaded(binding).catch(err =>
+      this.output.appendLine(`[refresh] ${describeError(err)}`),
+    );
+  }
+
+  /** A load is done, however it went: what waited for it goes ahead. */
+  private loadSettled(binding: Binding): void {
+    binding.loading = false;
+    if (binding.forgetLater) {
+      binding.forgetLater = false;
+      if (!this.server.isSubscribed(binding.chatUri)) {
+        this.unsubscribed(binding.chatUri);
+        return;
+      }
+    }
+    if (binding.stale) {
+      binding.stale = false;
+      this.refreshWatched(binding);
     }
   }
 
@@ -1487,7 +1600,11 @@ export class AcpAgentHost implements Disposable {
   }
 
   private ensureLoaded(binding: Binding): Promise<void> {
-    binding.ready ??= (async () => {
+    if (binding.ready) {
+      return binding.ready;
+    }
+    binding.loading = true;
+    binding.ready = (async () => {
       const client = await this.connect(binding);
       const shown = this.server.stateOf(binding.chatUri) as
         ChatState | undefined;
@@ -1525,13 +1642,23 @@ export class AcpAgentHost implements Disposable {
       }
       // Chat queues what's sent while the history replays.
       this.runPending(binding);
-    })().catch(err => {
-      binding.ready = undefined; // let the next subscribe retry
-      throw new AhpRequestError(
-        JsonRpcErrorCodes.InternalError,
-        `Couldn't load session: ${describeError(err)}`,
-      );
-    });
+    })()
+      .catch(err => {
+        if (binding.owner) {
+          // Its owner keeps it: a background job's isn't loaded again. The
+          // history has replayed all the same.
+          this.output.appendLine(
+            `[load] ${binding.owner}: ${describeError(err)}`,
+          );
+          return;
+        }
+        binding.ready = undefined; // let the next subscribe retry
+        throw new AhpRequestError(
+          JsonRpcErrorCodes.InternalError,
+          `Couldn't load session: ${describeError(err)}`,
+        );
+      })
+      .finally(() => this.loadSettled(binding));
     return binding.ready;
   }
 

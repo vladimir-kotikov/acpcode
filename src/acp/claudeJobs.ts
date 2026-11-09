@@ -96,3 +96,55 @@ export async function removeClaudeJob(
   }
   return printed.filter(Boolean).join("\n");
 }
+
+const isAlive = (pid: unknown): boolean => {
+  if (typeof pid !== "number") {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+/** What runs `sessionId` besides an SDK, so not a bridge's own `claude`: one
+ *  in a terminal, or a background job. Every running `claude` registers in
+ *  `<config dir>/sessions/<pid>.json`. `env` is the agent's.
+ *  ponytail: a pid reused by an unrelated process reads as the owner; the
+ *  entry's `procStart` would tell them apart. */
+export async function sessionOwner(
+  env: NodeJS.ProcessEnv,
+  sessionId: string,
+): Promise<string | undefined> {
+  const configDir = env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+  const registry = path.join(configDir, "sessions");
+  let files: string[];
+  try {
+    files = await fs.readdir(registry);
+  } catch (err) {
+    if (isMissing(err)) {
+      return undefined;
+    }
+    throw err;
+  }
+  for (const file of files.filter(f => f.endsWith(".json"))) {
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(await fs.readFile(path.join(registry, file), "utf8"));
+    } catch {
+      continue; // gone, or being rewritten
+    }
+    if (
+      entry.sessionId === sessionId &&
+      entry.entrypoint === "cli" &&
+      isAlive(entry.pid)
+    ) {
+      return entry.kind === "bg"
+        ? `background job ${sessionId.slice(0, 8)}`
+        : "a terminal";
+    }
+  }
+  return undefined;
+}
