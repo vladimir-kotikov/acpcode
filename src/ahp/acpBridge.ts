@@ -99,6 +99,11 @@ interface Run {
   turnId: string;
   /** A steering message the agent took, still to get its turn. */
   steered?: PendingMessage;
+  /** Settles when the agent has answered the prompt. */
+  settled: Promise<void>;
+  /** The prompt is sent: until then, what the agent sends belongs to the
+   *  previous, cancelled one. */
+  prompting?: boolean;
 }
 
 /** One ACP session exposed as one AHP session with exactly one chat. */
@@ -1596,7 +1601,12 @@ export class AcpAgentHost implements Disposable {
         return;
       }
       case ActionType.ChatTurnCancelled:
-        if (binding.sessionId) {
+      // Drops a running turn too: editing a request truncates the chat back
+      // to before it, then starts a turn of the edit.
+      // ponytail: the agent keeps the dropped turns in its history; ACP has
+      // no way to truncate it.
+      case ActionType.ChatTruncated:
+        if (binding.turnId && binding.sessionId) {
           this.pool.get(binding.agent.name)?.cancelPrompt(binding.sessionId);
         }
         this.clearTurn(binding);
@@ -1630,7 +1640,12 @@ export class AcpAgentHost implements Disposable {
     message: Message,
   ): Promise<void> {
     this.beginTurn(binding, turnId);
-    const run: Run = { turnId };
+    const previous = binding.run;
+    let settle!: () => void;
+    const run: Run = {
+      turnId,
+      settled: new Promise(resolve => (settle = resolve)),
+    };
     binding.run = run;
     let completed = false;
     binding.prompted = true;
@@ -1641,9 +1656,15 @@ export class AcpAgentHost implements Disposable {
       );
     }
     try {
+      // A cancelled prompt ends before the agent takes the next one.
+      await previous?.settled;
       await (binding.ready ?? this.ensureLoaded(binding));
       await this.applyModelSelection(binding, message);
       const client = await this.connect(binding);
+      if (binding.run !== run || binding.turnId !== run.turnId) {
+        return; // cancelled or truncated meanwhile
+      }
+      run.prompting = true;
       const { stopReason, failureTitle } = await client.prompt(
         binding.sessionId!,
         message.text,
@@ -1664,6 +1685,7 @@ export class AcpAgentHost implements Disposable {
       if (binding.run === run) {
         binding.run = undefined;
       }
+      settle();
       if (run.steered) {
         // Handed to the agent, but its turn didn't complete.
         this.server.dispatch(binding.chatUri, {
@@ -1715,7 +1737,7 @@ export class AcpAgentHost implements Disposable {
       this.server.stateOf(binding.chatUri) as ChatState | undefined
     )?.steeringMessage;
     if (
-      !run ||
+      !run?.prompting ||
       run.steered || // one at a time: `promoteSteered` sends the next
       !pending ||
       binding.steering ||
@@ -1916,6 +1938,9 @@ export class AcpAgentHost implements Disposable {
       // isn't mirrored into AHP.
       return;
     }
+    if (!binding.replaying && binding.run && !binding.run.prompting) {
+      return; // the tail of a cancelled prompt
+    }
     const chat = binding.chatUri;
     switch (update.sessionUpdate) {
       case "agent_message_chunk":
@@ -2096,6 +2121,13 @@ export class AcpAgentHost implements Disposable {
     const turnId = binding.turnId;
     if (!turnId) {
       return; // the webview frontend owns turns it started
+    }
+    if (binding.run && !binding.run.prompting) {
+      // A cancelled prompt's, sent before the agent saw the cancel.
+      this.pool
+        .get(binding.agent.name)
+        ?.resolvePermission(request.requestId, null);
+      return;
     }
     const { toolCall } = request;
     if (!binding.toolCalls.has(toolCall.toolCallId)) {

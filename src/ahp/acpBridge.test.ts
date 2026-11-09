@@ -152,7 +152,9 @@ function setup(
       calls.push({ method: "steer", args });
       return Promise.resolve(steering);
     },
-    cancelPrompt: () => undefined,
+    cancelPrompt: (...args: unknown[]) => {
+      calls.push({ method: "cancelPrompt", args });
+    },
     deleteSession: (...args: unknown[]) => {
       calls.push({ method: "deleteSession", args });
       return deleteFails
@@ -1058,4 +1060,67 @@ test("a steering message replaced before its turn starts is sent once that turn 
     ["first", "also this"],
   );
   assert.equal(t.state().activeTurn?.message.text, "and that");
+});
+
+test("editing a request during its turn cancels it, and the edit waits for that", async () => {
+  const t = await withRunningTurn();
+
+  t.clientAction(t.chat, { type: ActionType.ChatTruncated } as StateAction);
+  t.clientAction(t.chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId: "t2",
+    startedAt: new Date().toISOString(),
+    message: { text: "edited" },
+  } as StateAction);
+  await settle();
+  const promptedBeforeCancelled = t.prompted();
+  t.endPrompt("cancelled");
+  await settle();
+
+  assert.deepEqual(
+    t.calls.filter(c => c.method === "cancelPrompt").map(c => c.args),
+    [["draft"]],
+  );
+  assert.deepEqual(promptedBeforeCancelled, ["first"]);
+  assert.deepEqual(t.prompted(), ["first", "edited"]);
+  assert.equal(t.state().activeTurn?.id, "t2");
+  assert.deepEqual(t.state().turns, []);
+});
+
+test("a turn dropped while waiting for the cancelled prompt never prompts", async () => {
+  const t = await withRunningTurn();
+  const edit = (turnId: string, text: string) => {
+    t.clientAction(t.chat, { type: ActionType.ChatTruncated } as StateAction);
+    t.clientAction(t.chat, {
+      type: ActionType.ChatTurnStarted,
+      turnId,
+      startedAt: new Date().toISOString(),
+      message: { text },
+    } as StateAction);
+  };
+
+  edit("t2", "edited");
+  await settle();
+  t.replay("draft", {
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text: "tail of first" },
+  });
+  t.askPermission({
+    sessionId: "draft",
+    requestId: "perm-late",
+    toolCall: { toolCallId: "late", title: "Late" },
+    options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+  });
+  const editedParts = t.state().activeTurn?.responseParts;
+  edit("t3", "edited again");
+  t.endPrompt("cancelled");
+  await settle();
+
+  assert.deepEqual(t.prompted(), ["first", "edited again"]);
+  assert.deepEqual(editedParts, []);
+  assert.deepEqual(
+    t.calls.filter(c => c.method === "resolvePermission").map(c => c.args),
+    [["perm-late", null]],
+  );
+  assert.equal(t.state().activeTurn?.id, "t3");
 });
