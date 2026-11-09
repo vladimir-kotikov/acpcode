@@ -7,6 +7,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import {
   ActionType,
+  AhpErrorCodes,
   ChatSourceKind,
   PendingMessageKind,
   ResponsePartKind,
@@ -1173,4 +1174,22 @@ test("a turn the agent stops short says why", async () => {
       content: "Stopped: the response reached the token limit.",
     },
   ]);
+});
+
+test("creating a session that already exists fails without a second ACP session", async () => {
+  const t = setup();
+  const create = t.hooks.handlers.createSession as (
+    p: unknown,
+  ) => Promise<null>;
+  const params = {
+    channel: "ahp-session:/acp-claude/draft",
+    provider: "acp-claude",
+  };
+  await create(params);
+
+  await assert.rejects(
+    async () => create(params),
+    (err: { code?: number }) => err.code === AhpErrorCodes.SessionAlreadyExists,
+  );
+  assert.equal(t.calls.filter(c => c.method === "newSession").length, 1);
 });

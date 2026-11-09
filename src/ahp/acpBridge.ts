@@ -1367,6 +1367,13 @@ export class AcpAgentHost implements Disposable {
         `Unknown provider ${params.provider}`,
       );
     }
+    if (this.bindings.has(params.channel) || this.server.has(params.channel)) {
+      // A retry would otherwise orphan the first one's ACP session.
+      throw new AhpRequestError(
+        AhpErrorCodes.SessionAlreadyExists,
+        `${params.channel} already exists`,
+      );
+    }
     const [cwd = this.defaultCwd(), ...additional] = (
       params.workingDirectories ?? []
     )
