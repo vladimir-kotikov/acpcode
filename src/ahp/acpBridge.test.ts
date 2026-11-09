@@ -55,6 +55,7 @@ function setup(
     steering,
     duringLoad,
     failedLoads = 0,
+    afterReplay,
   }: {
     indexed?: boolean;
     /** The agent's env: a fake `claude` and its config dir. */
@@ -67,6 +68,8 @@ function setup(
     duringLoad?: () => void;
     /** How many history loads fail before they work. */
     failedLoads?: number;
+    /** What a load does once it has replayed the history. */
+    afterReplay?: () => Promise<undefined>;
   } = {},
 ) {
   const theAgent = {
@@ -132,7 +135,7 @@ function setup(
         messageId: "m1",
       });
       duringLoad?.();
-      return Promise.resolve(undefined);
+      return afterReplay?.() ?? Promise.resolve(undefined);
     },
     forkSession: (...args: unknown[]) => {
       calls.push({ method: "forkSession", args });
@@ -1521,4 +1524,48 @@ test("a chat Chat resubscribes to before any listing is restored from the agent'
   assert.equal(host.server.has("ahp-chat:/acp-claude/gone"), false);
   // Once for both chats, and once for the one it doesn't list.
   assert.equal(calls.filter(c => c.method === "listSessions").length, 2);
+});
+
+test("a load the agent never answers ends its replayed turn and keeps the queue", async () => {
+  const { host, hooks, clientAction, calls, listChanged } = setup(
+    {},
+    { afterReplay: () => new Promise<undefined>(() => {}) },
+  );
+  host.loadTimeoutMs = 20;
+  listChanged({ sessions: [row("s1")] });
+
+  const loading = hooks.materialize(CHAT);
+  await settle();
+  clientAction(CHAT, {
+    type: ActionType.ChatPendingMessageSet,
+    kind: PendingMessageKind.Queued,
+    id: "q1",
+    message: { text: "after" },
+  } as StateAction);
+
+  await assert.rejects(loading, /didn't load the session/);
+  const state = host.server.stateOf(CHAT) as ChatState;
+  assert.equal(state.activeTurn, undefined);
+  assert.equal(state.turns.at(-1)?.message.text, "hello");
+  assert.equal(state.queuedMessages?.length, 1);
+  assert.deepEqual(
+    calls.filter(c => c.method === "prompt"),
+    [],
+  );
+});
+
+test("cancelling a turn that isn't the running one leaves the running one be", async () => {
+  const t = await withRunningTurn();
+
+  t.clientAction(t.chat, {
+    type: ActionType.ChatTurnCancelled,
+    turnId: "a-previous-hosts",
+  } as StateAction);
+  await settle();
+
+  assert.deepEqual(
+    t.calls.filter(c => c.method === "cancelPrompt"),
+    [],
+  );
+  assert.equal(t.state().activeTurn?.id, "t1");
 });

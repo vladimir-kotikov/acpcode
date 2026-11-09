@@ -254,6 +254,24 @@ function retitle(tracking: ToolCallTracking, call: ToolCallUpdate): void {
   }
 }
 
+/** `promise`, or a rejection once `ms` have passed without it settling. */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  what: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`${what} in ${ms / 1000}s`)),
+        ms,
+      );
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 /** A failed tool call's own error: its text content, else its raw output's
  *  text — capped. */
 function failureText(update: ToolCallUpdate): string | undefined {
@@ -400,6 +418,8 @@ export class AcpAgentHost implements Disposable {
   private readonly directories: Record<string, string[]>;
   // Agents whose last listing failed; see `bridgesChanged()`.
   private readonly unlisted = new Set<string>();
+  /** How long an agent gets to load a session's history. */
+  loadTimeoutMs = 60_000;
   /** Listings run to restore the sessions Chat resubscribes to, by agent. */
   private readonly restoring = new Map<string, Promise<void>>();
   private readonly unrestorable = new Set<string>();
@@ -1463,17 +1483,27 @@ export class AcpAgentHost implements Disposable {
         // ponytail: loading a session the webview frontend also has open on
         // this connection replays its history into that view a second time
         // (see SessionViewSession.attachSession's `seed`).
-        const response = await client.loadSession(
-          binding.sessionId!,
-          binding.cwd,
-          binding.additionalDirectories,
+        // claude-agent-acp never answers when the Claude process it resumes
+        // fails to start, e.g. while the session runs in a terminal.
+        // ponytail: its replay may still trickle in after the timeout; with
+        // no turn of ours it's dropped.
+        const response = await withTimeout(
+          client.loadSession(
+            binding.sessionId!,
+            binding.cwd,
+            binding.additionalDirectories,
+          ),
+          this.loadTimeoutMs,
+          "the agent didn't load the session",
         );
         if (response?.configOptions) {
           this.rememberOptions(binding, response.configOptions);
         }
+      } finally {
+        // The replayed history ends here, however the load did; its last
+        // turn may be one still running elsewhere.
         this.flushReplayedUserMessage(binding);
         this.endTurn(binding, ActionType.ChatTurnComplete);
-      } finally {
         binding.replaying = false;
       }
       // Chat queues what's sent while the history replays.
@@ -1775,6 +1805,12 @@ export class AcpAgentHost implements Disposable {
       // ponytail: the agent keeps the dropped turns in its history; ACP has
       // no way to truncate it.
       case ActionType.ChatTruncated:
+        if (
+          action.type === ActionType.ChatTurnCancelled &&
+          action.turnId !== binding.turnId
+        ) {
+          return; // e.g. one a previous host ran, which Chat still shows
+        }
         if (binding.turnId && binding.sessionId) {
           this.pool.get(binding.agent.name)?.cancelPrompt(binding.sessionId);
         }
