@@ -251,6 +251,19 @@ function toAttachments(message: Message): Attachment[] {
         },
       ];
     }
+    if (
+      attachment.type === MessageAttachmentKind.Simple &&
+      attachment.modelRepresentation
+    ) {
+      return [
+        {
+          id: randomUUID(),
+          name: attachment.label,
+          mimeType: "text/plain",
+          data: Buffer.from(attachment.modelRepresentation).toString("base64"),
+        },
+      ];
+    }
     if (attachment.type === MessageAttachmentKind.EmbeddedResource) {
       return [
         {

@@ -126,6 +126,9 @@ export function describeError(err: unknown): string {
   return String(err);
 }
 
+const isTextual = (mimeType: string | undefined): boolean =>
+  !mimeType || /^text\/|[+/](json|xml|yaml|javascript)$/.test(mimeType);
+
 /** One live ACP connection to an agent's bridge subprocess. Owns the child
  *  process and the session lifecycle; consumers (tree view, session viewer,
  *  chat webview) subscribe to its events rather than the client knowing
@@ -606,7 +609,30 @@ export class AgentClient implements Disposable {
         mimeType: attachment.mimeType,
       });
     }
-    return Promise.resolve(undefined);
+    if (!attachment.data) {
+      return Promise.resolve(undefined);
+    }
+    // Inline content without a URI: sent as is rather than dropped. Only
+    // text: claude-agent-acp ignores blob resources, and ACP has no way to
+    // tell which agents take them.
+    if (isTextual(attachment.mimeType)) {
+      const text = Buffer.from(attachment.data, "base64").toString("utf8");
+      return Promise.resolve(
+        this.promptCapabilities.embeddedContext
+          ? {
+              type: "resource",
+              resource: {
+                uri: `attachment:${encodeURIComponent(attachment.name)}`,
+                mimeType: attachment.mimeType,
+                text,
+              },
+            }
+          : { type: "text", text: `${attachment.name}:\n${text}` },
+      );
+    }
+    return Promise.reject(
+      new Error(`the agent can't take ${attachment.name} as an attachment`),
+    );
   }
 
   private buildContentBlocks(

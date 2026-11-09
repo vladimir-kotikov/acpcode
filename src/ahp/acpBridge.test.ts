@@ -1193,3 +1193,36 @@ test("creating a session that already exists fails without a second ACP session"
   );
   assert.equal(t.calls.filter(c => c.method === "newSession").length, 1);
 });
+
+test("a simple attachment reaches the agent as its model representation", async () => {
+  const t = setup();
+  const draft = "ahp-session:/acp-claude/draft";
+  await (t.hooks.handlers.createSession as (p: unknown) => Promise<null>)({
+    channel: draft,
+    provider: "acp-claude",
+  });
+  const chat = (t.host.server.stateOf(draft) as SessionState).defaultChat!;
+
+  t.clientAction(chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId: "t1",
+    startedAt: new Date().toISOString(),
+    message: {
+      text: "look",
+      attachments: [
+        { type: "simple", label: "Problems", modelRepresentation: "2 errors" },
+      ],
+    },
+  } as StateAction);
+  await settle();
+
+  const [prompt] = t.calls.filter(c => c.method === "prompt");
+  assert.deepEqual(prompt.args[2], [
+    {
+      id: (prompt.args[2] as { id: string }[])[0].id,
+      name: "Problems",
+      mimeType: "text/plain",
+      data: Buffer.from("2 errors").toString("base64"),
+    },
+  ]);
+});

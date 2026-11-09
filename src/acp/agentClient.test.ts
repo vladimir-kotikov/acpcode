@@ -1,6 +1,7 @@
 // node --test src/acp/agentClient.test.ts
 import assert from "node:assert/strict";
 import { type TestContext, test } from "node:test";
+import type { Attachment } from "../shared/sessionViewProtocol.ts";
 import { AgentClient, type SteeringResponse } from "./agentClient.ts";
 import { fakeAgent } from "./fakeAgent.test-util.ts";
 
@@ -201,5 +202,100 @@ test("optional session methods go only to an agent that advertises them", async 
   assert.equal(
     (await capable.newSession("/w", ["/x"])).sessionId,
     JSON.stringify(["/x"]),
+  );
+});
+
+/** What an agent advertising `promptCapabilities` gets for `attachments`. */
+async function promptedWith(
+  t: TestContext,
+  promptCapabilities: object,
+  attachments: Attachment[],
+) {
+  // Answers a prompt with the blocks it got, as a message chunk.
+  const entryPoint = fakeAgent(
+    t,
+    (message, send) => {
+      if (message.method === "session/prompt") {
+        send({
+          method: "session/update",
+          params: {
+            sessionId: "s1",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: {
+                type: "text",
+                text: JSON.stringify(message.params.prompt),
+              },
+            },
+          },
+        });
+        send({ id: message.id, result: { stopReason: "end_turn" } });
+      }
+    },
+    { promptCapabilities },
+  );
+  const client = new AgentClient("/", {
+    append: () => undefined,
+    appendLine: () => undefined,
+    dispose: () => undefined,
+  });
+  t.after(() => client.dispose());
+  await client.connect(
+    {
+      name: "fake",
+      kind: "claude",
+      env: { CLAUDE_CODE_EXECUTABLE: "/bin/false" },
+    },
+    entryPoint,
+  );
+  let got: unknown;
+  client.onSessionUpdate(({ update }) => {
+    if (
+      update.sessionUpdate === "agent_message_chunk" &&
+      update.content.type === "text"
+    ) {
+      got = JSON.parse(update.content.text);
+    }
+  });
+  await client.prompt("s1", "", attachments);
+  return got;
+}
+
+const base64 = (text: string) => Buffer.from(text).toString("base64");
+const notes: Attachment = {
+  id: "a1",
+  name: "notes.md",
+  mimeType: "text/markdown",
+  data: base64("# Notes"),
+};
+
+test("inline text attachments reach the agent embedded, or as text", async t => {
+  assert.deepEqual(await promptedWith(t, { embeddedContext: true }, [notes]), [
+    {
+      type: "resource",
+      resource: {
+        uri: "attachment:notes.md",
+        mimeType: "text/markdown",
+        text: "# Notes",
+      },
+    },
+  ]);
+  assert.deepEqual(await promptedWith(t, {}, [notes]), [
+    { type: "text", text: "notes.md:\n# Notes" },
+  ]);
+});
+
+test("an inline image an agent can't take fails the prompt instead of vanishing", async t => {
+  const image = {
+    id: "a2",
+    name: "shot.png",
+    mimeType: "image/png",
+    data: base64("png"),
+  };
+
+  await assert.rejects(promptedWith(t, {}, [image]), /can't take shot\.png/);
+  await assert.rejects(
+    promptedWith(t, { embeddedContext: true }, [image]),
+    /can't take shot\.png/,
   );
 });
