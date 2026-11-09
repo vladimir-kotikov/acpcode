@@ -52,6 +52,7 @@ function setup(
     agentKind = "claude",
     steering,
     duringLoad,
+    failedLoads = 0,
   }: {
     indexed?: boolean;
     /** The agent's env: a fake `claude` and its config dir. */
@@ -62,6 +63,8 @@ function setup(
     steering?: SteeringResponse | Promise<SteeringResponse>;
     /** Runs while `s1`'s history replays. */
     duringLoad?: () => void;
+    /** How many history loads fail before they work. */
+    failedLoads?: number;
   } = {},
 ) {
   const theAgent = {
@@ -113,6 +116,10 @@ function setup(
     },
     subscribeSessionList: () => Promise.resolve("sub"),
     loadSession: (sessionId: string) => {
+      calls.push({ method: "loadSession", args: [sessionId] });
+      if (failedLoads-- > 0) {
+        return Promise.reject(new Error("load failed"));
+      }
       replay(sessionId, {
         sessionUpdate: "user_message_chunk",
         content: { type: "text", text: "hello" },
@@ -1123,4 +1130,32 @@ test("a turn dropped while waiting for the cancelled prompt never prompts", asyn
     [["perm-late", null]],
   );
   assert.equal(t.state().activeTurn?.id, "t3");
+});
+
+test("a turn in a chat whose history didn't load resumes the session instead", async () => {
+  const t = setup({}, { failedLoads: 1 });
+  t.listChanged({ sessions: [row("s1")] });
+  await assert.rejects(t.hooks.materialize(CHAT));
+
+  t.clientAction(CHAT, {
+    type: ActionType.ChatTurnStarted,
+    turnId: "t1",
+    startedAt: new Date().toISOString(),
+    message: { text: "still there?" },
+  } as StateAction);
+  await settle();
+
+  assert.deepEqual(
+    t.calls
+      .filter(c => /^(load|resume)Session$/.test(c.method))
+      .map(c => c.method),
+    ["loadSession", "resumeSession"],
+  );
+  assert.deepEqual(
+    t.calls.filter(c => c.method === "prompt").map(c => c.args[1]),
+    ["still there?"],
+  );
+  const chat = t.host.server.stateOf(CHAT) as ChatState;
+  assert.equal(chat.activeTurn?.id, "t1");
+  assert.deepEqual(chat.turns, []);
 });

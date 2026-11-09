@@ -536,6 +536,11 @@ export class AcpAgentHost implements Disposable {
         .then(client =>
           client.resumeSession(binding.sessionId!, binding.cwd, rest),
         )
+        .then(options => {
+          if (options) {
+            this.rememberOptions(binding, options);
+          }
+        })
         .catch(err =>
           this.output.appendLine(`[directories] ${describeError(err)}`),
         );
@@ -608,7 +613,7 @@ export class AcpAgentHost implements Disposable {
     config: Record<string, unknown>,
   ): Promise<void> {
     try {
-      await (binding.ready ?? this.ensureLoaded(binding));
+      await this.whenReady(binding);
       for (const [key, value] of Object.entries(config)) {
         const target = resolveConfig(
           binding.configOptions ?? [],
@@ -1293,6 +1298,32 @@ export class AcpAgentHost implements Disposable {
     }
   }
 
+  /** `ready`, or else the session loaded — resumed instead, without its
+   *  history, while a turn runs: its replay would take that turn over. */
+  private whenReady(binding: Binding): Promise<void> {
+    if (binding.ready || !binding.turnId) {
+      return binding.ready ?? this.ensureLoaded(binding);
+    }
+    binding.ready = this.connect(binding)
+      .then(client =>
+        client.resumeSession(
+          binding.sessionId!,
+          binding.cwd,
+          binding.additionalDirectories,
+        ),
+      )
+      .then(options => {
+        if (options) {
+          this.rememberOptions(binding, options);
+        }
+      })
+      .catch(err => {
+        binding.ready = undefined;
+        throw err;
+      });
+    return binding.ready;
+  }
+
   private ensureLoaded(binding: Binding): Promise<void> {
     binding.ready ??= (async () => {
       const client = await this.connect(binding);
@@ -1658,7 +1689,7 @@ export class AcpAgentHost implements Disposable {
     try {
       // A cancelled prompt ends before the agent takes the next one.
       await previous?.settled;
-      await (binding.ready ?? this.ensureLoaded(binding));
+      await this.whenReady(binding);
       await this.applyModelSelection(binding, message);
       const client = await this.connect(binding);
       if (binding.run !== run || binding.turnId !== run.turnId) {

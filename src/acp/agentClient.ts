@@ -440,18 +440,19 @@ export class AgentClient implements Disposable {
 
   /** Re-applies a live session's directory set: the bridge rebuilds the
    *  session (keeping its history and permission mode) when it differs from
-   *  the one it runs with, which is how `/add-dir` takes effect. */
+   *  the one it runs with, which is how `/add-dir` takes effect. Also
+   *  makes a session live without replaying its history. Resolves to the
+   *  session's config options, if the agent sent them. */
   async resumeSession(
     sessionId: SessionId,
     cwd: string,
     additionalDirectories: string[],
-  ): Promise<void> {
-    await this.requireAgent().request(methods.agent.session.resume, {
-      sessionId,
-      cwd,
-      mcpServers: [],
-      additionalDirectories,
-    });
+  ): Promise<SessionConfigOption[] | undefined> {
+    const response = await this.requireAgent().request(
+      methods.agent.session.resume,
+      { sessionId, cwd, mcpServers: [], additionalDirectories },
+    );
+    return response.configOptions ?? undefined;
   }
 
   async deleteSession(sessionId: SessionId): Promise<void> {
