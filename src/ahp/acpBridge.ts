@@ -197,9 +197,6 @@ const directoryUris = (binding: Binding): string[] =>
     dir => pathToFileURL(dir).href,
   );
 
-/** AHP provider IDs double as URI schemes VS Code builds draft-session
- *  resources from (`<provider>:/untitled-<uuid>`), so they must be
- *  scheme-safe — agent display names aren't. */
 /** The agent's own name for the tool (claude-agent-acp sends it in
  *  `_meta.claudeCode.toolName`), else ACP's coarse kind. */
 const toolNameOf = (call: ToolCallUpdate): string => {
@@ -250,6 +247,9 @@ function failureText(update: ToolCallUpdate): string | undefined {
 /** Content URIs of diff sides; see `storeContent`. */
 const CONTENT_SCHEME = "acpcode-content";
 
+/** AHP provider IDs double as URI schemes VS Code builds draft-session
+ *  resources from (`<provider>:/untitled-<uuid>`), so they must be
+ *  scheme-safe — agent display names aren't. */
 const providerId = (agent: AgentConfig): string =>
   `acp-${agent.name
     .toLowerCase()
