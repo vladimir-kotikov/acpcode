@@ -1596,3 +1596,26 @@ test("a load's history settles once the agent says it has replayed, not when it 
   assert.equal(state.turns.at(-1)?.message.text, "hello");
   await assert.rejects(loading);
 });
+
+test("a load retried after one timed out replays the history once", async () => {
+  let loads = 0;
+  const { host, hooks, listChanged } = setup(
+    {},
+    {
+      afterReplay: () =>
+        loads++ === 0
+          ? new Promise<undefined>(() => {})
+          : Promise.resolve(undefined),
+    },
+  );
+  host.loadTimeoutMs = 20;
+  listChanged({ sessions: [row("s1")] });
+
+  await assert.rejects(hooks.materialize(CHAT));
+  await hooks.materialize(CHAT);
+
+  assert.deepEqual(
+    (host.server.stateOf(CHAT) as ChatState).turns.map(t => t.message.text),
+    ["hello"],
+  );
+});

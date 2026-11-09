@@ -1489,6 +1489,16 @@ export class AcpAgentHost implements Disposable {
   private ensureLoaded(binding: Binding): Promise<void> {
     binding.ready ??= (async () => {
       const client = await this.connect(binding);
+      const shown = this.server.stateOf(binding.chatUri) as
+        ChatState | undefined;
+      if (!binding.run && (shown?.turns.length || shown?.activeTurn)) {
+        // A retry, after a load that failed or timed out part way: its
+        // replay rebuilds the history rather than adding to it.
+        // Not under a prompt of ours, which owns its turn.
+        this.server.dispatch(binding.chatUri, {
+          type: ActionType.ChatTruncated,
+        });
+      }
       binding.replaying = true;
       try {
         // ponytail: loading a session the webview frontend also has open on
