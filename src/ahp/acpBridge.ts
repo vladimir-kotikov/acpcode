@@ -6,6 +6,7 @@ import type {
   SessionUpdate,
   ToolCallContent,
   ToolCallUpdate,
+  ToolKind,
 } from "@agentclientprotocol/sdk";
 import {
   ActionType,
@@ -88,6 +89,7 @@ interface ToolCallTracking {
   turnId: string;
   title: string;
   phase: "running" | "pending" | "done";
+  kind?: ToolKind;
   permission?: { requestId: string; options: PermissionOption[] };
   // ACP's completing update usually omits content, and an absent `content`
   // in `toolCallComplete` would wipe what was shown while it ran.
@@ -205,6 +207,22 @@ const toolNameOf = (call: ToolCallUpdate): string => {
     ?.toolName;
   return typeof name === "string" ? name : (call.kind ?? "other");
 };
+
+/** A tool call's input as Chat takes it, if the update has one. Chat shows
+ *  a call marked as a terminal tool as a command line, read from the
+ *  input's `command`. */
+const inputFields = (
+  kind: ToolKind | undefined,
+  rawInput: unknown,
+): { toolInput?: string; _meta?: { toolKind: "terminal" } } =>
+  rawInput === undefined
+    ? {}
+    : {
+        toolInput: JSON.stringify(rawInput, null, 2),
+        ...(kind === "execute" &&
+          typeof (rawInput as { command?: unknown } | null)?.command ===
+            "string" && { _meta: { toolKind: "terminal" } }),
+      };
 
 /** A failed tool call's own error: its text content, else its raw output's
  *  text — capped. */
@@ -2108,6 +2126,7 @@ export class AcpAgentHost implements Disposable {
       turnId,
       title,
       phase: "running",
+      kind: call.kind ?? undefined,
     });
     this.server.dispatch(binding.chatUri, {
       type: ActionType.ChatToolCallStart,
@@ -2121,10 +2140,7 @@ export class AcpAgentHost implements Disposable {
       turnId,
       toolCallId: call.toolCallId,
       invocationMessage: title,
-      toolInput:
-        call.rawInput === undefined
-          ? undefined
-          : JSON.stringify(call.rawInput, null, 2),
+      ...inputFields(call.kind ?? undefined, call.rawInput),
       confirmed: ToolCallConfirmationReason.NotNeeded,
     });
     this.setToolContent(binding, turnId, call);
@@ -2249,12 +2265,15 @@ export class AcpAgentHost implements Disposable {
     if (tracking.phase !== "running") {
       return;
     }
-    if (update.title) {
+    tracking.kind = update.kind ?? tracking.kind;
+    // Agents that stream a tool's input send it whole in a later update.
+    if (update.title || update.rawInput !== undefined) {
       this.server.dispatch(binding.chatUri, {
         type: ActionType.ChatToolCallReady,
         turnId,
         toolCallId: update.toolCallId,
         invocationMessage: tracking.title,
+        ...inputFields(tracking.kind, update.rawInput),
         confirmed: ToolCallConfirmationReason.NotNeeded,
       });
     }
@@ -2288,6 +2307,7 @@ export class AcpAgentHost implements Disposable {
     if (toolCall.title) {
       tracking.title = toolCall.title;
     }
+    tracking.kind = toolCall.kind ?? tracking.kind;
     tracking.phase = "pending";
     tracking.permission = {
       requestId: request.requestId,
@@ -2299,6 +2319,7 @@ export class AcpAgentHost implements Disposable {
       toolCallId: toolCall.toolCallId,
       invocationMessage: tracking.title,
       confirmationTitle: tracking.title,
+      ...inputFields(tracking.kind, toolCall.rawInput),
       options: request.options.map(option => ({
         id: option.optionId,
         label: option.name,

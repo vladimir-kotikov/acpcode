@@ -1330,3 +1330,51 @@ test("a tool call keeps the agent's tool name and a failure its error", async ()
   assert.equal(part.toolCall.toolName, "Bash");
   assert.equal(part.toolCall.error?.message, "npm ERR! missing script: tests");
 });
+
+test("a shell command shows as a terminal once its streamed input has the command", async () => {
+  const t = await withRunningTurn();
+  const toolCall = (id: string) =>
+    t
+      .state()
+      .activeTurn?.responseParts.map(
+        p =>
+          (
+            p as {
+              toolCall: {
+                toolCallId: string;
+                toolInput?: string;
+                _meta?: object;
+              };
+            }
+          ).toolCall,
+      )
+      .find(c => c.toolCallId === id);
+
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "b1",
+    title: "Terminal",
+    kind: "execute",
+    rawInput: {},
+  });
+  const streaming = { ...toolCall("b1") };
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b1",
+    rawInput: { command: "npm test" },
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "d1",
+    title: "A dynamic tool",
+    kind: "execute",
+    rawInput: { arguments: {} },
+  });
+
+  assert.equal(streaming._meta, undefined);
+  assert.deepEqual(JSON.parse(toolCall("b1")!.toolInput!), {
+    command: "npm test",
+  });
+  assert.deepEqual(toolCall("b1")!._meta, { toolKind: "terminal" });
+  assert.equal(toolCall("d1")!._meta, undefined);
+});
