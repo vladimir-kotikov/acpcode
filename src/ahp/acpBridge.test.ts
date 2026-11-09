@@ -1331,7 +1331,7 @@ test("a tool call keeps the agent's tool name and a failure its error", async ()
   assert.equal(part.toolCall.error?.message, "npm ERR! missing script: tests");
 });
 
-test("a shell command shows as a terminal once its streamed input has the command", async () => {
+test("a shell command becomes a terminal once Chat can label it", async () => {
   const t = await withRunningTurn();
   const toolCall = (id: string) =>
     t
@@ -1343,13 +1343,16 @@ test("a shell command shows as a terminal once its streamed input has the comman
               toolCall: {
                 toolCallId: string;
                 toolInput?: string;
+                intention?: string;
                 _meta?: object;
               };
             }
           ).toolCall,
       )
       .find(c => c.toolCallId === id);
+  const terminal = { toolKind: "terminal" };
 
+  // Claude streams the input, the command before its description.
   t.replay("draft", {
     sessionUpdate: "tool_call",
     toolCallId: "b1",
@@ -1357,11 +1360,42 @@ test("a shell command shows as a terminal once its streamed input has the comman
     kind: "execute",
     rawInput: {},
   });
-  const streaming = { ...toolCall("b1") };
   t.replay("draft", {
     sessionUpdate: "tool_call_update",
     toolCallId: "b1",
     rawInput: { command: "npm test" },
+  });
+  const partial = { ...toolCall("b1") };
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b1",
+    rawInput: { command: "npm test", description: "Run the tests" },
+  });
+  // Codex sends it whole, without a description.
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "c1",
+    title: "npm test",
+    kind: "execute",
+    rawInput: { command: "npm test", cwd: "/w" },
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "n1",
+    title: "Terminal",
+    kind: "execute",
+    rawInput: {},
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "n1",
+    rawInput: { command: "ls" },
+  });
+  const undescribed = { ...toolCall("n1") };
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "n1",
+    status: "completed",
   });
   t.replay("draft", {
     sessionUpdate: "tool_call",
@@ -1371,11 +1405,13 @@ test("a shell command shows as a terminal once its streamed input has the comman
     rawInput: { arguments: {} },
   });
 
-  assert.equal(streaming._meta, undefined);
-  assert.deepEqual(JSON.parse(toolCall("b1")!.toolInput!), {
-    command: "npm test",
-  });
-  assert.deepEqual(toolCall("b1")!._meta, { toolKind: "terminal" });
+  assert.deepEqual(JSON.parse(partial.toolInput!), { command: "npm test" });
+  assert.equal(partial._meta, undefined);
+  assert.deepEqual(toolCall("b1")!._meta, terminal);
+  assert.equal(toolCall("b1")!.intention, "Run the tests");
+  assert.deepEqual(toolCall("c1")!._meta, terminal);
+  assert.equal(undescribed._meta, undefined);
+  assert.deepEqual(toolCall("n1")!._meta, terminal);
   assert.equal(toolCall("d1")!._meta, undefined);
 });
 
@@ -1392,6 +1428,7 @@ test("a shell command is titled with its input's description, not its command li
                 toolCallId: string;
                 invocationMessage?: string;
                 intention?: string;
+                _meta?: object;
                 confirmationTitle?: string;
                 pastTenseMessage?: string;
               };
@@ -1452,6 +1489,7 @@ test("a shell command is titled with its input's description, not its command li
   assert.equal(asked.confirmationTitle, "Remove the build");
   // What Chat's terminal card is labelled with.
   assert.equal(asked.intention, "Remove the build");
+  assert.deepEqual(asked._meta, { toolKind: "terminal" });
   assert.equal(call("b1")?.intention, "Run the tests");
   assert.equal(call("i1")?.intention, undefined);
   assert.equal(call("b1")?.pastTenseMessage, "Run the tests");

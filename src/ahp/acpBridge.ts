@@ -92,6 +92,8 @@ interface ToolCallTracking {
   kind?: ToolKind;
   /** The title is the input's short `description`, not the agent's. */
   described?: boolean;
+  /** Its input has a shell command: a terminal tool. */
+  command?: boolean;
   permission?: { requestId: string; options: PermissionOption[] };
   // ACP's completing update usually omits content, and an absent `content`
   // in `toolCallComplete` would wipe what was shown while it ran.
@@ -207,21 +209,32 @@ const toolNameOf = (call: ToolCallUpdate): string => {
   return typeof name === "string" ? name : (call.kind ?? "other");
 };
 
-/** A tool call's input as Chat takes it, if the update has one. Chat shows
- *  a call marked as a terminal tool as a command line, read from the
- *  input's `command`. */
-const inputFields = (
-  kind: ToolKind | undefined,
+/** A tool call's input as Chat takes it, if the update has one. Chat shows a
+ *  terminal tool's card with the input's `command`, labelled with the call's
+ *  intention as it was when the card first showed. So a call whose input is
+ *  streamed in (Claude sends the command before its description) becomes
+ *  one once its description is in, or `whole` input is, or it completes. */
+function inputFields(
+  tracking: ToolCallTracking,
   rawInput: unknown,
-): { toolInput?: string; _meta?: { toolKind: "terminal" } } =>
-  rawInput === undefined
-    ? {}
-    : {
-        toolInput: JSON.stringify(rawInput, null, 2),
-        ...(kind === "execute" &&
-          typeof (rawInput as { command?: unknown } | null)?.command ===
-            "string" && { _meta: { toolKind: "terminal" } }),
-      };
+  whole: boolean,
+): { toolInput?: string; _meta?: { toolKind: "terminal" } } {
+  if (rawInput === undefined) {
+    return {};
+  }
+  tracking.command ||=
+    tracking.kind === "execute" &&
+    typeof (rawInput as { command?: unknown } | null)?.command === "string";
+  return {
+    toolInput: JSON.stringify(rawInput, null, 2),
+    ...((whole || tracking.described) && terminalMeta(tracking)),
+  };
+}
+
+const terminalMeta = (
+  tracking: ToolCallTracking,
+): { _meta?: { toolKind: "terminal" } } =>
+  tracking.command ? { _meta: { toolKind: "terminal" } } : {};
 
 /** Takes a call's new title and kind. Claude titles a shell command with
  *  the whole command line, which Chat's terminal card shows anyway; its
@@ -2162,7 +2175,7 @@ export class AcpAgentHost implements Disposable {
       toolCallId: call.toolCallId,
       invocationMessage: title,
       ...(tracking.described && { intention: title }),
-      ...inputFields(call.kind ?? undefined, call.rawInput),
+      ...inputFields(tracking, call.rawInput, true),
       confirmed: ToolCallConfirmationReason.NotNeeded,
     });
     this.setToolContent(binding, turnId, call);
@@ -2267,6 +2280,8 @@ export class AcpAgentHost implements Disposable {
         type: ActionType.ChatToolCallComplete,
         turnId,
         toolCallId: update.toolCallId,
+        // A shell call it never knew the description of.
+        ...terminalMeta(tracking),
         result: {
           success: update.status === "completed",
           pastTenseMessage: tracking.title,
@@ -2293,7 +2308,7 @@ export class AcpAgentHost implements Disposable {
         toolCallId: update.toolCallId,
         invocationMessage: tracking.title,
         ...(tracking.described && { intention: tracking.title }),
-        ...inputFields(tracking.kind, update.rawInput),
+        ...inputFields(tracking, update.rawInput, false),
         confirmed: ToolCallConfirmationReason.NotNeeded,
       });
     }
@@ -2337,7 +2352,7 @@ export class AcpAgentHost implements Disposable {
       invocationMessage: tracking.title,
       confirmationTitle: tracking.title,
       ...(tracking.described && { intention: tracking.title }),
-      ...inputFields(tracking.kind, toolCall.rawInput),
+      ...inputFields(tracking, toolCall.rawInput, true),
       options: request.options.map(option => ({
         id: option.optionId,
         label: option.name,
