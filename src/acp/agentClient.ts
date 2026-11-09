@@ -300,7 +300,13 @@ export class AgentClient implements Disposable {
                 // sessionIndex: session/list rows carry `_meta.jetbrains.air`
                 // (forkedFrom, lastPromptAt, model, state, archived) and
                 // the bridge offers rename/archive/list-change methods.
-                capabilities: ["sessionFailure", "sessionIndex"],
+                // loadReplayEnd: a load says when its history has replayed,
+                // ahead of answering (which also waits for Claude to start).
+                capabilities: [
+                  "sessionFailure",
+                  "sessionIndex",
+                  "loadReplayEnd",
+                ],
               },
             },
           },

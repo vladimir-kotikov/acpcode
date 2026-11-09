@@ -1475,6 +1475,17 @@ export class AcpAgentHost implements Disposable {
     return binding.ready;
   }
 
+  /** The replayed history is whole. Its last turn may be one still running
+   *  elsewhere, e.g. in a terminal; it ends here all the same. */
+  private endReplay(binding: Binding): void {
+    if (!binding.replaying) {
+      return;
+    }
+    this.flushReplayedUserMessage(binding);
+    this.endTurn(binding, ActionType.ChatTurnComplete);
+    binding.replaying = false;
+  }
+
   private ensureLoaded(binding: Binding): Promise<void> {
     binding.ready ??= (async () => {
       const client = await this.connect(binding);
@@ -1500,11 +1511,7 @@ export class AcpAgentHost implements Disposable {
           this.rememberOptions(binding, response.configOptions);
         }
       } finally {
-        // The replayed history ends here, however the load did; its last
-        // turn may be one still running elsewhere.
-        this.flushReplayedUserMessage(binding);
-        this.endTurn(binding, ActionType.ChatTurnComplete);
-        binding.replaying = false;
+        this.endReplay(binding); // however the load did
       }
       // Chat queues what's sent while the history replays.
       this.runPending(binding);
@@ -2139,6 +2146,13 @@ export class AcpAgentHost implements Disposable {
     if (update.sessionUpdate === "session_info_update") {
       if (update.title) {
         this.setTitle(binding, update.title);
+      }
+      if (
+        binding.replaying &&
+        (update._meta?.jetbrains as { air?: { loadReplayEnd?: unknown } })?.air
+          ?.loadReplayEnd === true
+      ) {
+        this.endReplay(binding);
       }
       return;
     }

@@ -1569,3 +1569,30 @@ test("cancelling a turn that isn't the running one leaves the running one be", a
   );
   assert.equal(t.state().activeTurn?.id, "t1");
 });
+
+test("a load's history settles once the agent says it has replayed, not when it answers", async () => {
+  let replay!: ReturnType<typeof setup>["replay"];
+  const t = setup(
+    {},
+    {
+      afterReplay: () => {
+        replay("s1", {
+          sessionUpdate: "session_info_update",
+          _meta: { jetbrains: { air: { loadReplayEnd: true } } },
+        });
+        return new Promise<undefined>(() => {});
+      },
+    },
+  );
+  replay = t.replay;
+  t.host.loadTimeoutMs = 100;
+  t.listChanged({ sessions: [row("s1")] });
+
+  const loading = t.hooks.materialize(CHAT);
+  await settle();
+  const state = t.host.server.stateOf(CHAT) as ChatState;
+
+  assert.equal(state.activeTurn, undefined);
+  assert.equal(state.turns.at(-1)?.message.text, "hello");
+  await assert.rejects(loading);
+});
