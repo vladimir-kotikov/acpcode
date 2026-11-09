@@ -1,12 +1,8 @@
 name: Build and Publish
 
-# Push to main -> publish a pre-release build to the Marketplace (version
-# bumped to a build number that only ever increases, since the Marketplace
-# rejects republishing a version). Push a vX.Y.Z tag -> publish that exact
-# version as a regular release.
+# Push a vX.Y.Z tag -> publish that exact version to the Marketplace.
 on:
   push:
-    branches: [main]
     tags: ["v*.*.*"]
 
 concurrency:
@@ -24,35 +20,13 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-
       - run: npm ci
-
-      # Marketplace versions must strictly increase and can't be
-      # republished — run_number is unique and monotonic per workflow run,
-      # so each prerelease build gets its own. Not following the
-      # odd-minor-means-prerelease convention some extensions use; `vsce
-      # publish --pre-release` below is what actually puts it on the
-      # pre-release channel.
-      - name: Set pre-release version
-        if: github.ref_type == 'branch'
-        run: npm pkg set version="0.0.${{ github.run_number }}"
-
       - name: Set version from tag
-        if: github.ref_type == 'tag'
         run: npm pkg set version="${GITHUB_REF_NAME#v}"
-
       # Bundles everything and packages only what ships (see the Makefile).
       - run: make prod
-
-      - name: Publish pre-release
-        if: github.ref_type == 'branch'
-        run: npx @vscode/vsce@^4 publish --oidc --pre-release --packagePath acpcode.vsix
-
-      - name: Publish release
-        if: github.ref_type == 'tag'
-        run: npx @vscode/vsce@^4 publish --oidc --packagePath acpcode.vsix
+      - run: npx @vscode/vsce@^4 publish --oidc --packagePath acpcode.vsix
