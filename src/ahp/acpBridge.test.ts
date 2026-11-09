@@ -12,6 +12,7 @@ import {
   PendingMessageKind,
   ResponsePartKind,
   type ChatState,
+  type FileEdit,
   type SessionChatSummary,
   type SessionState,
   SessionStatus,
@@ -1225,4 +1226,42 @@ test("a simple attachment reaches the agent as its model representation", async 
       data: Buffer.from("2 errors").toString("base64"),
     },
   ]);
+});
+
+test("an edit shows as a file edit whose sides Chat reads from the host", async () => {
+  const t = await withRunningTurn();
+  const read = t.hooks.handlers.resourceRead as (p: unknown) => {
+    data: string;
+  };
+
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "e1",
+    title: "Edit a.txt",
+    kind: "edit",
+    content: [
+      {
+        type: "diff",
+        path: "/w/a.txt",
+        oldText: "a\nb\n",
+        newText: "a\nc\nd\n",
+      },
+    ],
+  });
+
+  const part = t.state().activeTurn?.responseParts[0];
+  assert.equal(part?.kind, ResponsePartKind.ToolCall);
+  const [edit] = (part as { toolCall: { content: FileEdit[] } }).toolCall
+    .content;
+  assert.equal(edit.before?.uri, "file:///w/a.txt");
+  // Plain paths: Chat sends back what its URI parser makes of them.
+  assert.match(edit.after!.content.uri, /^acpcode-content:\/[0-9a-f]+$/);
+  assert.deepEqual(edit.diff, { added: 2, removed: 1 });
+  assert.equal(read({ uri: edit.before!.content.uri }).data, "a\nb\n");
+  assert.equal(read({ uri: edit.after!.content.uri }).data, "a\nc\nd\n");
+
+  (t.hooks.handlers.disposeSession as (p: unknown) => null)({
+    channel: "ahp-session:/acp-claude/draft",
+  });
+  assert.throws(() => read({ uri: edit.after!.content.uri }), /not found/);
 });

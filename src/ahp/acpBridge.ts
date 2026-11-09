@@ -13,6 +13,7 @@ import {
   ChatOriginKind,
   ChatSourceKind,
   ConfirmationOptionKind,
+  ContentEncoding,
   JsonRpcErrorCodes,
   MessageAttachmentKind,
   MessageKind,
@@ -31,13 +32,15 @@ import {
   type CreateChatParams,
   type CreateSessionParams,
   type Message,
+  type ResourceReadResult,
   type SessionChatSummary,
   type SessionState,
   type SessionSummary,
   type StateAction,
   type ToolResultContent,
 } from "@microsoft/agent-host-protocol";
-import { randomUUID } from "node:crypto";
+import { diffLines } from "diff";
+import { createHash, randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -52,7 +55,6 @@ import { agentProcessEnv } from "../acp/bridges.ts";
 import { removeClaudeJob } from "../acp/claudeJobs.ts";
 import type { Disposable, Output } from "../shared/events.ts";
 import { type Attachment, stopNotice } from "../shared/sessionViewProtocol.ts";
-import { buildDiffText } from "../webview/diffText.ts";
 import {
   accepts,
   configSchema,
@@ -192,6 +194,9 @@ const directoryUris = (binding: Binding): string[] =>
 /** AHP provider IDs double as URI schemes VS Code builds draft-session
  *  resources from (`<provider>:/untitled-<uuid>`), so they must be
  *  scheme-safe — agent display names aren't. */
+/** Content URIs of diff sides; see `storeContent`. */
+const CONTENT_SCHEME = "acpcode-content";
+
 const providerId = (agent: AgentConfig): string =>
   `acp-${agent.name
     .toLowerCase()
@@ -211,31 +216,6 @@ const plainChoice = (
     options.find(o => o.kind.startsWith(kind))
   );
 };
-
-function toolContent(
-  content: ToolCallContent[] | null | undefined,
-): ToolResultContent[] | undefined {
-  if (!content?.length) {
-    return undefined;
-  }
-  return content.flatMap((item): ToolResultContent[] => {
-    if (item.type === "content" && item.content.type === "text") {
-      return [{ type: ToolResultContentType.Text, text: item.content.text }];
-    }
-    if (item.type === "diff") {
-      // ponytail: plain-text diff; AHP's FileEdit content needs the client to
-      // `resourceRead` both sides through us — add when diffs need the
-      // native diff editor.
-      return [
-        {
-          type: ToolResultContentType.Text,
-          text: `${item.path}\n${buildDiffText(item.oldText ?? "", item.newText)}`,
-        },
-      ];
-    }
-    return [];
-  });
-}
 
 /** VS Code-side attachments → the shape `AgentClient.prompt()` already
  *  knows how to turn into ACP content blocks. */
@@ -329,6 +309,8 @@ export class AcpAgentHost implements Disposable {
   private readonly env: AgentHostEnvironment;
   private readonly knownOptions: Record<string, SessionConfigOption[]>;
   private readonly imageSupport: Record<string, boolean>;
+  /** Diff sides served by `resourceRead`, by content URI. */
+  private readonly contents = new Map<string, { chat: string; text: string }>();
   private readonly directories: Record<string, string[]>;
   // Agents whose last listing failed; see `bridgesChanged()`.
   private readonly unlisted = new Set<string>();
@@ -375,6 +357,7 @@ export class AcpAgentHost implements Disposable {
             };
           },
           sessionConfigCompletions: () => ({ items: [] }),
+          resourceRead: (params: { uri: string }) => this.readContent(params),
           completions: (params: CompletionsParams) => this.completions(params),
         },
         completionTriggerCharacters: TRIGGER_CHARACTERS,
@@ -1262,6 +1245,11 @@ export class AcpAgentHost implements Disposable {
       this.pool.get(chat.agent.name)?.cancelPrompt(chat.sessionId);
     }
     this.bindings.delete(chat.chatUri);
+    for (const [uri, content] of this.contents) {
+      if (content.chat === chat.chatUri) {
+        this.contents.delete(uri);
+      }
+    }
     if (chat.sessionId) {
       this.byAcpSession.delete(`${chat.agent.name}\0${chat.sessionId}`);
     }
@@ -2106,12 +2094,76 @@ export class AcpAgentHost implements Disposable {
     this.setToolContent(binding, turnId, call);
   }
 
+  private toolContent(
+    binding: Binding,
+    content: ToolCallContent[] | null | undefined,
+  ): ToolResultContent[] | undefined {
+    if (!content?.length) {
+      return undefined;
+    }
+    return content.flatMap((item): ToolResultContent[] => {
+      if (item.type === "content" && item.content.type === "text") {
+        return [{ type: ToolResultContentType.Text, text: item.content.text }];
+      }
+      if (item.type === "diff") {
+        const file = pathToFileURL(item.path).href;
+        const side = (text: string) => ({
+          uri: file,
+          content: {
+            uri: this.storeContent(binding, text),
+            contentType: "text/plain",
+          },
+        });
+        let added = 0;
+        let removed = 0;
+        for (const change of diffLines(item.oldText ?? "", item.newText)) {
+          added += change.added ? (change.count ?? 0) : 0;
+          removed += change.removed ? (change.count ?? 0) : 0;
+        }
+        return [
+          {
+            type: ToolResultContentType.FileEdit,
+            // No old text: the file is new.
+            ...(typeof item.oldText === "string" && {
+              before: side(item.oldText),
+            }),
+            after: side(item.newText),
+            diff: { added, removed },
+          },
+        ];
+      }
+      return [];
+    });
+  }
+
+  /** Keeps a diff side for Chat to `resourceRead`, while the chat is open.
+   *  Its URI is a hash: a plain path survives Chat's URI round trip, and a
+   *  side sent again (each update repeats it) is kept once. */
+  private storeContent(binding: Binding, text: string): string {
+    const hash = createHash("sha256")
+      .update(binding.chatUri)
+      .update("\0")
+      .update(text)
+      .digest("hex");
+    const uri = `${CONTENT_SCHEME}:/${hash}`;
+    this.contents.set(uri, { chat: binding.chatUri, text });
+    return uri;
+  }
+
+  private readContent({ uri }: { uri: string }): ResourceReadResult {
+    const data = this.contents.get(uri)?.text;
+    if (data === undefined) {
+      throw new AhpRequestError(AhpErrorCodes.NotFound, `${uri} not found`);
+    }
+    return { data, encoding: ContentEncoding.Utf8, contentType: "text/plain" };
+  }
+
   private setToolContent(
     binding: Binding,
     turnId: string,
     update: ToolCallUpdate,
   ): void {
-    const content = toolContent(update.content);
+    const content = this.toolContent(binding, update.content);
     const tracking = binding.toolCalls.get(update.toolCallId);
     if (!content || !tracking) {
       return;
@@ -2146,7 +2198,8 @@ export class AcpAgentHost implements Disposable {
         result: {
           success: update.status === "completed",
           pastTenseMessage: tracking.title,
-          content: toolContent(update.content) ?? tracking.content,
+          content:
+            this.toolContent(binding, update.content) ?? tracking.content,
           ...(update.status === "failed"
             ? { error: { message: tracking.title } }
             : {}),
