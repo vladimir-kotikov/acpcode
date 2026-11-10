@@ -51,6 +51,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   describeError,
   type AgentClient,
+  type ElicitationRequestEvent,
   type SessionListChanges,
 } from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
@@ -77,6 +78,7 @@ import {
   resolveModelConfig,
   type ConfigValue,
 } from "./configOptions.ts";
+import { elicitationResponseOf, inputRequestOf } from "./elicitation.ts";
 import { AhpRequestError, AhpServer, ROOT_CHANNEL } from "./server.ts";
 
 const DEFAULT_CHAT_TITLE = "New chat";
@@ -183,6 +185,8 @@ interface Binding {
   markdownPartId?: string;
   reasoningPartId?: string;
   readonly toolCalls: Map<string, ToolCallTracking>;
+  /** The running turn's unanswered forms, by input request id. */
+  inputs?: Map<string, ElicitationRequestEvent>;
   /** The ACP session's config options, once it's created or loaded. */
   configOptions?: SessionConfigOption[];
   /** The ACP session's slash commands, once the agent has announced them. */
@@ -857,6 +861,13 @@ export class AcpAgentHost implements Disposable {
           this.onPermissionRequest(target, request);
         }
       });
+      client.onElicitationRequest(request =>
+        this.onElicitationRequest(
+          client,
+          this.byAcpSession.get(`${agentName}\0${request.sessionId}`),
+          request,
+        ),
+      );
     }
     return client;
   }
@@ -2124,6 +2135,34 @@ export class AcpAgentHost implements Disposable {
         }
         this.clearTurn(binding);
         return;
+      case ActionType.ChatInputCompleted: {
+        const pending = binding.inputs?.get(action.requestId);
+        if (!pending) {
+          return;
+        }
+        binding.inputs!.delete(action.requestId);
+        // Applied already: its answers are the drafts plus the action's.
+        const part = (
+          this.server.stateOf(binding.chatUri) as ChatState | undefined
+        )?.activeTurn?.responseParts.find(
+          p =>
+            p.kind === ResponsePartKind.InputRequest &&
+            p.request.id === action.requestId,
+        );
+        this.pool
+          .get(binding.agent.name)
+          ?.resolveElicitation(
+            pending.requestId,
+            elicitationResponseOf(
+              pending.request.requestedSchema,
+              action.response,
+              part?.kind === ResponsePartKind.InputRequest
+                ? part.request.answers
+                : action.answers,
+            ),
+          );
+        return;
+      }
       case ActionType.ChatToolCallConfirmed: {
         const tracking = binding.toolCalls.get(action.toolCallId);
         const permission = tracking?.permission;
@@ -2376,6 +2415,13 @@ export class AcpAgentHost implements Disposable {
    *  during it can be applied now. */
   private clearTurn(binding: Binding): void {
     binding.turnId = undefined;
+    // Chat can't answer them now; the agent stops waiting.
+    for (const { requestId } of binding.inputs?.values() ?? []) {
+      this.pool
+        .get(binding.agent.name)
+        ?.resolveElicitation(requestId, { action: "cancel" });
+    }
+    binding.inputs?.clear();
     if (binding.directoriesDirty) {
       binding.directoriesDirty = false;
       void this.applyDirectories(binding);
@@ -2809,6 +2855,33 @@ export class AcpAgentHost implements Disposable {
           ? ConfirmationOptionKind.Approve
           : ConfirmationOptionKind.Deny,
       })),
+    });
+  }
+
+  /** Asks the agent's form in the running turn, as questions Chat shows
+   *  inline. */
+  private onElicitationRequest(
+    client: AgentClient,
+    binding: Binding | undefined,
+    request: ElicitationRequestEvent,
+  ): void {
+    const turnId = binding?.turnId;
+    // None to show it in, or a cancelled prompt's.
+    if (!binding || !turnId || (binding.run && !binding.run.prompting)) {
+      client.resolveElicitation(request.requestId, { action: "cancel" });
+      return;
+    }
+    binding.markdownPartId = undefined;
+    binding.reasoningPartId = undefined;
+    const id = randomUUID();
+    (binding.inputs ??= new Map()).set(id, request);
+    this.server.dispatch(binding.chatUri, {
+      type: ActionType.ChatInputRequested,
+      request: inputRequestOf(
+        id,
+        request.request.message,
+        request.request.requestedSchema,
+      ),
     });
   }
 

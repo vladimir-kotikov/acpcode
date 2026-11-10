@@ -8,6 +8,9 @@ import type {
 import {
   ActionType,
   AhpErrorCodes,
+  ChatInputAnswerState,
+  ChatInputAnswerValueKind,
+  ChatInputResponseKind,
   ChatInteractivity,
   ChatSourceKind,
   PendingMessageKind,
@@ -24,6 +27,7 @@ import assert from "node:assert/strict";
 import { type TestContext, test } from "node:test";
 import type {
   AgentClient,
+  ElicitationRequestEvent,
   SessionListChanges,
   SteeringResponse,
 } from "../acp/agentClient.ts";
@@ -104,6 +108,11 @@ function setup(
   const askPermission = (
     request: Parameters<(typeof permissionListeners)[number]>[0],
   ) => permissionListeners.forEach(l => l(request));
+  const elicitationListeners: ((request: ElicitationRequestEvent) => void)[] =
+    [];
+  /** The agent asking the user to fill in a form. */
+  const askForm = (request: ElicitationRequestEvent) =>
+    elicitationListeners.forEach(l => l(request));
   const prompts: ((result: { stopReason: string; usage?: unknown }) => void)[] =
     [];
   /** The agent ending its oldest unanswered prompt. */
@@ -125,6 +134,13 @@ function setup(
     },
     resolvePermission: (...args: unknown[]) => {
       calls.push({ method: "resolvePermission", args });
+    },
+    onElicitationRequest: (l: (typeof elicitationListeners)[number]) => {
+      elicitationListeners.push(l);
+      return disposable;
+    },
+    resolveElicitation: (...args: unknown[]) => {
+      calls.push({ method: "resolveElicitation", args });
     },
     subscribeSessionList: () => Promise.resolve("sub"),
     loadSession: (sessionId: string) => {
@@ -247,6 +263,7 @@ function setup(
     clientAction,
     replay,
     askPermission,
+    askForm,
     endPrompt,
   };
 }
@@ -1615,6 +1632,117 @@ test("a shell command is titled with its input's description, not its command li
   assert.equal(call("b1")?.intention, "Run the tests");
   assert.equal(call("i1")?.intention, undefined);
   assert.equal(call("b1")?.pastTenseMessage, "Run the tests");
+});
+
+const form = (requestId: string): ElicitationRequestEvent => ({
+  requestId,
+  sessionId: "draft",
+  request: {
+    mode: "form",
+    sessionId: "draft",
+    message: "Which database?",
+    requestedSchema: {
+      type: "object",
+      properties: {
+        question_0: {
+          type: "string",
+          oneOf: [
+            { const: "Postgres", title: "Postgres" },
+            { const: "Redis", title: "Redis" },
+          ],
+        },
+        question_0_custom: { type: "string", title: "Other" },
+      },
+    },
+  },
+});
+
+const elicitationsResolved = (calls: { method: string; args: unknown[] }[]) =>
+  calls.filter(c => c.method === "resolveElicitation").map(c => c.args);
+
+test("an agent's form is asked in the running turn and answered with Chat's answers", async () => {
+  const t = await withRunningTurn();
+
+  t.askForm(form("elicit-1"));
+  const part = t.state().activeTurn?.responseParts.at(-1);
+  assert.equal(part?.kind, ResponsePartKind.InputRequest);
+  const { request } = part as { request: { id: string; message?: string } };
+  assert.equal(request.message, "Which database?");
+  // A draft Chat synced, then the submit without answers of its own.
+  t.clientAction(t.chat, {
+    type: ActionType.ChatInputAnswerChanged,
+    requestId: request.id,
+    questionId: "question_0",
+    answer: {
+      state: ChatInputAnswerState.Submitted,
+      value: { kind: ChatInputAnswerValueKind.Selected, value: "Redis" },
+    },
+  } as StateAction);
+  t.clientAction(t.chat, {
+    type: ActionType.ChatInputCompleted,
+    requestId: request.id,
+    response: ChatInputResponseKind.Accept,
+  } as StateAction);
+
+  assert.deepEqual(elicitationsResolved(t.calls), [
+    ["elicit-1", { action: "accept", content: { question_0: "Redis" } }],
+  ]);
+});
+
+test("a form still unanswered when its turn ends is cancelled", async () => {
+  const t = await withRunningTurn();
+
+  t.askForm(form("elicit-1"));
+  t.endPrompt();
+  await settle();
+
+  assert.deepEqual(elicitationsResolved(t.calls), [
+    ["elicit-1", { action: "cancel" }],
+  ]);
+});
+
+test("a form is declined when Chat declines it, and cancelled when the turn is stopped", async () => {
+  const t = await withRunningTurn();
+  const idOf = () =>
+    (
+      t.state().activeTurn?.responseParts.at(-1) as {
+        request: { id: string };
+      }
+    ).request.id;
+
+  t.askForm(form("elicit-1"));
+  t.clientAction(t.chat, {
+    type: ActionType.ChatInputCompleted,
+    requestId: idOf(),
+    response: ChatInputResponseKind.Decline,
+  } as StateAction);
+  t.askForm(form("elicit-2"));
+  t.clientAction(t.chat, {
+    type: ActionType.ChatTurnCancelled,
+    turnId: "t1",
+    duration: 0,
+  } as StateAction);
+
+  assert.deepEqual(elicitationsResolved(t.calls), [
+    ["elicit-1", { action: "decline" }],
+    ["elicit-2", { action: "cancel" }],
+  ]);
+});
+
+test("a form with no turn of this host's to show it in is cancelled", async () => {
+  const t = setup();
+  await (t.hooks.handlers.createSession as (p: unknown) => Promise<null>)({
+    channel: "ahp-session:/acp-claude/draft",
+    provider: "acp-claude",
+  });
+
+  t.askForm(form("elicit-1"));
+  t.askForm({ ...form("elicit-2"), sessionId: "unknown" });
+
+  assert.deepEqual(elicitationsResolved(t.calls), [
+    ["elicit-1", { action: "cancel" }],
+    ["elicit-2", { action: "cancel" }],
+  ]);
 });
 
 test("a shell command's card shows its output, not its description or Markdown fence", async () => {

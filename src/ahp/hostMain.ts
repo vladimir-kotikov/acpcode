@@ -93,7 +93,10 @@ const folders = (): string[] => {
   return windowFolders(windows);
 };
 
-const pool = new AgentConnectionPool(name => output(`[${name}] `));
+// Chat shows the agents' forms as questions (see `onElicitationRequest`).
+const pool = new AgentConnectionPool(name => output(`[${name}] `), {
+  elicitation: true,
+});
 const host = new AcpAgentHost(pool, log, {
   agents: () => agents,
   folders,
