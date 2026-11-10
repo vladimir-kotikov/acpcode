@@ -12,8 +12,8 @@ import type {
 import {
   ActionType,
   AhpErrorCodes,
-  ChatOriginKind,
   ChatInteractivity,
+  ChatOriginKind,
   ChatSourceKind,
   ConfirmationOptionKind,
   ContentEncoding,
@@ -28,20 +28,20 @@ import {
   ToolResultContentType,
   type AgentInfo,
   type ChatState,
-  type PendingMessage,
   type ChatSummary,
   type CompletionsParams,
   type CompletionsResult,
   type CreateChatParams,
   type CreateSessionParams,
   type Message,
+  type PendingMessage,
   type ResourceReadResult,
   type SessionChatSummary,
   type SessionState,
-  type UsageInfo,
   type SessionSummary,
   type StateAction,
   type ToolResultContent,
+  type UsageInfo,
 } from "@microsoft/agent-host-protocol";
 import { diffLines } from "diff";
 import { createHash, randomUUID } from "node:crypto";
@@ -58,7 +58,15 @@ import type { AgentConfig } from "../acp/agents/config.ts";
 import { agentProcessEnv } from "../acp/bridges.ts";
 import { removeClaudeJob, sessionOwner } from "../acp/claudeJobs.ts";
 import type { Disposable, Output } from "../shared/events.ts";
-import { type Attachment, stopNotice } from "../shared/sessionViewProtocol.ts";
+import { stopNotice, type Attachment } from "../shared/sessionViewProtocol.ts";
+import {
+  TRIGGER_CHARACTERS,
+  commandItems,
+  fileItems,
+  listFiles,
+  mentionToken,
+  slashToken,
+} from "./completions.ts";
 import {
   accepts,
   configSchema,
@@ -69,14 +77,6 @@ import {
   resolveModelConfig,
   type ConfigValue,
 } from "./configOptions.ts";
-import {
-  TRIGGER_CHARACTERS,
-  commandItems,
-  fileItems,
-  listFiles,
-  mentionToken,
-  slashToken,
-} from "./completions.ts";
 import { AhpRequestError, AhpServer, ROOT_CHANNEL } from "./server.ts";
 
 const DEFAULT_CHAT_TITLE = "New chat";
@@ -346,7 +346,7 @@ function turnUsage(usage: Usage): UsageInfo {
   return {
     inputTokens: Math.max(0, usage.totalTokens - usage.outputTokens),
     outputTokens: usage.outputTokens,
-    ...(usage.cachedReadTokens != null
+    ...(typeof usage.cachedReadTokens === "number"
       ? { cacheReadTokens: usage.cachedReadTokens }
       : {}),
   };
@@ -475,9 +475,8 @@ export class AcpAgentHost implements Disposable {
     this.server = new AhpServer(
       {
         handlers: {
-          listSessions: () => this.listSessions(),
-          createSession: (params: CreateSessionParams) =>
-            this.createSession(params),
+          listSessions: this.listSessions,
+          createSession: this.createSession,
           disposeSession: ({ channel }: { channel: string }) =>
             this.deleteSession(channel),
           createChat: (params: CreateChatParams) => this.createChat(params),
@@ -504,15 +503,13 @@ export class AcpAgentHost implements Disposable {
           },
           sessionConfigCompletions: () => ({ items: [] }),
           resourceRead: (params: { uri: string }) => this.readContent(params),
-          completions: (params: CompletionsParams) => this.completions(params),
+          completions: this.completions,
         },
         completionTriggerCharacters: TRIGGER_CHARACTERS,
-        materialize: channel => this.materialize(channel),
-        onClientAction: (channel, action) =>
-          this.onClientAction(channel, action),
-        rejectClientAction: (channel, action) =>
-          this.rejectClientAction(channel, action),
-        unsubscribed: channel => this.unsubscribed(channel),
+        materialize: this.materialize,
+        onClientAction: this.onClientAction,
+        rejectClientAction: this.rejectClientAction,
+        unsubscribed: this.unsubscribed,
       },
       output,
       () => this.defaultCwd() && pathToFileURL(this.defaultCwd()).href,
@@ -722,10 +719,10 @@ export class AcpAgentHost implements Disposable {
 
   /** The primary directory is the agent's cwd, which fixes where its session
    *  lives: Chat may add to the set but not remove or replace the first. */
-  private rejectClientAction(
+  private rejectClientAction = (
     channel: string,
     action: StateAction,
-  ): string | undefined {
+  ): string | undefined => {
     const binding = this.bindings.get(channel);
     if (
       binding?.owner &&
@@ -756,7 +753,7 @@ export class AcpAgentHost implements Disposable {
         path.resolve(binding.cwd)
       ? "the primary working directory can't be changed"
       : undefined;
-  }
+  };
 
   /** Applies AHP config values (`acp.<id>` keys) to the ACP session, then
    *  publishes what the agent actually ended up with. */
@@ -869,9 +866,8 @@ export class AcpAgentHost implements Disposable {
 
   // --- session catalogue -----------------------------------------------------
 
-  private listSessions(): Promise<{ items: SessionSummary[] }> {
-    return this.listAgents(this.env.agents()).then(items => ({ items }));
-  }
+  private listSessions = (): Promise<{ items: SessionSummary[] }> =>
+    this.listAgents(this.env.agents()).then(items => ({ items }));
 
   /** A bridge was installed or updated: lists the agents whose last listing
    *  failed (e.g. their bridge wasn't installed yet) and announces their
@@ -1446,7 +1442,7 @@ export class AcpAgentHost implements Disposable {
    *  history replays into the chat's turns, and its config options are known,
    *  before either snapshot is taken. Unknown URIs (incl. VS Code's
    *  `<provider>:/untitled-…` drafts) are left alone and answer NotFound. */
-  private async materialize(channel: string): Promise<void> {
+  private materialize = async (channel: string): Promise<void> => {
     if (!this.bindings.has(channel)) {
       await this.restore(channel);
     }
@@ -1484,7 +1480,7 @@ export class AcpAgentHost implements Disposable {
     if (channel === binding.chatUri) {
       await loaded;
     }
-  }
+  };
 
   /** What else runs a chat's ACP session, per `sessionOwner`. Only Claude
    *  sessions have one. */
@@ -1504,7 +1500,7 @@ export class AcpAgentHost implements Disposable {
   /** Chat stopped showing a chat that something else runs: it's forgotten
    *  here, so opening it again shows it as it is then — its own, if its
    *  owner is gone. Chat can't be told a chat stopped being read-only. */
-  private unsubscribed(channel: string): void {
+  private unsubscribed = (channel: string): void => {
     const binding = this.bindings.get(channel);
     if (!binding?.owner || channel !== binding.chatUri) {
       return;
@@ -1525,7 +1521,7 @@ export class AcpAgentHost implements Disposable {
         changes: { interactivity: ChatInteractivity.Full },
       });
     }
-  }
+  };
 
   /** A chat something else runs follows it: its history loads again as the
    *  session's row changes, e.g. as a turn there ends. */
@@ -1701,7 +1697,7 @@ export class AcpAgentHost implements Disposable {
     return binding.ready;
   }
 
-  private createSession(params: CreateSessionParams): Promise<null> {
+  private createSession = (params: CreateSessionParams): Promise<null> => {
     const agent = this.env
       .agents()
       .find(a => providerId(a) === params.provider);
@@ -1775,32 +1771,31 @@ export class AcpAgentHost implements Disposable {
         return null;
       },
     );
-  }
+  };
 
   /** Chat deleted the session: its chats' ACP sessions go too, for good. */
-  private deleteSession(sessionUri: string): null {
+  private deleteSession = (sessionUri: string): null => {
+    // Read before disposing: that forgets the session's chats.
     const chats = this.chatsOf(sessionUri);
     this.disposeSession(sessionUri);
-    for (const chat of chats) {
-      void this.deleteFromAgent(chat);
-    }
+    chats.forEach(this.deleteFromAgent);
     return null;
-  }
+  };
 
   /** Chat deleted a forked chat: its ACP session goes too, for good. */
-  private deleteChat(chatUri: string): null {
+  private deleteChat = (chatUri: string): null => {
     const chat = this.bindings.get(chatUri);
     this.disposeChat(chatUri);
     if (chat && !chat.primary) {
       void this.deleteFromAgent(chat);
     }
     return null;
-  }
+  };
 
   /** Deletes a chat's ACP session — its transcript — and its `claude agents`
    *  job. Only one the agent has stored (listed, forked or prompted): Chat
    *  also disposes the drafts it never sent. */
-  private async deleteFromAgent(chat: Binding): Promise<void> {
+  private deleteFromAgent = async (chat: Binding): Promise<void> => {
     if (chat.listedStatus === undefined && !chat.origin && !chat.prompted) {
       return;
     }
@@ -1822,7 +1817,7 @@ export class AcpAgentHost implements Disposable {
     // bring it back.
     await this.removeJob(chat);
     await this.deleteAcpSession(this.connect(chat), chat.sessionId, key());
-  }
+  };
 
   /** Whether Chat deleted `sessionId`. One whose row comes back once its
    *  delete is over (a job's last write recreated the transcript) is deleted
@@ -1942,9 +1937,9 @@ export class AcpAgentHost implements Disposable {
 
   // --- input completions -----------------------------------------------------
 
-  private completions(
+  private completions = (
     params: CompletionsParams,
-  ): CompletionsResult | Promise<CompletionsResult> {
+  ): CompletionsResult | Promise<CompletionsResult> => {
     // VS Code only asks once a chat's session exists, so there's always one.
     const binding = this.bindings.get(params.channel);
     if (!binding) {
@@ -1963,11 +1958,11 @@ export class AcpAgentHost implements Disposable {
     return listFiles(binding.cwd).then(files => ({
       items: fileItems(binding.cwd, files, mention),
     }));
-  }
+  };
 
   // --- client actions --------------------------------------------------------
 
-  private onClientAction(channel: string, action: StateAction): void {
+  private onClientAction = (channel: string, action: StateAction): void => {
     const binding = this.bindings.get(channel);
     if (!binding) {
       return;
@@ -2058,7 +2053,7 @@ export class AcpAgentHost implements Disposable {
         return;
       }
     }
-  }
+  };
 
   private async runTurn(
     binding: Binding,
