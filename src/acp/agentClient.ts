@@ -8,6 +8,9 @@ import {
   type AvailableCommand,
   type ClientContext,
   type ContentBlock,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
+  type ElicitationSchema,
   type ForkSessionResponse,
   type LoadSessionResponse,
   type NewSessionResponse,
@@ -192,6 +195,18 @@ export type PermissionRequestEvent = {
   toolCall: ToolCallUpdate;
   options: PermissionOption[];
 };
+/** A form the agent asks the user to fill in (ACP elicitation), for a
+ *  session; answer with `resolveElicitation`. */
+export type ElicitationRequestEvent = {
+  requestId: string;
+  sessionId: SessionId;
+  request: CreateElicitationRequest & {
+    mode: "form";
+    sessionId: SessionId;
+    toolCallId?: string | null;
+    requestedSchema: ElicitationSchema;
+  };
+};
 export type TranscriptResetEvent = {
   sessionId: SessionId;
 };
@@ -246,12 +261,21 @@ export class AgentClient implements Disposable {
       resolve: (response: RequestPermissionResponse) => void;
     }
   >();
+  private readonly pendingElicitations = new Map<
+    string,
+    {
+      sessionId: SessionId;
+      resolve: (response: CreateElicitationResponse) => void;
+    }
+  >();
   private readonly output: Output;
   private permissionCounter = 0;
+  private elicitationCounter = 0;
   /** See `compactionAsToolCall`. */
   // ponytail: kept for the connection's lifetime, a few KB per compaction.
   private readonly compactions = new Map<string, Compaction>();
   private readonly cwd: string;
+  private readonly elicitation: boolean;
   // Advertised via InitializeResponse._meta.steering.supported (the agreed
   // ACP steering wire protocol, "_session/steering" — not yet a built-in
   // method in the SDK's schema, called through the generic request() escape
@@ -276,6 +300,8 @@ export class AgentClient implements Disposable {
     requestId: string;
   }>();
   private readonly transcriptResetEmitter = new Emitter<TranscriptResetEvent>();
+  private readonly elicitationRequestEmitter =
+    new Emitter<ElicitationRequestEvent>();
 
   readonly onConnectionStateChanged = this.connectionStateEmitter.event;
   readonly onSessionUpdate = this.sessionUpdateEmitter.event;
@@ -285,6 +311,8 @@ export class AgentClient implements Disposable {
   readonly onSessionListChanges = this.sessionListChangesEmitter.event;
   readonly onPermissionRequest = this.permissionRequestEmitter.event;
   readonly onPermissionResolved = this.permissionResolvedEmitter.event;
+  /** Only with `elicitation` on; see the constructor. */
+  readonly onElicitationRequest = this.elicitationRequestEmitter.event;
   // Fired instead of (just before) the normal echo when `prompt()` recognizes
   // the agent's own history-reset command (see `RESET_COMMANDS`) — every view
   // sharing this connection's session needs it, same reasoning as
@@ -292,9 +320,17 @@ export class AgentClient implements Disposable {
   // rather than being each view's own problem to detect.
   readonly onTranscriptReset = this.transcriptResetEmitter.event;
 
-  constructor(cwd: string, output: Output) {
+  /** `elicitation`: tell the agent it can ask the user to fill in forms,
+   *  for a frontend that answers `onElicitationRequest`. The agent waits for
+   *  each answer. */
+  constructor(
+    cwd: string,
+    output: Output,
+    options: { elicitation?: boolean } = {},
+  ) {
     this.cwd = cwd;
     this.output = output;
+    this.elicitation = options.elicitation ?? false;
   }
 
   /** Spawns the agent's bridge, installing it first if needed (see
@@ -388,6 +424,32 @@ export class AgentClient implements Disposable {
                   ? compactSummaryAsToolCall(update)
                   : update,
         });
+      })
+      // After `session/update`: the SDK passes each incoming message down its
+      // handlers in order, an await each, while answers settle at once; a
+      // prompt's last update must still beat its answer.
+      .onRequest(methods.client.elicitation.create, ctx => {
+        const request = ctx.params as ElicitationRequestEvent["request"];
+        // Only forms are advertised; a request outside a session (e.g. one
+        // tied to a pending `session/new`) has no chat to show it in.
+        if (request.mode !== "form" || typeof request.sessionId !== "string") {
+          return { action: "decline" };
+        }
+        return new Promise<CreateElicitationResponse>(resolve => {
+          const requestId = `elicit-${++this.elicitationCounter}`;
+          this.pendingElicitations.set(requestId, {
+            sessionId: request.sessionId,
+            resolve,
+          });
+          ctx.signal.addEventListener("abort", () =>
+            this.resolveElicitation(requestId, { action: "cancel" }),
+          );
+          this.elicitationRequestEmitter.fire({
+            requestId,
+            sessionId: request.sessionId,
+            request,
+          });
+        });
       });
 
     const connection = app.connect(stream);
@@ -403,6 +465,7 @@ export class AgentClient implements Disposable {
         clientCapabilities: {
           // See `compactionAsToolCall`.
           session: { compaction: {} },
+          ...(this.elicitation && { elicitation: { form: {} } }),
           _meta: {
             jetbrains: {
               air: {
@@ -919,6 +982,11 @@ export class AgentClient implements Disposable {
         this.resolvePermission(requestId, null);
       }
     }
+    for (const [requestId, pending] of this.pendingElicitations) {
+      if (pending.sessionId === sessionId) {
+        this.resolveElicitation(requestId, { action: "cancel" });
+      }
+    }
   }
 
   async setConfigOption(
@@ -955,6 +1023,14 @@ export class AgentClient implements Disposable {
     // an editor tab) never learns the request settled and keeps showing its
     // buttons as active.
     this.permissionResolvedEmitter.fire({ requestId });
+  }
+
+  resolveElicitation(
+    requestId: string,
+    response: CreateElicitationResponse,
+  ): void {
+    this.pendingElicitations.get(requestId)?.resolve(response);
+    this.pendingElicitations.delete(requestId);
   }
 
   private disconnectChild(): void {

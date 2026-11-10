@@ -19,9 +19,14 @@ export class AgentConnectionPool implements Disposable {
   private readonly connecting = new Map<string, Promise<AgentClient>>();
   // One log per agent, named after it (an output channel in the extension).
   private readonly createOutput: (agentName: string) => Output;
+  private readonly clientOptions: ConstructorParameters<typeof AgentClient>[2];
 
-  constructor(createOutput: (agentName: string) => Output) {
+  constructor(
+    createOutput: (agentName: string) => Output,
+    clientOptions: ConstructorParameters<typeof AgentClient>[2] = {},
+  ) {
     this.createOutput = createOutput;
+    this.clientOptions = clientOptions;
   }
 
   async connect(agent: AgentConfig, cwd: string): Promise<AgentClient> {
@@ -34,7 +39,11 @@ export class AgentConnectionPool implements Disposable {
       return inFlight;
     }
     const promise = (async () => {
-      const client = new AgentClient(cwd, this.createOutput(agent.name));
+      const client = new AgentClient(
+        cwd,
+        this.createOutput(agent.name),
+        this.clientOptions,
+      );
       await client.connect(agent);
       this.clients.set(agent.name, client);
       return client;

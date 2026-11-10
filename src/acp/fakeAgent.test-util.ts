@@ -1,7 +1,7 @@
 // A scripted ACP agent bridge for tests: `client.connect(agent,
 // fakeAgent(t, handle))` spawns it in place of the real bridge. It answers
-// `initialize` itself, advertising `agentCapabilities`, and hands every other
-// JSON-RPC message to `handle`,
+// `initialize` itself, advertising `agentCapabilities`, and hands every
+// JSON-RPC message to `handle` (`initialize` too, after answering it),
 // which runs in the child process — so it must be self-contained, with no
 // closure over the test's variables.
 import * as fs from "node:fs";
@@ -34,9 +34,8 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   const message = JSON.parse(line);
   if (message.method === "initialize") {
     send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: ${JSON.stringify(agentCapabilities)} } });
-  } else {
-    handle(message, send);
   }
+  handle(message, send);
 });
 `,
   );

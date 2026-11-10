@@ -2,8 +2,13 @@
 import assert from "node:assert/strict";
 import { type TestContext, test } from "node:test";
 import type { Attachment } from "../shared/sessionViewProtocol.ts";
-import { AgentClient, type SteeringResponse } from "./agentClient.ts";
+import {
+  AgentClient,
+  type ElicitationRequestEvent,
+  type SteeringResponse,
+} from "./agentClient.ts";
 import { fakeAgent } from "./fakeAgent.test-util.ts";
+import { waitFor } from "./fakeClaude.test-util.ts";
 
 function clientForSteering(response: SteeringResponse) {
   const client = new AgentClient("/workspace", {
@@ -149,6 +154,202 @@ test("cancelling a prompt answers its session's pending permission request as ca
   assert.deepEqual(resolved, [requestId]);
   assert.equal((await turn).stopReason, "cancelled");
   assert.deepEqual(answers, [JSON.stringify({ outcome: "cancelled" })]);
+});
+
+test("an agent's form reaches the frontend and its answer goes back; other kinds are declined", async t => {
+  // Asks a form and a URL on every prompt, reports each answer it got as a
+  // message chunk, and ends the turn after both.
+  const entryPoint = fakeAgent(t, (message, send) => {
+    const answers = globalThis as { answered?: number };
+    if (message.method === "session/prompt") {
+      const scope = { sessionId: message.params.sessionId };
+      send({
+        id: `form-${message.id}`,
+        method: "elicitation/create",
+        params: {
+          ...scope,
+          mode: "form",
+          message: "Name?",
+          requestedSchema: { type: "object", properties: {} },
+        },
+      });
+      send({
+        id: `url-${message.id}`,
+        method: "elicitation/create",
+        params: {
+          ...scope,
+          mode: "url",
+          elicitationId: "e1",
+          url: "https://x",
+          message: "Sign in",
+        },
+      });
+    } else if (/^(form|url)-/.test(String(message.id))) {
+      send({
+        method: "session/update",
+        params: {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: `${message.id} ${JSON.stringify(message.result)}`,
+            },
+          },
+        },
+      });
+      answers.answered = (answers.answered ?? 0) + 1;
+      if (answers.answered === 2) {
+        send({
+          id: Number(String(message.id).split("-")[1]),
+          result: { stopReason: "end_turn" },
+        });
+      }
+    }
+  });
+  const client = new AgentClient(
+    "/",
+    {
+      append: () => undefined,
+      appendLine: () => undefined,
+      dispose: () => undefined,
+    },
+    { elicitation: true },
+  );
+  t.after(() => client.dispose());
+  await client.connect(
+    {
+      name: "fake",
+      kind: "claude",
+      env: { CLAUDE_CODE_EXECUTABLE: "/bin/false" },
+    },
+    entryPoint,
+  );
+  const answers: string[] = [];
+  client.onSessionUpdate(({ update }) => {
+    if (
+      update.sessionUpdate === "agent_message_chunk" &&
+      update.content.type === "text"
+    ) {
+      answers.push(update.content.text);
+    }
+  });
+  const asked: ElicitationRequestEvent[] = [];
+  client.onElicitationRequest(request => {
+    asked.push(request);
+    client.resolveElicitation(request.requestId, {
+      action: "accept",
+      content: { name: "Ada" },
+    });
+  });
+
+  await client.prompt("s1", "hi");
+  // Updates may trail the prompt's answer.
+  await waitFor(() => answers.length === 2);
+
+  assert.deepEqual(
+    asked.map(({ sessionId, request }) => [sessionId, request.message]),
+    [["s1", "Name?"]],
+  );
+  // Without the prompt's request id.
+  assert.deepEqual(answers.map(a => a.replace(/-\d+ /, " ")).sort(), [
+    `form ${JSON.stringify({ action: "accept", content: { name: "Ada" } })}`,
+    `url ${JSON.stringify({ action: "decline" })}`,
+  ]);
+});
+
+/** A client of an agent that asks a form on every prompt when the client
+ *  takes forms, reports the answer as a message chunk and ends the turn;
+ *  without forms it reports `no forms`. `texts` collects the chunks. */
+async function formAsker(t: TestContext, elicitation: boolean) {
+  const entryPoint = fakeAgent(t, (message, send) => {
+    const state = globalThis as { forms?: boolean };
+    const say = (text: string) =>
+      send({
+        method: "session/update",
+        params: {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text },
+          },
+        },
+      });
+    if (message.method === "initialize") {
+      state.forms = !!message.params.clientCapabilities.elicitation?.form;
+    } else if (message.method === "session/prompt" && !state.forms) {
+      say("no forms");
+      send({ id: message.id, result: { stopReason: "end_turn" } });
+    } else if (message.method === "session/prompt") {
+      send({
+        id: `form-${message.id}`,
+        method: "elicitation/create",
+        params: {
+          sessionId: message.params.sessionId,
+          mode: "form",
+          message: "Name?",
+          requestedSchema: { type: "object", properties: {} },
+        },
+      });
+    } else if (String(message.id).startsWith("form-")) {
+      say(JSON.stringify(message.result));
+      send({
+        id: Number(String(message.id).slice("form-".length)),
+        result: { stopReason: "end_turn" },
+      });
+    }
+  });
+  const client = new AgentClient(
+    "/",
+    {
+      append: () => undefined,
+      appendLine: () => undefined,
+      dispose: () => undefined,
+    },
+    { elicitation },
+  );
+  t.after(() => client.dispose());
+  await client.connect(
+    {
+      name: "fake",
+      kind: "claude",
+      env: { CLAUDE_CODE_EXECUTABLE: "/bin/false" },
+    },
+    entryPoint,
+  );
+  const texts: string[] = [];
+  client.onSessionUpdate(({ update }) => {
+    if (
+      update.sessionUpdate === "agent_message_chunk" &&
+      update.content.type === "text"
+    ) {
+      texts.push(update.content.text);
+    }
+  });
+  return { client, texts };
+}
+
+test("forms are offered to the agent only by a frontend that answers them", async t => {
+  const { client, texts } = await formAsker(t, false);
+
+  await client.prompt("s1", "hi");
+  await waitFor(() => texts.length === 1);
+
+  assert.deepEqual(texts, ["no forms"]);
+});
+
+test("cancelling a prompt answers its session's open form as cancelled", async t => {
+  const { client, texts } = await formAsker(t, true);
+  const asked = new Promise(resolve => client.onElicitationRequest(resolve));
+
+  const turn = client.prompt("s1", "hi");
+  await asked;
+  client.cancelPrompt("s2");
+  client.cancelPrompt("s1");
+  await turn;
+  await waitFor(() => texts.length === 1);
+
+  assert.deepEqual(texts, [JSON.stringify({ action: "cancel" })]);
 });
 
 /** A client of an agent advertising `agentCapabilities`, which answers
