@@ -7,6 +7,7 @@ import type {
   ToolCallContent,
   ToolCallUpdate,
   ToolKind,
+  Usage,
 } from "@agentclientprotocol/sdk";
 import {
   ActionType,
@@ -37,6 +38,7 @@ import {
   type ResourceReadResult,
   type SessionChatSummary,
   type SessionState,
+  type UsageInfo,
   type SessionSummary,
   type StateAction,
   type ToolResultContent,
@@ -128,6 +130,9 @@ interface Binding {
   /** The session's first chat. Forked chats (`createChat`) share its URI,
    *  directories and config but each runs its own ACP session. */
   readonly primary: boolean;
+  /** The agent's last context window reading (primary chat only), kept
+   *  for when the session channel is (re)created. */
+  contextUsage?: Record<string, number>;
   /** Set on a forked chat: where it branched off. */
   readonly origin?: { chat: string; turnId: string };
   /** Per turn, the ACP id of its last agent message: the point a fork of
@@ -329,6 +334,23 @@ const plainChoice = (
     options.find(o => o.kind.startsWith(kind))
   );
 };
+
+/** The session `_meta` key VS Code reads its context window gauge from
+ *  (`{currentTokens, tokenLimit, messagesLength}`, all integers). */
+const CONTEXT_USAGE_META = "copilot.usageInfo";
+
+/** A turn's ACP usage as AHP's. VS Code counts cache reads within the input
+ *  tokens; agents differ on that (Claude's input excludes the cache), but
+ *  both bundled ones count every prompt token in the total. */
+function turnUsage(usage: Usage): UsageInfo {
+  return {
+    inputTokens: Math.max(0, usage.totalTokens - usage.outputTokens),
+    outputTokens: usage.outputTokens,
+    ...(usage.cachedReadTokens != null
+      ? { cacheReadTokens: usage.cachedReadTokens }
+      : {}),
+  };
+}
 
 /** VS Code-side attachments → the shape `AgentClient.prompt()` already
  *  knows how to turn into ACP content blocks. */
@@ -1230,6 +1252,9 @@ export class AcpAgentHost implements Disposable {
         schema: configSchema(options, binding.agent.kind),
         values: configValues(options, binding.agent.kind),
       },
+      ...(binding.contextUsage
+        ? { _meta: { [CONTEXT_USAGE_META]: binding.contextUsage } }
+        : {}),
     };
   }
 
@@ -2066,11 +2091,18 @@ export class AcpAgentHost implements Disposable {
         return; // cancelled or truncated meanwhile
       }
       run.prompting = true;
-      const { stopReason, failureTitle } = await client.prompt(
+      const { stopReason, failureTitle, usage } = await client.prompt(
         binding.sessionId!,
         message.text,
         toAttachments(message),
       );
+      if (usage) {
+        this.server.dispatch(binding.chatUri, {
+          type: ActionType.ChatUsage,
+          turnId: run.turnId,
+          usage: turnUsage(usage),
+        });
+      }
       if (failureTitle) {
         this.failTurn(binding, run.turnId, failureTitle);
       } else if (stopReason === "cancelled") {
@@ -2328,6 +2360,38 @@ export class AcpAgentHost implements Disposable {
         this.server.dispatch(binding.sessionUri, {
           type: ActionType.SessionConfigChanged,
           config: configValues(update.configOptions, binding.agent.kind),
+        });
+      }
+      return;
+    }
+    if (update.sessionUpdate === "usage_update") {
+      // ponytail: the gauge is per AHP session, so only the primary chat
+      // fills it; a fork's own context isn't shown. VS Code drops a gauge
+      // whose values aren't integers or whose limit is 0.
+      if (
+        !binding.primary ||
+        !Number.isInteger(update.used) ||
+        !Number.isInteger(update.size) ||
+        update.used < 0 ||
+        update.size <= 0
+      ) {
+        return;
+      }
+      binding.contextUsage = {
+        currentTokens: update.used,
+        tokenLimit: update.size,
+        messagesLength:
+          (this.server.stateOf(binding.chatUri) as ChatState | undefined)?.turns
+            .length ?? 0,
+      };
+      // Before the session channel exists (e.g. during a load), its
+      // creation picks the reading up.
+      const state = this.server.stateOf(binding.sessionUri) as
+        SessionState | undefined;
+      if (state) {
+        this.server.dispatch(binding.sessionUri, {
+          type: ActionType.SessionMetaChanged,
+          _meta: { ...state._meta, [CONTEXT_USAGE_META]: binding.contextUsage },
         });
       }
       return;

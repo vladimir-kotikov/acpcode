@@ -99,10 +99,11 @@ function setup(
   const askPermission = (
     request: Parameters<(typeof permissionListeners)[number]>[0],
   ) => permissionListeners.forEach(l => l(request));
-  const prompts: ((result: { stopReason: string }) => void)[] = [];
+  const prompts: ((result: { stopReason: string; usage?: unknown }) => void)[] =
+    [];
   /** The agent ending its oldest unanswered prompt. */
-  const endPrompt = (stopReason = "end_turn") =>
-    prompts.shift()!({ stopReason });
+  const endPrompt = (stopReason = "end_turn", usage?: unknown) =>
+    prompts.shift()!({ stopReason, usage });
   const disposable = { dispose: () => undefined };
   const client = {
     canSendImages: () => false,
@@ -1223,6 +1224,109 @@ test("a turn the agent stops short says why", async () => {
       content: "Stopped: the response reached the token limit.",
     },
   ]);
+});
+
+test("a turn's token usage reaches its AHP turn, counting cache reads as input", async () => {
+  const t = await withRunningTurn();
+
+  t.endPrompt("end_turn", {
+    inputTokens: 10,
+    cachedReadTokens: 500,
+    cachedWriteTokens: 90,
+    outputTokens: 40,
+    totalTokens: 640,
+  });
+  await settle();
+
+  assert.deepEqual(t.state().turns[0].usage, {
+    inputTokens: 600,
+    outputTokens: 40,
+    cacheReadTokens: 500,
+  });
+});
+
+test("the agent's context window usage fills the session's context gauge", async () => {
+  const t = await withRunningTurn();
+  const session = "ahp-session:/acp-claude/draft";
+  t.host.server.dispatch(session, {
+    type: ActionType.SessionMetaChanged,
+    _meta: { other: 1 },
+  } as StateAction);
+
+  t.replay("draft", {
+    sessionUpdate: "usage_update",
+    used: 1200,
+    size: 200000,
+  });
+  t.endPrompt();
+  await settle();
+  t.replay("draft", {
+    sessionUpdate: "usage_update",
+    used: 1500,
+    size: 200000,
+  });
+
+  assert.deepEqual((t.host.server.stateOf(session) as SessionState)._meta, {
+    other: 1,
+    "copilot.usageInfo": {
+      currentTokens: 1500,
+      tokenLimit: 200000,
+      messagesLength: 1,
+    },
+  });
+  assert.equal(t.state().turns[0].usage, undefined);
+});
+
+test("a turn without token usage reports none", async () => {
+  const t = await withRunningTurn();
+
+  t.endPrompt();
+  await settle();
+
+  assert.equal(t.state().turns[0].usage, undefined);
+});
+
+test("context window usage sent while a session loads shows once it opens", async () => {
+  let report = () => {};
+  const t = setup({}, { duringLoad: () => report() });
+  report = () =>
+    t.replay("s1", { sessionUpdate: "usage_update", used: 900, size: 1000 });
+  t.listChanged({ sessions: [row("s1")] });
+
+  await t.hooks.materialize(CHAT);
+
+  assert.deepEqual((t.host.server.stateOf(SESSION) as SessionState)._meta, {
+    "copilot.usageInfo": {
+      currentTokens: 900,
+      tokenLimit: 1000,
+      messagesLength: 0,
+    },
+  });
+});
+
+test("only the primary chat's valid context window readings fill the gauge", async () => {
+  const t = setup();
+  t.listChanged({ sessions: [row("s1")] });
+  await t.hooks.materialize(CHAT);
+  const [turn] = (t.host.server.stateOf(CHAT) as ChatState).turns;
+  await (t.hooks.handlers.createChat as (p: unknown) => Promise<null>)({
+    channel: SESSION,
+    chat: "ahp-chat:/fork",
+    source: { kind: ChatSourceKind.Fork, chat: CHAT, turnId: turn.id },
+  });
+  t.replay("s1", { sessionUpdate: "usage_update", used: 100, size: 1000 });
+
+  t.replay("fork-1", { sessionUpdate: "usage_update", used: 500, size: 1000 });
+  t.replay("s1", { sessionUpdate: "usage_update", used: 200, size: 0 });
+  t.replay("s1", { sessionUpdate: "usage_update", used: 1.5, size: 1000 });
+
+  assert.deepEqual((t.host.server.stateOf(SESSION) as SessionState)._meta, {
+    "copilot.usageInfo": {
+      currentTokens: 100,
+      tokenLimit: 1000,
+      messagesLength: 1,
+    },
+  });
 });
 
 test("creating a session that already exists fails without a second ACP session", async () => {

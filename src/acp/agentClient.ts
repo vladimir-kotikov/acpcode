@@ -22,6 +22,7 @@ import {
   type SetSessionConfigOptionResponse,
   type StopReason,
   type ToolCallUpdate,
+  type Usage,
 } from "@agentclientprotocol/sdk";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -772,7 +773,11 @@ export class AgentClient implements Disposable {
     sessionId: SessionId,
     text: string,
     attachments: Attachment[] = [],
-  ): Promise<{ stopReason: StopReason; failureTitle?: string }> {
+  ): Promise<{
+    stopReason: StopReason;
+    failureTitle?: string;
+    usage?: Usage;
+  }> {
     // Checked before echoing: the agent's CLI drops its own context either
     // way, but nothing in ACP tells a client that happened (no "history
     // reset" update kind exists) — so without this, the display would just
@@ -795,6 +800,7 @@ export class AgentClient implements Disposable {
     return {
       stopReason: response.stopReason as StopReason,
       failureTitle: extractAirFailureTitle(response._meta),
+      usage: response.usage ?? undefined,
     };
   }
 
