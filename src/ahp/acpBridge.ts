@@ -258,13 +258,15 @@ const terminalMeta = (
 
 /** Takes a call's new title and kind. Claude titles a shell command with
  *  the whole command line, which Chat's terminal card shows anyway; its
- *  input's `description` is the short one, and sticks. */
+ *  input's `description` (or `command_description`) is the short one, and
+ *  sticks. */
 function retitle(tracking: ToolCallTracking, call: ToolCallUpdate): void {
   tracking.kind = call.kind ?? tracking.kind;
+  const input = call.rawInput as
+    { description?: unknown; command_description?: unknown } | null | undefined;
   const description =
     tracking.kind === "execute"
-      ? (call.rawInput as { description?: unknown } | null | undefined)
-          ?.description
+      ? (input?.description ?? input?.command_description)
       : undefined;
   if (typeof description === "string" && description) {
     tracking.title = description;
@@ -272,6 +274,19 @@ function retitle(tracking: ToolCallTracking, call: ToolCallUpdate): void {
   } else if (call.title && !tracking.described) {
     tracking.title = call.title;
   }
+}
+
+/** A shell call's text content as Chat's terminal card shows it: as output.
+ *  Claude sends the description while the command runs (the card's title
+ *  already has it), then the output fenced as Markdown. */
+function shellOutput(
+  tracking: ToolCallTracking,
+  text: string,
+): string | undefined {
+  if (tracking.described && text === tracking.title) {
+    return undefined;
+  }
+  return /^```console\n([\s\S]*)\n```$/.exec(text)?.[1] ?? text;
 }
 
 /** `promise`, or a rejection once `ms` have passed without it settling. */
@@ -294,12 +309,20 @@ function withTimeout<T>(
 
 /** A failed tool call's own error: its text content, else its raw output's
  *  text — capped. */
-function failureText(update: ToolCallUpdate): string | undefined {
-  const texts = (update.content ?? []).flatMap(item =>
-    item.type === "content" && item.content.type === "text"
-      ? [item.content.text]
-      : [],
-  );
+function failureText(
+  tracking: ToolCallTracking,
+  update: ToolCallUpdate,
+): string | undefined {
+  const texts = (update.content ?? []).flatMap(item => {
+    if (item.type !== "content" || item.content.type !== "text") {
+      return [];
+    }
+    const text =
+      tracking.kind === "execute"
+        ? shellOutput(tracking, item.content.text)
+        : item.content.text;
+    return text === undefined ? [] : [text];
+  });
   const raw = update.rawOutput;
   if (!texts.length && typeof raw === "string") {
     texts.push(raw);
@@ -2594,14 +2617,21 @@ export class AcpAgentHost implements Disposable {
 
   private toolContent(
     binding: Binding,
+    tracking: ToolCallTracking,
     content: ToolCallContent[] | null | undefined,
   ): ToolResultContent[] | undefined {
     if (!content?.length) {
       return undefined;
     }
-    return content.flatMap((item): ToolResultContent[] => {
+    const result = content.flatMap((item): ToolResultContent[] => {
       if (item.type === "content" && item.content.type === "text") {
-        return [{ type: ToolResultContentType.Text, text: item.content.text }];
+        const text =
+          tracking.kind === "execute"
+            ? shellOutput(tracking, item.content.text)
+            : item.content.text;
+        return text === undefined
+          ? []
+          : [{ type: ToolResultContentType.Text, text }];
       }
       if (item.type === "diff") {
         const file = pathToFileURL(item.path).href;
@@ -2632,6 +2662,8 @@ export class AcpAgentHost implements Disposable {
       }
       return [];
     });
+    // Nothing Chat shows: what it shows already stays.
+    return result.length ? result : undefined;
   }
 
   /** Keeps a diff side for Chat to `resourceRead`, while the chat is open.
@@ -2661,9 +2693,10 @@ export class AcpAgentHost implements Disposable {
     turnId: string,
     update: ToolCallUpdate,
   ): void {
-    const content = this.toolContent(binding, update.content);
     const tracking = binding.toolCalls.get(update.toolCallId);
-    if (!content || !tracking) {
+    const content =
+      tracking && this.toolContent(binding, tracking, update.content);
+    if (!tracking || !content) {
       return;
     }
     tracking.content = content;
@@ -2697,9 +2730,14 @@ export class AcpAgentHost implements Disposable {
           success: update.status === "completed",
           pastTenseMessage: tracking.title,
           content:
-            this.toolContent(binding, update.content) ?? tracking.content,
+            this.toolContent(binding, tracking, update.content) ??
+            tracking.content,
           ...(update.status === "failed"
-            ? { error: { message: failureText(update) ?? tracking.title } }
+            ? {
+                error: {
+                  message: failureText(tracking, update) ?? tracking.title,
+                },
+              }
             : {}),
         },
       });

@@ -1617,6 +1617,89 @@ test("a shell command is titled with its input's description, not its command li
   assert.equal(call("b1")?.pastTenseMessage, "Run the tests");
 });
 
+test("a shell command's card shows its output, not its description or Markdown fence", async () => {
+  const t = await withRunningTurn();
+  const text = (value: string) => ({
+    type: "content" as const,
+    content: { type: "text" as const, text: value },
+  });
+  const contentOf = (index = 0) =>
+    (
+      t.state().activeTurn?.responseParts[index] as {
+        toolCall: {
+          content?: { text: string }[];
+          invocationMessage?: string;
+          error?: { message: string };
+        };
+      }
+    ).toolCall;
+
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "b1",
+    title: "git status --short",
+    kind: "execute",
+    rawInput: {
+      command: "git status --short",
+      command_description: "Show changes",
+    },
+    content: [text("Show changes")],
+  });
+  const running = contentOf();
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b1",
+    status: "completed",
+    content: [text("```console\n M a.ts\n```")],
+  });
+
+  // A failure: output first, then an update with only the description.
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "b2",
+    title: "npm test",
+    kind: "execute",
+    rawInput: { command: "npm test", description: "Run the tests" },
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b2",
+    content: [text("```console\n1 failing\n```")],
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b2",
+    status: "failed",
+    content: [text("Run the tests")],
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call",
+    toolCallId: "b3",
+    title: "npm run lint",
+    kind: "execute",
+    rawInput: { command: "npm run lint", description: "Lint" },
+  });
+  t.replay("draft", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "b3",
+    status: "failed",
+    content: [text("```console\n2 problems\n```")],
+  });
+
+  assert.equal(running.invocationMessage, "Show changes");
+  assert.equal(running.content, undefined);
+  assert.deepEqual(
+    contentOf().content?.map(c => c.text),
+    [" M a.ts"],
+  );
+  assert.deepEqual(
+    contentOf(1).content?.map(c => c.text),
+    ["1 failing"],
+  );
+  assert.equal(contentOf(1).error?.message, "Run the tests");
+  assert.equal(contentOf(2).error?.message, "2 problems");
+});
+
 test("a chat Chat resubscribes to before any listing is restored from the agent's", async () => {
   const { host, hooks, listed, calls } = setup();
   listed.push(row("s1", "Root"), forkRow("f1", "s1"));
