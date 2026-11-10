@@ -16,6 +16,8 @@ export interface HostConfig {
   agents: AgentConfig[];
   /** List only the sessions of the open windows' folders, not every project's. */
   filterSessionsByWorkspace?: boolean;
+  /** Seconds a session stays loaded after Chat stops showing it. */
+  releaseSessionsAfter?: number;
 }
 
 /** One per window, named after its extension host's pid. */

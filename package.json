@@ -259,6 +259,12 @@
           "default": false,
           "markdownDescription": "List only the sessions whose directory is a workspace folder of an open VS Code window. Off lists every session the agents know about, like the Claude agents UI. Takes effect when Chat next connects."
         },
+        "acpcode.agentHost.releaseSessionsAfter": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "markdownDescription": "Seconds a session stays loaded after Chat stops showing it. Then the agent host closes it, so a terminal or the Claude agents UI can continue it; opening it in Chat again loads it again. A session still running a turn closes once it's done."
+        },
         "acpcode.agentHost.port": {
           "type": "number",
           "markdownDescription": "Local port (127.0.0.1) the agent host listens on. Defaults to 8765 (8766 in VS Code Insiders, so both can run side by side). Requires a window reload."

@@ -196,6 +196,9 @@ function startAgentHost(context: vscode.ExtensionContext): void {
       filterSessionsByWorkspace: vscode.workspace
         .getConfiguration("acpcode.agentHost")
         .get<boolean>("filterSessionsByWorkspace", false),
+      releaseSessionsAfter: vscode.workspace
+        .getConfiguration("acpcode.agentHost")
+        .get<number>("releaseSessionsAfter", 30),
     };
     fs.writeFileSync(files.config, JSON.stringify(config));
   };
@@ -220,7 +223,8 @@ function startAgentHost(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration(e => {
       if (
         e.affectsConfiguration("acpcode.agents") ||
-        e.affectsConfiguration("acpcode.agentHost.filterSessionsByWorkspace")
+        e.affectsConfiguration("acpcode.agentHost.filterSessionsByWorkspace") ||
+        e.affectsConfiguration("acpcode.agentHost.releaseSessionsAfter")
       ) {
         writeConfig();
       }

@@ -152,6 +152,12 @@ interface Binding {
   loading?: boolean;
   stale?: boolean;
   forgetLater?: boolean;
+  /** Pending `unload`, once Chat stopped showing the chat; `unloadWhenIdle`
+   *  when it came while the chat was busy, `closing` while the agent
+   *  unloads it. */
+  unloadTimer?: NodeJS.Timeout;
+  unloadWhenIdle?: boolean;
+  closing?: Promise<void>;
   /** The directory set changed during a turn; applied when it ends. */
   directoriesDirty?: boolean;
   title: string;
@@ -401,6 +407,8 @@ export interface AgentHostEnvironment {
   folders(): string[];
   /** Whether to list only the sessions of `folders()`, not every project's. */
   filterByWorkspace(): boolean;
+  /** How long a chat Chat stopped showing stays loaded; see `unload`. */
+  unloadAfterMs(): number;
   /** Last-seen ACP config options per agent name, persisted so model lists
    *  and config pickers are there before any of its sessions is opened. */
   configCache: {
@@ -1413,15 +1421,19 @@ export class AcpAgentHost implements Disposable {
       this.pool.get(chat.agent.name)?.cancelPrompt(chat.sessionId);
     }
     this.bindings.delete(chat.chatUri);
-    for (const [uri, content] of this.contents) {
-      if (content.chat === chat.chatUri) {
-        this.contents.delete(uri);
-      }
-    }
+    this.forgetContents(chat.chatUri);
     if (chat.sessionId) {
       this.byAcpSession.delete(`${chat.agent.name}\0${chat.sessionId}`);
     }
     this.server.delete(chat.chatUri);
+  }
+
+  private forgetContents(chatUri: string): void {
+    for (const [uri, content] of this.contents) {
+      if (content.chat === chatUri) {
+        this.contents.delete(uri);
+      }
+    }
   }
 
   /** Forgets a forked chat on this host; its ACP session stays listed. */
@@ -1499,10 +1511,19 @@ export class AcpAgentHost implements Disposable {
 
   /** Chat stopped showing a chat that something else runs: it's forgotten
    *  here, so opening it again shows it as it is then — its own, if its
-   *  owner is gone. Chat can't be told a chat stopped being read-only. */
+   *  owner is gone. Chat can't be told a chat stopped being read-only.
+   *  One of its own is unloaded a while later. */
   private unsubscribed = (channel: string): void => {
     const binding = this.bindings.get(channel);
-    if (!binding?.owner || channel !== binding.chatUri) {
+    if (!binding || channel !== binding.chatUri) {
+      return;
+    }
+    if (!binding.owner) {
+      clearTimeout(binding.unloadTimer);
+      binding.unloadTimer = setTimeout(
+        () => this.unload(binding),
+        this.env.unloadAfterMs(),
+      );
       return;
     }
     if (binding.loading) {
@@ -1522,6 +1543,52 @@ export class AcpAgentHost implements Disposable {
       });
     }
   };
+
+  /** Chat stopped showing a chat of its own a while ago: the agent unloads
+   *  it, so a terminal or the Claude agents UI can continue it, and it's
+   *  forgotten here, so opening it again loads it again. Work still going on
+   *  in it puts that off until it's done; Chat showing it again, for good. */
+  private unload(binding: Binding): void {
+    binding.unloadTimer = undefined;
+    binding.unloadWhenIdle = false;
+    const client = this.pool.get(binding.agent.name);
+    if (
+      this.bindings.get(binding.chatUri) !== binding ||
+      this.server.isSubscribed(binding.chatUri) ||
+      !binding.ready ||
+      !binding.sessionId ||
+      !client?.canCloseSessions()
+    ) {
+      return;
+    }
+    const chat = this.server.stateOf(binding.chatUri) as ChatState | undefined;
+    if (
+      binding.turnId ||
+      binding.run ||
+      binding.loading ||
+      chat?.queuedMessages?.length
+    ) {
+      binding.unloadWhenIdle = true; // see `idle`
+      return;
+    }
+    this.server.delete(binding.chatUri);
+    this.forgetContents(binding.chatUri);
+    binding.ready = undefined;
+    binding.toolCalls.clear();
+    binding.turnMessages.clear();
+    // Loading it again waits for this: the agent would drop that load.
+    binding.closing = client
+      .closeSession(binding.sessionId)
+      .catch(err => this.output.appendLine(`[unload] ${describeError(err)}`))
+      .finally(() => (binding.closing = undefined));
+  }
+
+  /** A turn or load is over: a chat left while it ran is unloaded now. */
+  private idle(binding: Binding): void {
+    if (binding.unloadWhenIdle) {
+      this.unload(binding);
+    }
+  }
 
   /** A chat something else runs follows it: its history loads again as the
    *  session's row changes, e.g. as a turn there ends. */
@@ -1558,6 +1625,7 @@ export class AcpAgentHost implements Disposable {
       binding.stale = false;
       this.refreshWatched(binding);
     }
+    this.idle(binding);
   }
 
   /** After a host restart, Chat resubscribes to the sessions it shows before
@@ -1640,6 +1708,7 @@ export class AcpAgentHost implements Disposable {
     }
     binding.loading = true;
     binding.ready = (async () => {
+      await binding.closing;
       const client = await this.connect(binding);
       const shown = this.server.stateOf(binding.chatUri) as
         ChatState | undefined;
@@ -2137,6 +2206,7 @@ export class AcpAgentHost implements Disposable {
     if (completed) {
       this.runPending(binding);
     }
+    this.idle(binding);
   }
 
   /** The next pending message, steering first, as a turn of its own: Chat

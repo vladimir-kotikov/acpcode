@@ -57,6 +57,8 @@ function setup(
     duringLoad,
     failedLoads = 0,
     afterReplay,
+    closable = true,
+    closing,
   }: {
     indexed?: boolean;
     /** The agent's env: a fake `claude` and its config dir. */
@@ -71,6 +73,9 @@ function setup(
     failedLoads?: number;
     /** What a load does once it has replayed the history. */
     afterReplay?: () => Promise<undefined>;
+    /** Whether the agent can close sessions, and what closing one does. */
+    closable?: boolean;
+    closing?: Promise<void>;
   } = {},
 ) {
   const theAgent = {
@@ -172,6 +177,11 @@ function setup(
     cancelPrompt: (...args: unknown[]) => {
       calls.push({ method: "cancelPrompt", args });
     },
+    canCloseSessions: () => closable,
+    closeSession: (...args: unknown[]) => {
+      calls.push({ method: "closeSession", args });
+      return closing ?? Promise.resolve();
+    },
     deleteSession: (...args: unknown[]) => {
       calls.push({ method: "deleteSession", args });
       return deleteFails
@@ -192,6 +202,7 @@ function setup(
       agents: () => [theAgent],
       folders: () => ["/w"],
       filterByWorkspace: () => false,
+      unloadAfterMs: () => 0,
       configCache: { load: () => ({}), save: () => undefined },
       imageCache: { load: () => ({}), save: () => undefined },
       directoryCache: {
@@ -1915,4 +1926,90 @@ test("a deleted session whose row comes back after its delete is deleted again",
 
   assert.deepEqual(deleted(t.calls), [["s1"], ["s1"]]);
   assert.equal(t.notified.at(-1)?.method, "root/sessionRemoved");
+});
+
+const closed = (calls: { method: string; args: unknown[] }[]) =>
+  calls.filter(c => c.method === "closeSession").map(c => c.args);
+
+test("a chat Chat stopped showing is closed on the agent, and loads again when opened", async () => {
+  const { host, hooks, calls, listChanged } = setup();
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+
+  hooks.unsubscribed?.(CHAT);
+  await waitFor(() => closed(calls).length > 0);
+  await hooks.materialize(CHAT);
+
+  assert.deepEqual(closed(calls), [["s1"]]);
+  assert.equal(calls.filter(c => c.method === "loadSession").length, 2);
+  assert.deepEqual(
+    (host.server.stateOf(CHAT) as ChatState).turns.map(t => t.message.text),
+    ["hello"],
+  );
+});
+
+test("a chat Chat shows again before it's released stays loaded", async () => {
+  const { host, hooks, calls, listChanged } = setup();
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+
+  hooks.unsubscribed?.(CHAT);
+  host.server.isSubscribed = () => true;
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  assert.deepEqual(closed(calls), []);
+});
+
+test("a chat running a turn when Chat stops showing it is closed once the turn ends", async () => {
+  const { hooks, calls, listChanged, clientAction, endPrompt } = setup();
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+  clientAction(CHAT, {
+    type: ActionType.ChatTurnStarted,
+    turnId: "t1",
+    startedAt: new Date().toISOString(),
+    message: { text: "go" },
+  } as StateAction);
+  await settle();
+
+  hooks.unsubscribed?.(CHAT);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(closed(calls), []);
+  endPrompt();
+
+  await waitFor(() => closed(calls).length > 0);
+  assert.deepEqual(closed(calls), [["s1"]]);
+});
+
+test("a left chat opened again while the agent closes it loads once that's done", async () => {
+  let finishClose!: () => void;
+  const { hooks, calls, listChanged } = setup(
+    {},
+    { closing: new Promise<void>(resolve => (finishClose = resolve)) },
+  );
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+  const loads = () => calls.filter(c => c.method === "loadSession").length;
+
+  hooks.unsubscribed?.(CHAT);
+  await waitFor(() => closed(calls).length > 0);
+  const opening = hooks.materialize(CHAT);
+  await settle();
+  assert.equal(loads(), 1);
+  finishClose();
+  await opening;
+
+  assert.equal(loads(), 2);
+});
+
+test("a left chat stays loaded when the agent can't close sessions", async () => {
+  const { host, hooks, calls, listChanged } = setup({}, { closable: false });
+  listChanged({ sessions: [row("s1")] });
+  await hooks.materialize(CHAT);
+
+  hooks.unsubscribed?.(CHAT);
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  assert.deepEqual(closed(calls), []);
+  assert.ok(host.server.has(CHAT));
 });

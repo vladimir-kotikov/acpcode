@@ -612,6 +612,23 @@ export class AgentClient implements Disposable {
     return response.configOptions ?? undefined;
   }
 
+  canCloseSessions(): boolean {
+    return !!this.agentCapabilities.sessionCapabilities?.close;
+  }
+
+  /** Unloads a session from the agent. claude-agent-acp ends its Claude
+   *  process, which lets other clients (a terminal, the Claude agents view)
+   *  continue the session; loading it again brings it back here. */
+  closeSession(sessionId: SessionId): Promise<void> {
+    this.requireCapability(
+      "session/close",
+      this.agentCapabilities.sessionCapabilities?.close,
+    );
+    return this.requireAgent()
+      .request(methods.agent.session.close, { sessionId })
+      .then(() => undefined);
+  }
+
   async deleteSession(sessionId: SessionId): Promise<void> {
     this.requireCapability(
       "session/delete",
