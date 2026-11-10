@@ -239,17 +239,22 @@ function startAgentHost(context: vscode.ExtensionContext): void {
   );
 
   const running = readJson<HostInfo>(files.host);
-  if (
-    running &&
-    isAlive(running.pid) &&
-    running.build === agentHostBuild(context) &&
-    running.port === agentHostPort()
-  ) {
-    return;
+  if (!running || !isAlive(running.pid) || running.port !== agentHostPort()) {
+    void restartAgentHost(context);
+  } else if (running.build !== agentHostBuild(context)) {
+    // Restarting would end the turns running in it, maybe in other windows,
+    // so that's the user's call.
+    void vscode.window
+      .showInformationMessage(
+        "The ACP Code agent host still runs the previous version of the extension.",
+        "Restart Agent Host",
+      )
+      .then(choice => {
+        if (choice) {
+          void vscode.commands.executeCommand("acpcode.restartAgentHost");
+        }
+      });
   }
-  // ponytail: an update restarts the host even mid-turn; wait for it to go
-  // idle first if that bites.
-  void restartAgentHost(context);
 }
 
 /** Chat's failed connections never reach the extension, so a stale entry
