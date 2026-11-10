@@ -97,6 +97,8 @@ function compactSummaryAsToolCall(update: SessionUpdate): SessionUpdate {
     title: "Compact conversation",
     kind: "think",
     status: "completed",
+    // VS Code Chat only shows a tool call's output when it has input.
+    rawInput: {},
     content: [{ type: "content", content: update.content }],
     _meta: { claudeCode: { toolName: "compact" } },
   };
@@ -128,6 +130,8 @@ function compactionAsToolCall(
     toolCallId: update.compactionId,
     title: "Compact conversation",
     kind: "think",
+    // See `compactSummaryAsToolCall`.
+    ...(!known && { rawInput: {} }),
     _meta: { claudeCode: { toolName: "compact" } },
   } as const;
   if (update.sessionUpdate === "compaction_summary_chunk") {

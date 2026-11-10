@@ -401,6 +401,11 @@ test("compaction updates reach frontends as the Compact conversation tool call",
       if (update.title) {
         assert.equal(update.title, "Compact conversation");
         assert.equal(update.kind, "think");
+        // Without input, VS Code Chat doesn't show the summary.
+        assert.deepEqual(
+          update.rawInput,
+          update.sessionUpdate === "tool_call" ? {} : undefined,
+        );
       }
     }
   });
