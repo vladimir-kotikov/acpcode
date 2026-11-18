@@ -183,6 +183,12 @@ function questionOf(field: Field, required: boolean): ChatInputQuestion {
   };
 }
 
+/** Whether the agent goes on while the form is open: Codex asks such
+ *  questions, and drops their answers once its turn ends. */
+export const isAsyncForm = (request: { _meta?: unknown }): boolean =>
+  (request._meta as { codex?: { delivery?: unknown } } | null | undefined)
+    ?.codex?.delivery === "async";
+
 export function inputRequestOf(
   id: string,
   message: string,

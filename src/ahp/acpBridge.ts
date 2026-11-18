@@ -27,6 +27,7 @@ import {
   ToolCallConfirmationReason,
   ToolResultContentType,
   type AgentInfo,
+  type ChatInputAnswer,
   type ChatState,
   type ChatSummary,
   type CompletionsParams,
@@ -78,10 +79,18 @@ import {
   resolveModelConfig,
   type ConfigValue,
 } from "./configOptions.ts";
-import { elicitationResponseOf, inputRequestOf } from "./elicitation.ts";
+import {
+  elicitationResponseOf,
+  inputRequestOf,
+  isAsyncForm,
+} from "./elicitation.ts";
 import { AhpRequestError, AhpServer, ROOT_CHANNEL } from "./server.ts";
 
 const DEFAULT_CHAT_TITLE = "New chat";
+/** Ends a turn with Codex's question still unanswered: Chat shows it as
+ *  skipped. */
+export const UNANSWERED_QUESTION_NOTICE =
+  "Codex went ahead without your answer. Reply in a new message if it still matters.";
 const TITLE_FROM_PROMPT_LENGTH = 60;
 
 /** Where a tool call is in the AHP lifecycle — tracked separately from the
@@ -2235,16 +2244,22 @@ export class AcpAgentHost implements Disposable {
         this.endTurn(binding, ActionType.ChatTurnCancelled, run.turnId);
       } else {
         this.promoteSteered(binding, run, true);
-        const notice = stopNotice(stopReason);
-        if (notice && binding.turnId === run.turnId) {
-          this.server.dispatch(binding.chatUri, {
-            type: ActionType.ChatResponsePart,
-            turnId: run.turnId,
-            part: {
-              kind: ResponsePartKind.SystemNotification,
-              content: notice,
-            },
-          });
+        const notices = [
+          stopNotice(stopReason),
+          [...(binding.inputs?.values() ?? [])].some(({ request }) =>
+            isAsyncForm(request),
+          )
+            ? UNANSWERED_QUESTION_NOTICE
+            : undefined,
+        ].filter(notice => notice !== undefined);
+        if (binding.turnId === run.turnId) {
+          for (const content of notices) {
+            this.server.dispatch(binding.chatUri, {
+              type: ActionType.ChatResponsePart,
+              turnId: run.turnId,
+              part: { kind: ResponsePartKind.SystemNotification, content },
+            });
+          }
         }
         this.endTurn(binding, ActionType.ChatTurnComplete, run.turnId);
         completed = true;
@@ -2375,6 +2390,24 @@ export class AcpAgentHost implements Disposable {
       return;
     }
     run.steered = undefined;
+    // The agent still waits on the turn's open forms, which Chat stops
+    // asking once the turn ends: asked again in the next, drafts and all.
+    const parts =
+      (this.server.stateOf(binding.chatUri) as ChatState | undefined)
+        ?.activeTurn?.responseParts ?? [];
+    const open = [...(binding.inputs ?? [])].map(([id, request]) => {
+      const part = parts.find(
+        p => p.kind === ResponsePartKind.InputRequest && p.request.id === id,
+      );
+      return {
+        request,
+        answers:
+          part?.kind === ResponsePartKind.InputRequest
+            ? part.request.answers
+            : undefined,
+      };
+    });
+    binding.inputs?.clear();
     // Not `endTurn`: the prompt goes on, so nothing waiting on its end
     // (directory changes) may run yet.
     this.server.dispatch(binding.chatUri, {
@@ -2391,6 +2424,9 @@ export class AcpAgentHost implements Disposable {
       message: steered.message,
       queuedMessageId: steered.id,
     });
+    for (const { request, answers } of open) {
+      this.askInput(binding, request, answers);
+    }
     this.steer(binding); // one that replaced it meanwhile
   }
 
@@ -2871,17 +2907,30 @@ export class AcpAgentHost implements Disposable {
       client.resolveElicitation(request.requestId, { action: "cancel" });
       return;
     }
+    this.askInput(binding, request);
+  }
+
+  /** Asks a form in the binding's running turn. Each asking has its own id:
+   *  Chat cancels the one it stops showing. */
+  private askInput(
+    binding: Binding,
+    request: ElicitationRequestEvent,
+    answers?: Record<string, ChatInputAnswer>,
+  ): void {
     binding.markdownPartId = undefined;
     binding.reasoningPartId = undefined;
     const id = randomUUID();
     (binding.inputs ??= new Map()).set(id, request);
     this.server.dispatch(binding.chatUri, {
       type: ActionType.ChatInputRequested,
-      request: inputRequestOf(
-        id,
-        request.request.message,
-        request.request.requestedSchema,
-      ),
+      request: {
+        ...inputRequestOf(
+          id,
+          request.request.message,
+          request.request.requestedSchema,
+        ),
+        ...(answers && { answers }),
+      },
     });
   }
 

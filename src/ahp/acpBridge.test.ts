@@ -17,6 +17,7 @@ import {
   ResponsePartKind,
   type ChatState,
   type FileEdit,
+  type ResponsePart,
   type SessionChatSummary,
   type SessionState,
   SessionStatus,
@@ -33,7 +34,7 @@ import type {
 } from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
-import { AcpAgentHost } from "./acpBridge.ts";
+import { AcpAgentHost, UNANSWERED_QUESTION_NOTICE } from "./acpBridge.ts";
 import { fakeClaude, waitFor } from "../acp/fakeClaude.test-util.ts";
 import type { AhpServerHooks } from "./server.ts";
 
@@ -1657,6 +1658,20 @@ const form = (requestId: string): ElicitationRequestEvent => ({
   },
 });
 
+// Codex's question that doesn't block it.
+const asyncForm = (requestId: string): ElicitationRequestEvent => {
+  const event = form(requestId);
+  return {
+    ...event,
+    request: { ...event.request, _meta: { codex: { delivery: "async" } } },
+  };
+};
+
+const noticesOf = (turn: { responseParts: readonly ResponsePart[] }) =>
+  turn.responseParts.flatMap(part =>
+    part.kind === ResponsePartKind.SystemNotification ? [part.content] : [],
+  );
+
 const elicitationsResolved = (calls: { method: string; args: unknown[] }[]) =>
   calls.filter(c => c.method === "resolveElicitation").map(c => c.args);
 
@@ -1699,6 +1714,113 @@ test("a form still unanswered when its turn ends is cancelled", async () => {
   assert.deepEqual(elicitationsResolved(t.calls), [
     ["elicit-1", { action: "cancel" }],
   ]);
+  // Only Codex's questions go on without an answer.
+  assert.deepEqual(noticesOf(t.state().turns[0]), []);
+});
+
+test("Codex's question still unanswered when its turn ends says Codex went ahead", async () => {
+  const t = await withRunningTurn();
+
+  t.askForm(asyncForm("elicit-1"));
+  t.endPrompt();
+  await settle();
+
+  assert.deepEqual(elicitationsResolved(t.calls), [
+    ["elicit-1", { action: "cancel" }],
+  ]);
+  assert.deepEqual(noticesOf(t.state().turns[0]), [UNANSWERED_QUESTION_NOTICE]);
+});
+
+test("a turn stopped short with Codex's question open says both why and that it went ahead", async () => {
+  const t = await withRunningTurn();
+
+  t.askForm(asyncForm("elicit-1"));
+  t.endPrompt("max_tokens");
+  await settle();
+
+  assert.deepEqual(noticesOf(t.state().turns[0]), [
+    "Stopped: the response reached the token limit.",
+    UNANSWERED_QUESTION_NOTICE,
+  ]);
+});
+
+test("a turn with Codex's question answered, or one that's cancelled, doesn't say it went ahead", async () => {
+  const answered = await withRunningTurn();
+  answered.askForm(asyncForm("elicit-1"));
+  const { request } = answered.state().activeTurn!.responseParts.at(-1) as {
+    request: { id: string };
+  };
+  answered.clientAction(answered.chat, {
+    type: ActionType.ChatInputCompleted,
+    requestId: request.id,
+    response: ChatInputResponseKind.Decline,
+  } as StateAction);
+  answered.endPrompt();
+  const cancelled = await withRunningTurn();
+  cancelled.askForm(asyncForm("elicit-1"));
+  cancelled.endPrompt("cancelled");
+  await settle();
+
+  assert.deepEqual(noticesOf(answered.state().turns[0]), []);
+  assert.deepEqual(noticesOf(cancelled.state().turns[0]), []);
+});
+
+test("a form open when a steering message completes its turn is asked again in the next, with its drafts", async () => {
+  const t = await withRunningTurn({ steering: { outcome: "injected" } });
+  t.askForm(form("elicit-1"));
+  const inputOf = () =>
+    t
+      .state()
+      .activeTurn!.responseParts.findLast(
+        p => p.kind === ResponsePartKind.InputRequest,
+      ) as { request: { id: string; answers?: unknown } };
+  const first = inputOf().request.id;
+  const draft = {
+    state: ChatInputAnswerState.Draft,
+    value: { kind: ChatInputAnswerValueKind.Selected, value: "Redis" },
+  };
+  t.clientAction(t.chat, {
+    type: ActionType.ChatInputAnswerChanged,
+    requestId: first,
+    questionId: "question_0",
+    answer: draft,
+  } as StateAction);
+
+  t.pend(PendingMessageKind.Steering, "s1", "also this");
+  await settle();
+  const again = inputOf().request;
+  // Chat cancels the one it stopped showing.
+  t.clientAction(t.chat, {
+    type: ActionType.ChatInputCompleted,
+    requestId: first,
+    response: ChatInputResponseKind.Cancel,
+  } as StateAction);
+  t.clientAction(t.chat, {
+    type: ActionType.ChatInputCompleted,
+    requestId: again.id,
+    response: ChatInputResponseKind.Accept,
+  } as StateAction);
+
+  assert.equal(t.state().activeTurn?.message.text, "also this");
+  assert.notEqual(again.id, first);
+  assert.deepEqual(again.answers, { question_0: draft });
+  assert.deepEqual(elicitationsResolved(t.calls), [
+    ["elicit-1", { action: "accept", content: { question_0: "Redis" } }],
+  ]);
+});
+
+test("Codex's question carried past a steering message says it went ahead in the turn it ends in", async () => {
+  const t = await withRunningTurn({ steering: { outcome: "injected" } });
+  t.askForm(asyncForm("elicit-1"));
+
+  t.pend(PendingMessageKind.Steering, "s1", "also this");
+  await settle();
+  t.endPrompt();
+  await settle();
+
+  const [steeredFrom, steered] = t.state().turns;
+  assert.deepEqual(noticesOf(steeredFrom), []);
+  assert.deepEqual(noticesOf(steered), [UNANSWERED_QUESTION_NOTICE]);
 });
 
 test("a form is declined when Chat declines it, and cancelled when the turn is stopped", async () => {
