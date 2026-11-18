@@ -33,7 +33,9 @@ interface Property {
   enum?: string[] | null;
   oneOf?: Choice[] | null;
   items?: { enum?: string[] | null; anyOf?: Choice[] | null };
-  _meta?: { codex?: { role?: string; questionId?: string } } | null;
+  _meta?: {
+    codex?: { role?: string; questionId?: string; isSecret?: boolean };
+  } | null;
 }
 
 interface Choice {
@@ -113,12 +115,19 @@ function fieldsOf(schema: ElicitationSchema): Field[] {
   return fields.filter(field => !customs.has(field.key));
 }
 
+/** Told with a question Codex marks secret: Chat can't mask an answer. */
+export const SECRET_ANSWER_WARNING =
+  "Your answer will show in the chat and its history.";
+
 function questionOf(field: Field, required: boolean): ChatInputQuestion {
   const { key, property } = field;
+  const message = property.description || property.title || key;
   const base = {
     id: key,
     ...(property.title && { title: property.title }),
-    message: property.description || property.title || key,
+    message: property._meta?.codex?.isSecret
+      ? `${message}\n\n${SECRET_ANSWER_WARNING}`
+      : message,
     ...(required && { required }),
   };
   const choices = choicesOf(property)?.filter(

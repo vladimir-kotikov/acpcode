@@ -10,7 +10,11 @@ import {
 } from "@microsoft/agent-host-protocol";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { elicitationResponseOf, inputRequestOf } from "./elicitation.ts";
+import {
+  SECRET_ANSWER_WARNING,
+  elicitationResponseOf,
+  inputRequestOf,
+} from "./elicitation.ts";
 
 // What claude-agent-acp 0.101.1 sends for AskUserQuestion: each question is a
 // select followed by its "Other" box.
@@ -231,6 +235,24 @@ test("a choice of a question's own called None of the above stays, and a note bo
       ["question_1", ChatInputQuestionKind.SingleSelect, ["None of the above"]],
       ["question_2_note", ChatInputQuestionKind.Text, undefined],
     ],
+  );
+});
+
+test("a question Codex marks secret warns its answer shows in the chat", () => {
+  const request = inputRequestOf("r1", "Codex needs your input", {
+    type: "object",
+    properties: {
+      question_0: {
+        type: "string",
+        title: "API key?",
+        _meta: { codex: { isOther: false, isSecret: true } },
+      },
+    } as ElicitationSchema["properties"],
+  });
+
+  assert.equal(
+    request.questions?.[0].message,
+    `API key?\n\n${SECRET_ANSWER_WARNING}`,
   );
 });
 
