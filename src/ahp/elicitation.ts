@@ -33,6 +33,7 @@ interface Property {
   enum?: string[] | null;
   oneOf?: Choice[] | null;
   items?: { enum?: string[] | null; anyOf?: Choice[] | null };
+  _meta?: { codex?: { role?: string; questionId?: string } } | null;
 }
 
 interface Choice {
@@ -46,7 +47,16 @@ interface Field {
   property: Property;
   /** The text property that takes this select's "Other" answer. */
   custom?: string;
+  /** Whether that text property is Codex's note box, whose select has a
+   *  choice pointing at it: left out, as the question takes typed text. */
+  codexNote?: boolean;
 }
+
+/** The choice codex-acp adds to a select that has a note box, unless one of
+ *  the select's own is called so. */
+const isCodexNotePointer = (choice: ChatInputOption) =>
+  choice.id === "None of the above" &&
+  choice.description === "Provide a different answer in the note field.";
 
 const choicesOf = (property: Property): ChatInputOption[] | undefined => {
   const titled =
@@ -64,24 +74,41 @@ const choicesOf = (property: Property): ChatInputOption[] | undefined => {
     : undefined;
 };
 
-/** The schema's questions. A select followed by a `<key>_custom` text
- *  property is one question that also takes typed text: Claude's
- *  AskUserQuestion form gives each question such an "Other" box. */
+/** The schema's questions. A select and the text property that takes its
+ *  "Other" answer are one question that also takes typed text: Claude's
+ *  AskUserQuestion form follows each select with a `<key>_custom` box, and
+ *  Codex's names its note box's select in `_meta`. */
 function fieldsOf(schema: ElicitationSchema): Field[] {
   const properties = (schema.properties ?? {}) as Record<string, Property>;
+  const isText = (property?: Property) =>
+    property?.type === "string" && !choicesOf(property)?.length;
+  const notes = new Map<string, string>();
+  for (const [key, property] of Object.entries(properties)) {
+    const codex = property._meta?.codex;
+    if (
+      codex?.role === "user_note" &&
+      typeof codex.questionId === "string" &&
+      isText(property)
+    ) {
+      notes.set(codex.questionId, key);
+    }
+  }
   const customs = new Set<string>();
   const fields: Field[] = [];
   for (const [key, property] of Object.entries(properties)) {
-    const custom = `${key}_custom`;
-    const other = properties[custom];
+    const note = notes.get(key);
+    const custom = note ?? `${key}_custom`;
     const folds =
-      choicesOf(property) !== undefined &&
-      other?.type === "string" &&
-      !choicesOf(other)?.length;
+      choicesOf(property) !== undefined && isText(properties[custom]);
     if (folds) {
       customs.add(custom);
     }
-    fields.push({ key, property, ...(folds && { custom }) });
+    fields.push({
+      key,
+      property,
+      ...(folds && { custom }),
+      ...(folds && note && { codexNote: true }),
+    });
   }
   return fields.filter(field => !customs.has(field.key));
 }
@@ -94,7 +121,9 @@ function questionOf(field: Field, required: boolean): ChatInputQuestion {
     message: property.description || property.title || key,
     ...(required && { required }),
   };
-  const choices = choicesOf(property);
+  const choices = choicesOf(property)?.filter(
+    choice => !(field.codexNote && isCodexNotePointer(choice)),
+  );
   // A list without choices is asked as text; see `fromText`.
   if (property.type === "array" && choices) {
     return {
@@ -102,8 +131,8 @@ function questionOf(field: Field, required: boolean): ChatInputQuestion {
       kind: ChatInputQuestionKind.MultiSelect,
       options: choices,
       ...(field.custom && { allowFreeformInput: true }),
-      ...(property.minItems != null && { min: property.minItems }),
-      ...(property.maxItems != null && { max: property.maxItems }),
+      ...(typeof property.minItems === "number" && { min: property.minItems }),
+      ...(typeof property.maxItems === "number" && { max: property.maxItems }),
     };
   }
   if (choices) {
@@ -125,8 +154,8 @@ function questionOf(field: Field, required: boolean): ChatInputQuestion {
         property.type === "integer"
           ? ChatInputQuestionKind.Integer
           : ChatInputQuestionKind.Number,
-      ...(property.minimum != null && { min: property.minimum }),
-      ...(property.maximum != null && { max: property.maximum }),
+      ...(typeof property.minimum === "number" && { min: property.minimum }),
+      ...(typeof property.maximum === "number" && { max: property.maximum }),
       ...(typeof property.default === "number" && {
         defaultValue: property.default,
       }),
@@ -146,8 +175,8 @@ function questionOf(field: Field, required: boolean): ChatInputQuestion {
     ...base,
     kind: ChatInputQuestionKind.Text,
     ...(property.format && { format: property.format }),
-    ...(property.minLength != null && { min: property.minLength }),
-    ...(property.maxLength != null && { max: property.maxLength }),
+    ...(typeof property.minLength === "number" && { min: property.minLength }),
+    ...(typeof property.maxLength === "number" && { max: property.maxLength }),
     ...(typeof property.default === "string" && {
       defaultValue: property.default,
     }),

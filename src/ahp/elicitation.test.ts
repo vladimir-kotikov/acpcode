@@ -112,6 +112,139 @@ test("typed text goes to the Other box, beside or instead of the picks", () => {
   });
 });
 
+// What codex-acp 2.6.0 sends for a question with choices: its note box is
+// named in `_meta`, and a choice points at it.
+const codexQuestion: ElicitationSchema = {
+  type: "object",
+  properties: {
+    question_0: {
+      type: "string",
+      title: "Where should it live?",
+      oneOf: [
+        { const: "/tmp (Recommended)", title: "/tmp (Recommended)" },
+        { const: "The repo", title: "The repo" },
+        {
+          const: "None of the above",
+          title: "None of the above",
+          description: "Provide a different answer in the note field.",
+        },
+      ],
+      _meta: { codex: { isOther: true, isSecret: false } },
+    },
+    question_0_note: {
+      type: "string",
+      title: "Additional answer or note",
+      _meta: {
+        codex: { questionId: "question_0", role: "user_note", isSecret: false },
+      },
+    },
+  } as ElicitationSchema["properties"],
+};
+
+test("Codex's select and its note box are one question, without the pointer choice", () => {
+  const request = inputRequestOf("r1", "Codex keeps working", codexQuestion);
+  const response = elicitationResponseOf(
+    codexQuestion,
+    ChatInputResponseKind.Accept,
+    {
+      question_0: submitted({
+        kind: ChatInputAnswerValueKind.Selected,
+        value: "The repo",
+        freeformValues: ["under prototypes/"],
+      }),
+    },
+  );
+
+  assert.deepEqual(request.questions, [
+    {
+      id: "question_0",
+      title: "Where should it live?",
+      message: "Where should it live?",
+      kind: ChatInputQuestionKind.SingleSelect,
+      options: [
+        { id: "/tmp (Recommended)", label: "/tmp (Recommended)" },
+        { id: "The repo", label: "The repo" },
+      ],
+      allowFreeformInput: true,
+    },
+  ]);
+  assert.deepEqual(response, {
+    action: "accept",
+    content: { question_0: "The repo", question_0_note: "under prototypes/" },
+  });
+});
+
+test("typed text alone goes to Codex's note box", () => {
+  const response = elicitationResponseOf(
+    codexQuestion,
+    ChatInputResponseKind.Accept,
+    {
+      question_0: submitted({
+        kind: ChatInputAnswerValueKind.Text,
+        value: "~/prototypes",
+      }),
+    },
+  );
+
+  assert.deepEqual(response, {
+    action: "accept",
+    content: { question_0_note: "~/prototypes" },
+  });
+});
+
+test("a choice of a question's own called None of the above stays, and a note box without its select is asked alone", () => {
+  const own = { const: "None of the above", title: "None of the above" };
+  const request = inputRequestOf("r1", "Questions", {
+    type: "object",
+    properties: {
+      question_0: {
+        type: "string",
+        title: "Pick",
+        oneOf: [{ const: "A", title: "A" }, own],
+      },
+      question_0_note: {
+        type: "string",
+        title: "Additional answer or note",
+        _meta: { codex: { questionId: "question_0", role: "user_note" } },
+      },
+      question_1: { type: "string", title: "Pick", oneOf: [own] },
+      question_2_note: {
+        type: "string",
+        title: "Note",
+        _meta: { codex: { questionId: "question_2", role: "user_note" } },
+      },
+    } as ElicitationSchema["properties"],
+  });
+
+  assert.deepEqual(
+    request.questions?.map(q => [
+      q.id,
+      q.kind,
+      "options" in q ? q.options?.map(o => o.id) : undefined,
+    ]),
+    [
+      [
+        "question_0",
+        ChatInputQuestionKind.SingleSelect,
+        ["A", "None of the above"],
+      ],
+      ["question_1", ChatInputQuestionKind.SingleSelect, ["None of the above"]],
+      ["question_2_note", ChatInputQuestionKind.Text, undefined],
+    ],
+  );
+});
+
+test("a limit that isn't a number is left out", () => {
+  const request = inputRequestOf("r1", "Questions", {
+    type: "object",
+    properties: { name: { type: "string", minLength: null } },
+  } as unknown as ElicitationSchema);
+
+  assert.deepEqual(request.questions, [
+    { id: "name", message: "name", kind: ChatInputQuestionKind.Text },
+  ]);
+});
+
 test("each property kind becomes its question kind, with its limits and default", () => {
   const schema: ElicitationSchema = {
     type: "object",
