@@ -34,7 +34,7 @@ import type {
 } from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
-import { AcpAgentHost, UNANSWERED_QUESTION_NOTICE } from "./acpBridge.ts";
+import { AcpAgentHost } from "./acpBridge.ts";
 import { fakeClaude, waitFor } from "../acp/fakeClaude.test-util.ts";
 import type { AhpServerHooks } from "./server.ts";
 
@@ -1455,7 +1455,7 @@ test("a tool call keeps the agent's tool name and a failure its error", async ()
     toolCallId: "b1",
     title: "Run the tests",
     kind: "execute",
-    _meta: { claudeCode: { toolName: "Bash" } },
+    _meta: { acpcode: { toolName: "Bash" } },
   });
   t.replay("draft", {
     sessionUpdate: "tool_call_update",
@@ -1638,32 +1638,33 @@ test("a shell command is titled with its input's description, not its command li
 const form = (requestId: string): ElicitationRequestEvent => ({
   requestId,
   sessionId: "draft",
-  request: {
-    mode: "form",
-    sessionId: "draft",
+  form: {
     message: "Which database?",
-    requestedSchema: {
-      type: "object",
-      properties: {
-        question_0: {
+    questions: [
+      {
+        key: "question_0",
+        property: {
           type: "string",
           oneOf: [
             { const: "Postgres", title: "Postgres" },
             { const: "Redis", title: "Redis" },
           ],
         },
-        question_0_custom: { type: "string", title: "Other" },
+        required: false,
+        freeText: "question_0_custom",
       },
-    },
+    ],
   },
 });
 
-// Codex's question that doesn't block it.
+const UNANSWERED_NOTICE = "Went ahead without your answer.";
+
+// A form the agent goes on without.
 const asyncForm = (requestId: string): ElicitationRequestEvent => {
   const event = form(requestId);
   return {
     ...event,
-    request: { ...event.request, _meta: { codex: { delivery: "async" } } },
+    form: { ...event.form, unansweredNotice: UNANSWERED_NOTICE },
   };
 };
 
@@ -1728,7 +1729,7 @@ test("Codex's question still unanswered when its turn ends says Codex went ahead
   assert.deepEqual(elicitationsResolved(t.calls), [
     ["elicit-1", { action: "cancel" }],
   ]);
-  assert.deepEqual(noticesOf(t.state().turns[0]), [UNANSWERED_QUESTION_NOTICE]);
+  assert.deepEqual(noticesOf(t.state().turns[0]), [UNANSWERED_NOTICE]);
 });
 
 test("a turn stopped short with Codex's question open says both why and that it went ahead", async () => {
@@ -1740,7 +1741,7 @@ test("a turn stopped short with Codex's question open says both why and that it 
 
   assert.deepEqual(noticesOf(t.state().turns[0]), [
     "Stopped: the response reached the token limit.",
-    UNANSWERED_QUESTION_NOTICE,
+    UNANSWERED_NOTICE,
   ]);
 });
 
@@ -1820,7 +1821,7 @@ test("Codex's question carried past a steering message says it went ahead in the
 
   const [steeredFrom, steered] = t.state().turns;
   assert.deepEqual(noticesOf(steeredFrom), []);
-  assert.deepEqual(noticesOf(steered), [UNANSWERED_QUESTION_NOTICE]);
+  assert.deepEqual(noticesOf(steered), [UNANSWERED_NOTICE]);
 });
 
 test("a form is declined when Chat declines it, and cancelled when the turn is stopped", async () => {

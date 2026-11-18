@@ -8,40 +8,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { type AgentConfig, agentEnv } from "./agents/config.ts";
+import { KINDS } from "./agents/kinds.ts";
 
 type Kind = AgentConfig["kind"];
 
-/** Per agent kind: the bridge's npm package and which key in its `bin` map to
- *  spawn, plus the agent CLI the bridge drives — found on the user's machine
- *  and handed over in `cliEnv`, which both bridges check before falling back
- *  to their bundled copy (claude-agent-acp: `CLAUDE_CODE_EXECUTABLE`,
- *  codex-acp: `CODEX_PATH`). */
-const AGENTS: Record<
-  Kind,
-  {
-    packageName: string;
-    binName: string;
-    cli: string;
-    cliEnv: string;
-    cliDirs: string[];
-  }
-> = {
-  claude: {
-    packageName: "@agentclientprotocol/claude-agent-acp",
-    binName: "claude-agent-acp",
-    cli: "claude",
-    cliEnv: "CLAUDE_CODE_EXECUTABLE",
-    // Where `claude migrate-installer` puts it.
-    cliDirs: [path.join(os.homedir(), ".claude", "local")],
-  },
-  codex: {
-    packageName: "@agentclientprotocol/codex-acp",
-    binName: "codex-acp",
-    cli: "codex",
-    cliEnv: "CODEX_PATH",
-    cliDirs: [],
-  },
-};
+const bridgeOf = (kind: Kind) => KINDS[kind].bridge;
 
 /** `env` with `file`'s directory first on PATH. npm, and CLIs installed with
  *  it, are `#!/usr/bin/env node` scripts, while a GUI-launched VS Code's PATH
@@ -95,7 +66,7 @@ export function withAgentCli(
   kind: Kind,
   env: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-  const { cli, cliEnv, cliDirs } = AGENTS[kind];
+  const { cli, cliEnv, cliDirs } = bridgeOf(kind);
   const dirs = [...cliDirs, ...COMMON_DIRS];
   const found = env[cliEnv] ?? findExecutable(cli, [...pathDirs(), ...dirs]);
   if (!found) {
@@ -128,7 +99,7 @@ function kindDir(kind: Kind): string {
   return path.join(bridgesDir, kind);
 }
 
-export const bridgePackage = (kind: Kind): string => AGENTS[kind].packageName;
+export const bridgePackage = (kind: Kind): string => bridgeOf(kind).packageName;
 
 /** `<kindDir>/current.json`: the install connections use, and the npm version
  *  spec it was installed for (so a changed pin is noticed without asking the
@@ -157,7 +128,7 @@ function writeCurrent(kind: Kind, current: InstalledBridge): void {
  *  rather than through Node's resolver, which would depend on the package's
  *  "exports" map shape. */
 function entryPoint(kind: Kind, version: string): string {
-  const { packageName, binName } = AGENTS[kind];
+  const { packageName, binName } = bridgeOf(kind);
   const pkgDir = path.join(kindDir(kind), version, "node_modules", packageName);
   const binRel = (
     JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")) as {
@@ -232,7 +203,7 @@ async function install(
   probe: BridgeProbe,
   report: (step: string) => void,
 ): Promise<InstallResult> {
-  const { packageName } = AGENTS[kind];
+  const { packageName } = bridgeOf(kind);
   const dir = kindDir(kind);
   const current = installedBridge(kind);
 

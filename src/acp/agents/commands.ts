@@ -1,7 +1,20 @@
 import * as vscode from "vscode";
 import { getAgents, saveAgents } from "../../settings.ts";
+import { withAgentCli } from "../bridges.ts";
 import type { AgentConfig } from "./config.ts";
-import { AGENT_KINDS } from "./kinds.ts";
+import { KINDS } from "./kinds.ts";
+
+/** Read-only: says how to install the kind's agent CLI if it's missing, but
+ *  never installs it. (The ACP bridge needs no check: it's installed on first
+ *  connect.) */
+function missingCli(kind: AgentConfig["kind"]): string | undefined {
+  try {
+    withAgentCli(kind, process.env);
+    return undefined;
+  } catch (err) {
+    return (err as Error).message;
+  }
+}
 
 export const editAgentsConfigCommand = async () =>
   await vscode.commands.executeCommand(
@@ -11,10 +24,10 @@ export const editAgentsConfigCommand = async () =>
 
 export const addAgentCommand = async (): Promise<void> => {
   const kindPick = await vscode.window.showQuickPick(
-    AGENT_KINDS.map(agentKind => ({
-      label: agentKind.label,
-      description: agentKind.description,
-      agentKind,
+    Object.entries(KINDS).map(([id, kind]) => ({
+      label: kind.label,
+      description: kind.description,
+      id: id as AgentConfig["kind"],
     })),
     { title: "Add Agent", placeHolder: "Select an agent kind" },
   );
@@ -22,16 +35,16 @@ export const addAgentCommand = async (): Promise<void> => {
     return;
   }
 
-  const installCheck = kindPick.agentKind.checkInstalled?.() ?? { ok: true };
-  if (!installCheck.ok) {
-    void vscode.window.showErrorMessage(installCheck.message);
+  const missing = missingCli(kindPick.id);
+  if (missing) {
+    void vscode.window.showErrorMessage(missing);
     return;
   }
 
   const name = await vscode.window.showInputBox({
     title: "Add Agent",
     prompt: "Display name for this agent",
-    placeHolder: `e.g. ${kindPick.agentKind.label} (work)`,
+    placeHolder: `e.g. ${kindPick.label} (work)`,
     validateInput: value => (value.trim() ? undefined : "Name is required"),
   });
   if (!name) {
@@ -48,7 +61,7 @@ export const addAgentCommand = async (): Promise<void> => {
 
   const agent: AgentConfig = {
     name: name.trim(),
-    kind: kindPick.agentKind.id,
+    kind: kindPick.id,
     env: {},
   };
   await saveAgents([...existing, agent]);

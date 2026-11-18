@@ -57,8 +57,9 @@ import {
 } from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
+import { KINDS } from "../acp/agents/kinds.ts";
 import { agentProcessEnv } from "../acp/bridges.ts";
-import { removeClaudeJob, sessionOwner } from "../acp/claudeJobs.ts";
+import { toolNameOf } from "../acp/toolNames.ts";
 import type { Disposable, Output } from "../shared/events.ts";
 import { stopNotice, type Attachment } from "../shared/sessionViewProtocol.ts";
 import {
@@ -79,18 +80,10 @@ import {
   resolveModelConfig,
   type ConfigValue,
 } from "./configOptions.ts";
-import {
-  elicitationResponseOf,
-  inputRequestOf,
-  isAsyncForm,
-} from "./elicitation.ts";
+import { elicitationResponseOf, inputRequestOf } from "./elicitation.ts";
 import { AhpRequestError, AhpServer, ROOT_CHANNEL } from "./server.ts";
 
 const DEFAULT_CHAT_TITLE = "New chat";
-/** Ends a turn with Codex's question still unanswered: Chat shows it as
- *  skipped. */
-export const UNANSWERED_QUESTION_NOTICE =
-  "Codex went ahead without your answer. Reply in a new message if it still matters.";
 const TITLE_FROM_PROMPT_LENGTH = 60;
 
 /** Where a tool call is in the AHP lifecycle — tracked separately from the
@@ -135,8 +128,7 @@ interface Binding {
   readonly chatUri: string;
   readonly cwd: string;
   /** The session's other directories (the `/add-dir` set); `cwd` is the
-   *  primary. Only agents that can take them (see `takesExtraDirectories`)
-   *  ever have any. */
+   *  primary. */
   additionalDirectories: string[];
   /** The session's first chat. Forked chats (`createChat`) share its URI,
    *  directories and config but each runs its own ACP session. */
@@ -202,9 +194,6 @@ interface Binding {
   commands?: AvailableCommand[];
 }
 
-const takesExtraDirectories = (agent: AgentConfig): boolean =>
-  agent.kind === "claude" || agent.kind === "codex";
-
 /** The bridge's session index (`sessionIndex`) reports each row's activity
  *  and archive state in `_meta.jetbrains.air`. Without it, rows are idle. */
 export function rowStatus(info: SessionInfo): SessionStatus {
@@ -233,14 +222,6 @@ const directoryUris = (binding: Binding): string[] =>
   [binding.cwd, ...binding.additionalDirectories].map(
     dir => pathToFileURL(dir).href,
   );
-
-/** The agent's own name for the tool (claude-agent-acp sends it in
- *  `_meta.claudeCode.toolName`), else ACP's coarse kind. */
-const toolNameOf = (call: ToolCallUpdate): string => {
-  const name = (call._meta?.claudeCode as { toolName?: unknown } | undefined)
-    ?.toolName;
-  return typeof name === "string" ? name : (call.kind ?? "other");
-};
 
 /** A tool call's input as Chat takes it, if the update has one. Chat shows a
  *  terminal tool's card with the input's `command`, labelled with the call's
@@ -592,12 +573,10 @@ export class AcpAgentHost implements Disposable {
         models: models.map(model => ({ ...model, supportsVision })),
         // The primary is the session's cwd, which fixes where its transcript
         // lives, so only the rest of the set can change.
-        ...(takesExtraDirectories(agent) && {
-          capabilities: {
-            multipleWorkingDirectories: { immutablePrimary: true },
-            multipleChats: { fork: true },
-          },
-        }),
+        capabilities: {
+          multipleWorkingDirectories: { immutablePrimary: true },
+          multipleChats: { fork: true },
+        },
       };
     });
   }
@@ -737,7 +716,7 @@ export class AcpAgentHost implements Disposable {
   }
 
   private rememberDirectories(binding: Binding): void {
-    if (!binding.sessionId || !takesExtraDirectories(binding.agent)) {
+    if (!binding.sessionId) {
       return;
     }
     const key = `${binding.agent.name}\0${binding.sessionId}`;
@@ -1537,10 +1516,10 @@ export class AcpAgentHost implements Disposable {
     }
   };
 
-  /** What else runs a chat's ACP session, per `sessionOwner`. Only Claude
-   *  sessions have one. */
+  /** What else runs a chat's ACP session, per `AgentKind.sessionOwner`. */
   private ownerOf(binding: Binding): Promise<string | undefined> {
-    if (binding.agent.kind !== "claude" || !binding.sessionId) {
+    const { sessionOwner } = KINDS[binding.agent.kind];
+    if (!sessionOwner || !binding.sessionId) {
       return Promise.resolve(undefined);
     }
     return sessionOwner(
@@ -1836,7 +1815,7 @@ export class AcpAgentHost implements Disposable {
       params.channel,
       `ahp-chat:/${randomUUID()}`,
       cwd,
-      takesExtraDirectories(agent) ? additional : [],
+      additional,
     );
     this.server.create(binding.chatUri, "chat", this.chatState(binding));
     const ready = this.connect(binding)
@@ -1978,11 +1957,12 @@ export class AcpAgentHost implements Disposable {
     );
   }
 
-  /** Removes the session's `claude agents` job, as ctrl+x there does; its
-   *  transcript stays. */
+  /** Removes what the agent keeps running for the session, per
+   *  `AgentKind.removeJob`. */
   private removeJob(binding: Binding): Promise<void> {
     const { agent, sessionId } = binding;
-    if (agent.kind !== "claude" || !sessionId) {
+    const { removeJob } = KINDS[agent.kind];
+    if (!removeJob || !sessionId) {
       return Promise.resolve();
     }
     // Archiving the primary chat can arrive as both the session's and the
@@ -1993,14 +1973,14 @@ export class AcpAgentHost implements Disposable {
       return inFlight;
     }
     const removal = Promise.resolve()
-      .then(() => removeClaudeJob(agentProcessEnv(agent), sessionId))
+      .then(() => removeJob(agentProcessEnv(agent), sessionId))
       .then(
         printed => {
           if (printed) {
-            this.output.appendLine(`[claude rm] ${printed}`);
+            this.output.appendLine(`[remove job] ${printed}`);
           }
         },
-        err => this.output.appendLine(`[claude rm] ${describeError(err)}`),
+        err => this.output.appendLine(`[remove job] ${describeError(err)}`),
       )
       .finally(() => this.removingJobs.delete(key));
     this.removingJobs.set(key, removal);
@@ -2163,7 +2143,7 @@ export class AcpAgentHost implements Disposable {
           ?.resolveElicitation(
             pending.requestId,
             elicitationResponseOf(
-              pending.request.requestedSchema,
+              pending.form,
               action.response,
               part?.kind === ResponsePartKind.InputRequest
                 ? part.request.answers
@@ -2246,11 +2226,12 @@ export class AcpAgentHost implements Disposable {
         this.promoteSteered(binding, run, true);
         const notices = [
           stopNotice(stopReason),
-          [...(binding.inputs?.values() ?? [])].some(({ request }) =>
-            isAsyncForm(request),
-          )
-            ? UNANSWERED_QUESTION_NOTICE
-            : undefined,
+          // Chat shows the forms as skipped.
+          ...new Set(
+            [...(binding.inputs?.values() ?? [])].map(
+              ({ form }) => form.unansweredNotice,
+            ),
+          ),
         ].filter(notice => notice !== undefined);
         if (binding.turnId === run.turnId) {
           for (const content of notices) {
@@ -2682,7 +2663,7 @@ export class AcpAgentHost implements Disposable {
       type: ActionType.ChatToolCallStart,
       turnId,
       toolCallId: call.toolCallId,
-      toolName: toolNameOf(call),
+      toolName: toolNameOf(call) ?? call.kind ?? "other",
       displayName: title,
     });
     this.server.dispatch(binding.chatUri, {
@@ -2924,11 +2905,7 @@ export class AcpAgentHost implements Disposable {
     this.server.dispatch(binding.chatUri, {
       type: ActionType.ChatInputRequested,
       request: {
-        ...inputRequestOf(
-          id,
-          request.request.message,
-          request.request.requestedSchema,
-        ),
+        ...inputRequestOf(id, request.form),
         ...(answers && { answers }),
       },
     });

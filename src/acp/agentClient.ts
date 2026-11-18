@@ -35,7 +35,9 @@ import { fileURLToPath } from "node:url";
 import { Emitter, type Disposable, type Output } from "../shared/events.ts";
 import type { Attachment } from "../shared/sessionViewProtocol.ts";
 import type { AgentConfig } from "./agents/config.ts";
+import { KINDS, type AgentKind } from "./agents/kinds.ts";
 import { agentProcessEnv, bridgeEntryPoint } from "./bridges.ts";
+import { plainForm, type Form } from "./forms.ts";
 
 /** Pulls the AIR extension's session-failure title out of a response's
  *  `_meta`, but only when `severity` is "error" — see `prompt()`'s doc
@@ -59,54 +61,6 @@ function extractAirFailureTitle(
   return severity === "error" && typeof title === "string" ? title : undefined;
 }
 
-/** The slash command each agent kind's CLI recognizes as "drop prior
- *  conversation from the model's context." Not every kind has one — codex-acp
- *  exposes no equivalent built-in (its closest, `/compact`, summarizes rather
- *  than drops) — so lookups fall through to `undefined` and both `prompt()`
- *  and `withResetCommand()` below simply leave it out. Only resets the
- *  *display*; the agent's own CLI is what actually drops the content from
- *  its context. Doubles as the composer's menu entry (`name`/`description`
- *  are exactly `AvailableCommand`'s shape) since neither bridge actually
- *  advertises this one through `available_commands_update` itself. */
-const RESET_COMMANDS: Partial<Record<AgentConfig["kind"], AvailableCommand>> = {
-  claude: {
-    name: "clear",
-    description: "Clear conversation history and free up context",
-  },
-};
-
-/** The fallback for a compaction `compactionAsToolCall` never sees: Claude
- *  Code keeps the summary as a user message, and a bridge that doesn't map it
- *  to a compaction replays it as one, a huge prompt nobody typed. It's shown as
- *  the completed "Compact conversation" tool call instead. claude-agent-acp
- *  0.100.0 needs this: it only recognises an older framing of the summary.
- *  Once it maps the summary, it no longer arrives as a user message. */
-// ponytail: the record's `isCompactSummary` doesn't reach ACP, so this
-// matches Claude Code's framing, and a prompt pasted with it shows as a card
-// too.
-const COMPACT_SUMMARY =
-  /^\s*This session is being continued from a previous conversation[^\n]*\n[\s\S]*?^Summary:/m;
-function compactSummaryAsToolCall(update: SessionUpdate): SessionUpdate {
-  if (
-    update.sessionUpdate !== "user_message_chunk" ||
-    update.content.type !== "text" ||
-    !COMPACT_SUMMARY.test(update.content.text)
-  ) {
-    return update;
-  }
-  return {
-    sessionUpdate: "tool_call",
-    toolCallId: update.messageId ?? randomUUID(),
-    title: "Compact conversation",
-    kind: "think",
-    status: "completed",
-    // VS Code Chat only shows a tool call's output when it has input.
-    rawInput: {},
-    content: [{ type: "content", content: update.content }],
-    _meta: { claudeCode: { toolName: "compact" } },
-  };
-}
-
 type CompactionEvent = Extract<
   SessionUpdate,
   { sessionUpdate: "compaction_update" | "compaction_summary_chunk" }
@@ -116,7 +70,7 @@ type CompactionEvent = Extract<
  *  claude-agent-acp sends to clients without `session.compaction`, so both
  *  frontends show them as before. We advertise the capability for replay:
  *  without it, a compacted session's history shows the summary as a huge user
- *  message (see `compactSummaryAsToolCall` for bridges that still do).
+ *  message (see the Claude kind's `mapUpdate` for bridges that still do).
  *  `compactions` holds each one's summary so far and error, keyed by session
  *  and compaction id; a missing key means a new compaction. */
 function compactionAsToolCall(
@@ -133,9 +87,9 @@ function compactionAsToolCall(
     toolCallId: update.compactionId,
     title: "Compact conversation",
     kind: "think",
-    // See `compactSummaryAsToolCall`.
+    // VS Code Chat only shows a tool call's output when it has input.
     ...(!known && { rawInput: {} }),
-    _meta: { claudeCode: { toolName: "compact" } },
+    _meta: { acpcode: { toolName: "compact" } },
   } as const;
   if (update.sessionUpdate === "compaction_summary_chunk") {
     if (update.content.type === "text") {
@@ -200,12 +154,7 @@ export type PermissionRequestEvent = {
 export type ElicitationRequestEvent = {
   requestId: string;
   sessionId: SessionId;
-  request: CreateElicitationRequest & {
-    mode: "form";
-    sessionId: SessionId;
-    toolCallId?: string | null;
-    requestedSchema: ElicitationSchema;
-  };
+  form: Form;
 };
 export type TranscriptResetEvent = {
   sessionId: SessionId;
@@ -252,8 +201,8 @@ export class AgentClient implements Disposable {
   private child?: ChildProcessWithoutNullStreams;
   private agent?: ClientContext;
   // Set in `connect()` — read by `prompt()` to look up this kind's reset
-  // command (see `RESET_COMMANDS`).
-  private kind?: AgentConfig["kind"];
+  // command (see `AgentKind.resetCommand`).
+  private kind?: AgentKind;
   private readonly pendingPermissions = new Map<
     string,
     {
@@ -314,7 +263,7 @@ export class AgentClient implements Disposable {
   /** Only with `elicitation` on; see the constructor. */
   readonly onElicitationRequest = this.elicitationRequestEmitter.event;
   // Fired instead of (just before) the normal echo when `prompt()` recognizes
-  // the agent's own history-reset command (see `RESET_COMMANDS`) — every view
+  // the agent's own history-reset command (see `AgentKind.resetCommand`) — every view
   // sharing this connection's session needs it, same reasoning as
   // `echoUserMessage`'s doc comment, so it rides the same emitter pattern
   // rather than being each view's own problem to detect.
@@ -337,7 +286,7 @@ export class AgentClient implements Disposable {
    *  `bridgeEntryPoint`); `entryPoint` overrides which bridge install. */
   async connect(agent: AgentConfig, entryPoint?: string): Promise<void> {
     this.disconnectChild();
-    this.kind = agent.kind;
+    this.kind = KINDS[agent.kind];
     this.connectionStateEmitter.fire({ state: "connecting" });
 
     let env: NodeJS.ProcessEnv;
@@ -420,16 +369,18 @@ export class AgentClient implements Disposable {
               : update.sessionUpdate === "compaction_update" ||
                   update.sessionUpdate === "compaction_summary_chunk"
                 ? compactionAsToolCall(sessionId, update, this.compactions)
-                : this.kind === "claude"
-                  ? compactSummaryAsToolCall(update)
-                  : update,
+                : (this.kind?.mapUpdate?.(update) ?? update),
         });
       })
       // After `session/update`: the SDK passes each incoming message down its
       // handlers in order, an await each, while answers settle at once; a
       // prompt's last update must still beat its answer.
       .onRequest(methods.client.elicitation.create, ctx => {
-        const request = ctx.params as ElicitationRequestEvent["request"];
+        const request = ctx.params as CreateElicitationRequest & {
+          mode: "form";
+          sessionId: SessionId;
+          requestedSchema: ElicitationSchema;
+        };
         // Only forms are advertised; a request outside a session (e.g. one
         // tied to a pending `session/new`) has no chat to show it in.
         if (request.mode !== "form" || typeof request.sessionId !== "string") {
@@ -447,7 +398,11 @@ export class AgentClient implements Disposable {
           this.elicitationRequestEmitter.fire({
             requestId,
             sessionId: request.sessionId,
-            request,
+            form: (this.kind?.formOf ?? plainForm)({
+              message: request.message,
+              requestedSchema: request.requestedSchema,
+              _meta: request._meta,
+            }),
           });
         });
       });
@@ -868,7 +823,7 @@ export class AgentClient implements Disposable {
     // keep accumulating right through it. Matched on the command word alone
     // (ignoring any trailing args) the same way the bridges themselves parse
     // their own local commands.
-    const resetCommand = this.kind && RESET_COMMANDS[this.kind];
+    const resetCommand = this.kind?.resetCommand;
     if (
       resetCommand &&
       `/${resetCommand.name}` === text.trim().split(/\s+/, 1)[0]
@@ -958,14 +913,14 @@ export class AgentClient implements Disposable {
     }
   }
 
-  /** Neither bridge actually lists its reset command (see `RESET_COMMANDS`)
+  /** Neither bridge actually lists its reset command (see `AgentKind.resetCommand`)
    *  among the real `available_commands_update` it sends, so the composer's
    *  "/" menu would never suggest it even though `prompt()` above already
    *  acts on it — patched in here instead of in the webview so the two stay
    *  impossible to drift apart (same lookup, same source). `some` guard:
    *  skip adding it if a future bridge version ever does advertise it. */
   private withResetCommand(commands: AvailableCommand[]): AvailableCommand[] {
-    const reset = this.kind && RESET_COMMANDS[this.kind];
+    const reset = this.kind?.resetCommand;
     return reset && !commands.some(c => c.name === reset.name)
       ? [...commands, reset]
       : commands;

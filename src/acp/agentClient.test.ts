@@ -248,7 +248,7 @@ test("an agent's form reaches the frontend and its answer goes back; other kinds
   await waitFor(() => answers.length === 2);
 
   assert.deepEqual(
-    asked.map(({ sessionId, request }) => [sessionId, request.message]),
+    asked.map(({ sessionId, form }) => [sessionId, form.message]),
     [["s1", "Name?"]],
   );
   // Without the prompt's request id.

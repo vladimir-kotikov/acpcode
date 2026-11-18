@@ -10,44 +10,51 @@ import {
 } from "@microsoft/agent-host-protocol";
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { plainForm, type Form } from "../acp/forms.ts";
 import {
   SECRET_ANSWER_WARNING,
   elicitationResponseOf,
   inputRequestOf,
 } from "./elicitation.ts";
 
-// What claude-agent-acp 0.101.1 sends for AskUserQuestion: each question is a
-// select followed by its "Other" box.
-const askUserQuestion: ElicitationSchema = {
-  type: "object",
-  properties: {
-    question_0: {
-      type: "string",
-      title: "Database",
-      description: "Which database?",
-      oneOf: [
-        { const: "Postgres", title: "Postgres", description: "Relational" },
-        { const: "Redis", title: "Redis" },
-      ],
-    },
-    question_0_custom: {
-      type: "string",
-      title: "Other",
-      description: "Type your own answer (optional).",
-    },
-    question_1: {
-      type: "array",
-      title: "Features",
-      description: "Which features?",
-      items: {
-        anyOf: [
-          { const: "Auth", title: "Auth" },
-          { const: "Billing", title: "Billing" },
+const formOf = (requestedSchema: ElicitationSchema) =>
+  plainForm({ message: "Questions", requestedSchema });
+
+// Selects that also take a typed answer, in a text property of their own.
+const withTypedAnswers: Form = {
+  message: "Questions",
+  questions: [
+    {
+      key: "database",
+      property: {
+        type: "string",
+        title: "Database",
+        description: "Which database?",
+        oneOf: [
+          { const: "Postgres", title: "Postgres", description: "Relational" },
+          { const: "Redis", title: "Redis" },
         ],
       },
+      required: false,
+      freeText: "database_other",
     },
-    question_1_custom: { type: "string", title: "Other" },
-  },
+    {
+      key: "features",
+      property: {
+        type: "array",
+        title: "Features",
+        description: "Which features?",
+        items: {
+          anyOf: [
+            { const: "Auth", title: "Auth" },
+            { const: "Billing", title: "Billing" },
+          ],
+        },
+      },
+      required: false,
+      freeText: "features_other",
+    },
+  ],
 };
 
 const submitted = (value: ChatInputAnswerValue): ChatInputAnswer => ({
@@ -55,15 +62,15 @@ const submitted = (value: ChatInputAnswerValue): ChatInputAnswer => ({
   value,
 });
 
-test("a select and its Other box are one question that also takes typed text", () => {
-  const request = inputRequestOf("r1", "Questions", askUserQuestion);
+test("a select with a free-text property takes typed text too", () => {
+  const request = inputRequestOf("r1", withTypedAnswers);
 
   assert.deepEqual(request, {
     id: "r1",
     message: "Questions",
     questions: [
       {
-        id: "question_0",
+        id: "database",
         title: "Database",
         message: "Which database?",
         kind: ChatInputQuestionKind.SingleSelect,
@@ -74,7 +81,7 @@ test("a select and its Other box are one question that also takes typed text", (
         allowFreeformInput: true,
       },
       {
-        id: "question_1",
+        id: "features",
         title: "Features",
         message: "Which features?",
         kind: ChatInputQuestionKind.MultiSelect,
@@ -88,17 +95,17 @@ test("a select and its Other box are one question that also takes typed text", (
   });
 });
 
-test("typed text goes to the Other box, beside or instead of the picks", () => {
+test("typed text goes to the free-text property, beside or instead of the picks", () => {
   const response = elicitationResponseOf(
-    askUserQuestion,
+    withTypedAnswers,
     ChatInputResponseKind.Accept,
     {
       // Chat sends text alone when nothing was picked.
-      question_0: submitted({
+      database: submitted({
         kind: ChatInputAnswerValueKind.Text,
         value: "SQLite",
       }),
-      question_1: submitted({
+      features: submitted({
         kind: ChatInputAnswerValueKind.SelectedMany,
         value: ["Auth"],
         freeformValues: ["Search"],
@@ -109,145 +116,24 @@ test("typed text goes to the Other box, beside or instead of the picks", () => {
   assert.deepEqual(response, {
     action: "accept",
     content: {
-      question_0_custom: "SQLite",
-      question_1: ["Auth"],
-      question_1_custom: "Search",
+      database_other: "SQLite",
+      features: ["Auth"],
+      features_other: "Search",
     },
   });
 });
 
-// What codex-acp 2.6.0 sends for a question with choices: its note box is
-// named in `_meta`, and a choice points at it.
-const codexQuestion: ElicitationSchema = {
-  type: "object",
-  properties: {
-    question_0: {
-      type: "string",
-      title: "Where should it live?",
-      oneOf: [
-        { const: "/tmp (Recommended)", title: "/tmp (Recommended)" },
-        { const: "The repo", title: "The repo" },
-        {
-          const: "None of the above",
-          title: "None of the above",
-          description: "Provide a different answer in the note field.",
-        },
-      ],
-      _meta: { codex: { isOther: true, isSecret: false } },
-    },
-    question_0_note: {
-      type: "string",
-      title: "Additional answer or note",
-      _meta: {
-        codex: { questionId: "question_0", role: "user_note", isSecret: false },
+test("a secret question warns its answer shows in the chat", () => {
+  const request = inputRequestOf("r1", {
+    message: "Questions",
+    questions: [
+      {
+        key: "key",
+        property: { type: "string", title: "API key?" },
+        required: false,
+        secret: true,
       },
-    },
-  } as ElicitationSchema["properties"],
-};
-
-test("Codex's select and its note box are one question, without the pointer choice", () => {
-  const request = inputRequestOf("r1", "Codex keeps working", codexQuestion);
-  const response = elicitationResponseOf(
-    codexQuestion,
-    ChatInputResponseKind.Accept,
-    {
-      question_0: submitted({
-        kind: ChatInputAnswerValueKind.Selected,
-        value: "The repo",
-        freeformValues: ["under prototypes/"],
-      }),
-    },
-  );
-
-  assert.deepEqual(request.questions, [
-    {
-      id: "question_0",
-      title: "Where should it live?",
-      message: "Where should it live?",
-      kind: ChatInputQuestionKind.SingleSelect,
-      options: [
-        { id: "/tmp (Recommended)", label: "/tmp (Recommended)" },
-        { id: "The repo", label: "The repo" },
-      ],
-      allowFreeformInput: true,
-    },
-  ]);
-  assert.deepEqual(response, {
-    action: "accept",
-    content: { question_0: "The repo", question_0_note: "under prototypes/" },
-  });
-});
-
-test("typed text alone goes to Codex's note box", () => {
-  const response = elicitationResponseOf(
-    codexQuestion,
-    ChatInputResponseKind.Accept,
-    {
-      question_0: submitted({
-        kind: ChatInputAnswerValueKind.Text,
-        value: "~/prototypes",
-      }),
-    },
-  );
-
-  assert.deepEqual(response, {
-    action: "accept",
-    content: { question_0_note: "~/prototypes" },
-  });
-});
-
-test("a choice of a question's own called None of the above stays, and a note box without its select is asked alone", () => {
-  const own = { const: "None of the above", title: "None of the above" };
-  const request = inputRequestOf("r1", "Questions", {
-    type: "object",
-    properties: {
-      question_0: {
-        type: "string",
-        title: "Pick",
-        oneOf: [{ const: "A", title: "A" }, own],
-      },
-      question_0_note: {
-        type: "string",
-        title: "Additional answer or note",
-        _meta: { codex: { questionId: "question_0", role: "user_note" } },
-      },
-      question_1: { type: "string", title: "Pick", oneOf: [own] },
-      question_2_note: {
-        type: "string",
-        title: "Note",
-        _meta: { codex: { questionId: "question_2", role: "user_note" } },
-      },
-    } as ElicitationSchema["properties"],
-  });
-
-  assert.deepEqual(
-    request.questions?.map(q => [
-      q.id,
-      q.kind,
-      "options" in q ? q.options?.map(o => o.id) : undefined,
-    ]),
-    [
-      [
-        "question_0",
-        ChatInputQuestionKind.SingleSelect,
-        ["A", "None of the above"],
-      ],
-      ["question_1", ChatInputQuestionKind.SingleSelect, ["None of the above"]],
-      ["question_2_note", ChatInputQuestionKind.Text, undefined],
     ],
-  );
-});
-
-test("a question Codex marks secret warns its answer shows in the chat", () => {
-  const request = inputRequestOf("r1", "Codex needs your input", {
-    type: "object",
-    properties: {
-      question_0: {
-        type: "string",
-        title: "API key?",
-        _meta: { codex: { isOther: false, isSecret: true } },
-      },
-    } as ElicitationSchema["properties"],
   });
 
   assert.equal(
@@ -257,10 +143,13 @@ test("a question Codex marks secret warns its answer shows in the chat", () => {
 });
 
 test("a limit that isn't a number is left out", () => {
-  const request = inputRequestOf("r1", "Questions", {
-    type: "object",
-    properties: { name: { type: "string", minLength: null } },
-  } as unknown as ElicitationSchema);
+  const request = inputRequestOf(
+    "r1",
+    formOf({
+      type: "object",
+      properties: { name: { type: "string", minLength: null } },
+    } as unknown as ElicitationSchema),
+  );
 
   assert.deepEqual(request.questions, [
     { id: "name", message: "name", kind: ChatInputQuestionKind.Text },
@@ -283,7 +172,7 @@ test("each property kind becomes its question kind, with its limits and default"
     },
   };
 
-  assert.deepEqual(inputRequestOf("r1", "Fill in", schema).questions, [
+  assert.deepEqual(inputRequestOf("r1", formOf(schema)).questions, [
     {
       id: "name",
       title: "Name",
@@ -349,15 +238,22 @@ test("answers are sent as their property's kind; skipped ones are left out", () 
     },
   };
 
-  const response = elicitationResponseOf(schema, ChatInputResponseKind.Accept, {
-    count: submitted({ kind: ChatInputAnswerValueKind.Text, value: "3" }),
-    ok: submitted({ kind: ChatInputAnswerValueKind.Boolean, value: false }),
-    color: submitted({ kind: ChatInputAnswerValueKind.Selected, value: "red" }),
-    tags: submitted({ kind: ChatInputAnswerValueKind.Selected, value: "b" }),
-    typed: submitted({ kind: ChatInputAnswerValueKind.Text, value: "c" }),
-    list: submitted({ kind: ChatInputAnswerValueKind.Text, value: "d" }),
-    note: { state: ChatInputAnswerState.Skipped },
-  });
+  const response = elicitationResponseOf(
+    formOf(schema),
+    ChatInputResponseKind.Accept,
+    {
+      count: submitted({ kind: ChatInputAnswerValueKind.Text, value: "3" }),
+      ok: submitted({ kind: ChatInputAnswerValueKind.Boolean, value: false }),
+      color: submitted({
+        kind: ChatInputAnswerValueKind.Selected,
+        value: "red",
+      }),
+      tags: submitted({ kind: ChatInputAnswerValueKind.Selected, value: "b" }),
+      typed: submitted({ kind: ChatInputAnswerValueKind.Text, value: "c" }),
+      list: submitted({ kind: ChatInputAnswerValueKind.Text, value: "d" }),
+      note: { state: ChatInputAnswerState.Skipped },
+    },
+  );
 
   assert.deepEqual(response, {
     action: "accept",
@@ -374,11 +270,11 @@ test("answers are sent as their property's kind; skipped ones are left out", () 
 
 test("a declined or cancelled form sends no answers", () => {
   assert.deepEqual(
-    elicitationResponseOf(askUserQuestion, ChatInputResponseKind.Decline),
+    elicitationResponseOf(withTypedAnswers, ChatInputResponseKind.Decline),
     { action: "decline" },
   );
   assert.deepEqual(
-    elicitationResponseOf(askUserQuestion, ChatInputResponseKind.Cancel),
+    elicitationResponseOf(withTypedAnswers, ChatInputResponseKind.Cancel),
     { action: "cancel" },
   );
 });

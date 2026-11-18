@@ -1,10 +1,9 @@
-// ACP form elicitations ⇄ AHP input requests. Both follow MCP's
-// elicitation schema: each property of the requested schema is a question,
-// keyed by the property's name.
+// An agent's forms ⇄ AHP input requests. Both follow MCP's elicitation
+// schema: each property of the requested schema is a question, keyed by the
+// property's name.
 import type {
   CreateElicitationResponse,
   ElicitationContentValue,
-  ElicitationSchema,
 } from "@agentclientprotocol/sdk";
 import {
   ChatInputAnswerState,
@@ -16,49 +15,7 @@ import {
   type ChatInputQuestion,
   type ChatInputRequest,
 } from "@microsoft/agent-host-protocol";
-
-/** A requested schema's property, any of ACP's kinds. */
-interface Property {
-  type?: string;
-  title?: string | null;
-  description?: string | null;
-  default?: unknown;
-  format?: string | null;
-  minLength?: number | null;
-  maxLength?: number | null;
-  minimum?: number | null;
-  maximum?: number | null;
-  minItems?: number | null;
-  maxItems?: number | null;
-  enum?: string[] | null;
-  oneOf?: Choice[] | null;
-  items?: { enum?: string[] | null; anyOf?: Choice[] | null };
-  _meta?: {
-    codex?: { role?: string; questionId?: string; isSecret?: boolean };
-  } | null;
-}
-
-interface Choice {
-  const: string;
-  title: string;
-  description?: string | null;
-}
-
-interface Field {
-  key: string;
-  property: Property;
-  /** The text property that takes this select's "Other" answer. */
-  custom?: string;
-  /** Whether that text property is Codex's note box, whose select has a
-   *  choice pointing at it: left out, as the question takes typed text. */
-  codexNote?: boolean;
-}
-
-/** The choice codex-acp adds to a select that has a note box, unless one of
- *  the select's own is called so. */
-const isCodexNotePointer = (choice: ChatInputOption) =>
-  choice.id === "None of the above" &&
-  choice.description === "Provide a different answer in the note field.";
+import type { Form, Property, Question } from "../acp/forms.ts";
 
 const choicesOf = (property: Property): ChatInputOption[] | undefined => {
   const titled =
@@ -76,70 +33,29 @@ const choicesOf = (property: Property): ChatInputOption[] | undefined => {
     : undefined;
 };
 
-/** The schema's questions. A select and the text property that takes its
- *  "Other" answer are one question that also takes typed text: Claude's
- *  AskUserQuestion form follows each select with a `<key>_custom` box, and
- *  Codex's names its note box's select in `_meta`. */
-function fieldsOf(schema: ElicitationSchema): Field[] {
-  const properties = (schema.properties ?? {}) as Record<string, Property>;
-  const isText = (property?: Property) =>
-    property?.type === "string" && !choicesOf(property)?.length;
-  const notes = new Map<string, string>();
-  for (const [key, property] of Object.entries(properties)) {
-    const codex = property._meta?.codex;
-    if (
-      codex?.role === "user_note" &&
-      typeof codex.questionId === "string" &&
-      isText(property)
-    ) {
-      notes.set(codex.questionId, key);
-    }
-  }
-  const customs = new Set<string>();
-  const fields: Field[] = [];
-  for (const [key, property] of Object.entries(properties)) {
-    const note = notes.get(key);
-    const custom = note ?? `${key}_custom`;
-    const folds =
-      choicesOf(property) !== undefined && isText(properties[custom]);
-    if (folds) {
-      customs.add(custom);
-    }
-    fields.push({
-      key,
-      property,
-      ...(folds && { custom }),
-      ...(folds && note && { codexNote: true }),
-    });
-  }
-  return fields.filter(field => !customs.has(field.key));
-}
-
-/** Told with a question Codex marks secret: Chat can't mask an answer. */
+/** Told with a question the agent marks secret: Chat can't mask an answer. */
 export const SECRET_ANSWER_WARNING =
   "Your answer will show in the chat and its history.";
 
-function questionOf(field: Field, required: boolean): ChatInputQuestion {
-  const { key, property } = field;
+function questionOf(question: Question): ChatInputQuestion {
+  const { key, property, required } = question;
   const message = property.description || property.title || key;
   const base = {
     id: key,
     ...(property.title && { title: property.title }),
-    message: property._meta?.codex?.isSecret
+    message: question.secret
       ? `${message}\n\n${SECRET_ANSWER_WARNING}`
       : message,
     ...(required && { required }),
   };
-  const choices = choicesOf(property)?.filter(
-    choice => !(field.codexNote && isCodexNotePointer(choice)),
-  );
+  const choices = choicesOf(property);
   // A list without choices is asked as text; see `fromText`.
   if (property.type === "array" && choices) {
     return {
       ...base,
       kind: ChatInputQuestionKind.MultiSelect,
       options: choices,
-      ...(field.custom && { allowFreeformInput: true }),
+      ...(question.freeText && { allowFreeformInput: true }),
       ...(typeof property.minItems === "number" && { min: property.minItems }),
       ...(typeof property.maxItems === "number" && { max: property.maxItems }),
     };
@@ -153,7 +69,7 @@ function questionOf(field: Field, required: boolean): ChatInputQuestion {
           ? { ...choice, recommended: true }
           : choice,
       ),
-      ...(field.custom && { allowFreeformInput: true }),
+      ...(question.freeText && { allowFreeformInput: true }),
     };
   }
   if (property.type === "number" || property.type === "integer") {
@@ -192,26 +108,11 @@ function questionOf(field: Field, required: boolean): ChatInputQuestion {
   };
 }
 
-/** Whether the agent goes on while the form is open: Codex asks such
- *  questions, and drops their answers once its turn ends. */
-export const isAsyncForm = (request: { _meta?: unknown }): boolean =>
-  (request._meta as { codex?: { delivery?: unknown } } | null | undefined)
-    ?.codex?.delivery === "async";
-
-export function inputRequestOf(
-  id: string,
-  message: string,
-  schema: ElicitationSchema,
-): ChatInputRequest {
-  const required = new Set(schema.required ?? []);
-  return {
-    id,
-    message,
-    questions: fieldsOf(schema).map(field =>
-      questionOf(field, required.has(field.key)),
-    ),
-  };
-}
+export const inputRequestOf = (id: string, form: Form): ChatInputRequest => ({
+  id,
+  message: form.message,
+  questions: form.questions.map(questionOf),
+});
 
 /** A text answer as the property's own kind: Chat sends typed numbers and
  *  free text as text. */
@@ -228,7 +129,7 @@ function fromText(property: Property, text: string): ElicitationContentValue {
 
 /** The ACP response to Chat's answers to a request made by `inputRequestOf`. */
 export function elicitationResponseOf(
-  schema: ElicitationSchema,
+  form: Form,
   response: ChatInputResponseKind,
   answers: Record<string, ChatInputAnswer> = {},
 ): CreateElicitationResponse {
@@ -238,7 +139,7 @@ export function elicitationResponseOf(
     };
   }
   const content: Record<string, ElicitationContentValue> = {};
-  for (const { key, property, custom } of fieldsOf(schema)) {
+  for (const { key, property, freeText } of form.questions) {
     const answer = answers[key];
     if (!answer || answer.state === ChatInputAnswerState.Skipped) {
       continue;
@@ -257,11 +158,11 @@ export function elicitationResponseOf(
       content[key] = value.value;
     } else if (value.kind !== ChatInputAnswerValueKind.Text) {
       content[key] = value.value;
-    } else if (!custom) {
+    } else if (!freeText) {
       content[key] = fromText(property, value.value);
     }
-    if (custom && typed.length) {
-      content[custom] = typed.join("\n");
+    if (freeText && typed.length) {
+      content[freeText] = typed.join("\n");
     }
   }
   return { action: "accept", content };

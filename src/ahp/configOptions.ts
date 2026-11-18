@@ -6,6 +6,7 @@ import type {
   SessionConfigSelectOption,
 } from "@agentclientprotocol/sdk";
 import type { AgentConfig } from "../acp/agents/config.ts";
+import { KINDS } from "../acp/agents/kinds.ts";
 import type {
   ConfigSchema,
   SessionConfigPropertySchema,
@@ -23,12 +24,6 @@ interface Placement {
   toAhp: Record<string, string>;
 }
 
-// The keys native Claude and Codex use for their permission modes. VS Code
-// renders whatever values these have in a dedicated picker.
-const PERMISSIONS_KEY: Record<AgentKind, string> = {
-  claude: "permissionMode",
-  codex: "codex.permissionsPreset",
-};
 // VS Code's Agent Mode picker (`mode`) only appears for values within this
 // set that include "interactive".
 const AGENT_MODES = new Set(["interactive", "plan", "autopilot"]);
@@ -38,7 +33,7 @@ const KEY_PREFIX = "acp.";
 
 function placement(option: SessionConfigOption, kind: AgentKind): Placement {
   if (option.category === "mode") {
-    return { key: PERMISSIONS_KEY[kind], toAhp: {} };
+    return { key: KINDS[kind].permissionsKey, toAhp: {} };
   }
   if (option.category === "collaboration_mode") {
     const toAhp: Record<string, string> = { default: "interactive" };
