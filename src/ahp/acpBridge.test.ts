@@ -1509,9 +1509,10 @@ test("a shell command becomes a terminal once Chat can label it", async () => {
   t.replay("draft", {
     sessionUpdate: "tool_call_update",
     toolCallId: "b1",
-    rawInput: { command: "npm test", description: "Run the tests" },
+    rawInput: { command: "npm test" },
+    _meta: { acpcode: { intention: "Run the tests" } },
   });
-  // Codex sends it whole, without a description.
+  // Sent whole, without an intention.
   t.replay("draft", {
     sessionUpdate: "tool_call",
     toolCallId: "c1",
@@ -1555,7 +1556,7 @@ test("a shell command becomes a terminal once Chat can label it", async () => {
   assert.equal(toolCall("d1")!._meta, undefined);
 });
 
-test("a shell command is titled with its input's description, not its command line", async () => {
+test("a shell command is titled with its intention, not its command line", async () => {
   const t = await withRunningTurn();
   const call = (id: string) =>
     t
@@ -1589,10 +1590,8 @@ test("a shell command is titled with its input's description, not its command li
     sessionUpdate: "tool_call_update",
     toolCallId: "b1",
     title: "npm test -- --long --flags",
-    rawInput: {
-      command: "npm test -- --long --flags",
-      description: "Run the tests",
-    },
+    rawInput: { command: "npm test -- --long --flags" },
+    _meta: { acpcode: { intention: "Run the tests" } },
   });
   t.replay("draft", {
     sessionUpdate: "tool_call_update",
@@ -1604,7 +1603,8 @@ test("a shell command is titled with its input's description, not its command li
     toolCallId: "i1",
     title: "Create an issue",
     kind: "other",
-    rawInput: { description: "A long issue body" },
+    rawInput: {},
+    _meta: { acpcode: { intention: "A long issue body" } },
   });
   t.askPermission({
     sessionId: "draft",
@@ -1613,7 +1613,8 @@ test("a shell command is titled with its input's description, not its command li
       toolCallId: "p1",
       title: "rm -rf build",
       kind: "execute",
-      rawInput: { command: "rm -rf build", description: "Remove the build" },
+      rawInput: { command: "rm -rf build" },
+      _meta: { acpcode: { intention: "Remove the build" } },
     },
     options: [{ optionId: "ok", name: "Allow", kind: "allow_once" }],
   });
@@ -1868,7 +1869,7 @@ test("a form with no turn of this host's to show it in is cancelled", async () =
   ]);
 });
 
-test("a shell command's card shows its output, not its description or Markdown fence", async () => {
+test("a shell command's card shows its output, not text repeating its intention", async () => {
   const t = await withRunningTurn();
   const text = (value: string) => ({
     type: "content" as const,
@@ -1890,10 +1891,8 @@ test("a shell command's card shows its output, not its description or Markdown f
     toolCallId: "b1",
     title: "git status --short",
     kind: "execute",
-    rawInput: {
-      command: "git status --short",
-      command_description: "Show changes",
-    },
+    rawInput: { command: "git status --short" },
+    _meta: { acpcode: { intention: "Show changes" } },
     content: [text("Show changes")],
   });
   const running = contentOf();
@@ -1901,21 +1900,22 @@ test("a shell command's card shows its output, not its description or Markdown f
     sessionUpdate: "tool_call_update",
     toolCallId: "b1",
     status: "completed",
-    content: [text("```console\n M a.ts\n```")],
+    content: [text(" M a.ts")],
   });
 
-  // A failure: output first, then an update with only the description.
+  // A failure: output first, then an update with only the intention.
   t.replay("draft", {
     sessionUpdate: "tool_call",
     toolCallId: "b2",
     title: "npm test",
     kind: "execute",
-    rawInput: { command: "npm test", description: "Run the tests" },
+    rawInput: { command: "npm test" },
+    _meta: { acpcode: { intention: "Run the tests" } },
   });
   t.replay("draft", {
     sessionUpdate: "tool_call_update",
     toolCallId: "b2",
-    content: [text("```console\n1 failing\n```")],
+    content: [text("1 failing")],
   });
   t.replay("draft", {
     sessionUpdate: "tool_call_update",
@@ -1928,13 +1928,14 @@ test("a shell command's card shows its output, not its description or Markdown f
     toolCallId: "b3",
     title: "npm run lint",
     kind: "execute",
-    rawInput: { command: "npm run lint", description: "Lint" },
+    rawInput: { command: "npm run lint" },
+    _meta: { acpcode: { intention: "Lint" } },
   });
   t.replay("draft", {
     sessionUpdate: "tool_call_update",
     toolCallId: "b3",
     status: "failed",
-    content: [text("```console\n2 problems\n```")],
+    content: [text("2 problems")],
   });
 
   assert.equal(running.invocationMessage, "Show changes");

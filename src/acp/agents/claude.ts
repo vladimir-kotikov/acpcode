@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { removeClaudeJob, sessionOwner } from "../claudeJobs.ts";
 import { plainForm, withFreeText } from "../forms.ts";
-import { withToolName } from "../toolNames.ts";
+import { withToolMeta } from "../toolMeta.ts";
 import type { AgentKind } from "./kinds.ts";
 
 /** The fallback for a compaction the client's compaction mapping never sees:
@@ -28,7 +28,7 @@ function compactSummaryAsToolCall(update: SessionUpdate): SessionUpdate {
   ) {
     return update;
   }
-  return withToolName(
+  return withToolMeta(
     {
       sessionUpdate: "tool_call",
       toolCallId: update.messageId ?? randomUUID(),
@@ -39,12 +39,18 @@ function compactSummaryAsToolCall(update: SessionUpdate): SessionUpdate {
       rawInput: {},
       content: [{ type: "content", content: update.content }],
     },
-    "compact",
+    { toolName: "compact" },
   );
 }
 
-/** claude-agent-acp sends its tool's name in `_meta.claudeCode.toolName`. */
-function withClaudeToolName(update: SessionUpdate): SessionUpdate {
+/** A command's output, sent without a terminal, comes fenced as Markdown. */
+const CONSOLE_FENCE = /^```console\n([\s\S]*)\n```$/;
+
+/** claude-agent-acp's tool call in shared terms. It names the tool in
+ *  `_meta.claudeCode.toolName`, and titles a shell command with its command
+ *  line: what it's for is the input's `description`, or `command_description`
+ *  (CLI 2.1.295 takes either; the first wins). */
+function sharedToolCall(update: SessionUpdate): SessionUpdate {
   if (
     update.sessionUpdate !== "tool_call" &&
     update.sessionUpdate !== "tool_call_update"
@@ -53,7 +59,30 @@ function withClaudeToolName(update: SessionUpdate): SessionUpdate {
   }
   const name = (update._meta?.claudeCode as { toolName?: unknown } | undefined)
     ?.toolName;
-  return typeof name === "string" ? withToolName(update, name) : update;
+  const input = update.rawInput as
+    { description?: unknown; command_description?: unknown } | null | undefined;
+  const intention =
+    typeof input?.description === "string"
+      ? input.description
+      : input?.command_description;
+  const meta = {
+    ...(typeof name === "string" && { toolName: name }),
+    ...(typeof intention === "string" && intention && { intention }),
+  };
+  const content = update.content?.map(item =>
+    item.type === "content" && item.content.type === "text"
+      ? {
+          ...item,
+          content: {
+            ...item.content,
+            text:
+              CONSOLE_FENCE.exec(item.content.text)?.[1] ?? item.content.text,
+          },
+        }
+      : item,
+  );
+  const shared = content ? { ...update, content } : update;
+  return Object.keys(meta).length ? withToolMeta(shared, meta) : shared;
 }
 
 export const claude: AgentKind = {
@@ -72,7 +101,7 @@ export const claude: AgentKind = {
     name: "clear",
     description: "Clear conversation history and free up context",
   },
-  mapUpdate: update => withClaudeToolName(compactSummaryAsToolCall(update)),
+  mapUpdate: update => sharedToolCall(compactSummaryAsToolCall(update)),
   // AskUserQuestion's form follows each select with a `<key>_custom` box for
   // its "Other" answer.
   formOf: request =>

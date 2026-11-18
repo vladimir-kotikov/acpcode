@@ -59,7 +59,7 @@ import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
 import { KINDS } from "../acp/agents/kinds.ts";
 import { agentProcessEnv } from "../acp/bridges.ts";
-import { toolNameOf } from "../acp/toolNames.ts";
+import { toolMetaOf } from "../acp/toolMeta.ts";
 import type { Disposable, Output } from "../shared/events.ts";
 import { stopNotice, type Attachment } from "../shared/sessionViewProtocol.ts";
 import {
@@ -97,7 +97,7 @@ interface ToolCallTracking {
   title: string;
   phase: "running" | "pending" | "done";
   kind?: ToolKind;
-  /** The title is the input's short `description`, not the agent's. */
+  /** The title is the call's intention, not the agent's title. */
   described?: boolean;
   /** Its input has a shell command: a terminal tool. */
   command?: boolean;
@@ -226,8 +226,8 @@ const directoryUris = (binding: Binding): string[] =>
 /** A tool call's input as Chat takes it, if the update has one. Chat shows a
  *  terminal tool's card with the input's `command`, labelled with the call's
  *  intention as it was when the card first showed. So a call whose input is
- *  streamed in (Claude sends the command before its description) becomes
- *  one once its description is in, or `whole` input is, or it completes. */
+ *  streamed in (the command can come before the intention) becomes one once
+ *  its intention is in, or `whole` input is, or it completes. */
 function inputFields(
   tracking: ToolCallTracking,
   rawInput: unknown,
@@ -250,20 +250,14 @@ const terminalMeta = (
 ): { _meta?: { toolKind: "terminal" } } =>
   tracking.command ? { _meta: { toolKind: "terminal" } } : {};
 
-/** Takes a call's new title and kind. Claude titles a shell command with
- *  the whole command line, which Chat's terminal card shows anyway; its
- *  input's `description` (or `command_description`) is the short one, and
- *  sticks. */
+/** Takes a call's new title and kind. A shell call's title may be its whole
+ *  command line, which Chat's terminal card shows anyway: its intention,
+ *  once known, is the title and sticks. */
 function retitle(tracking: ToolCallTracking, call: ToolCallUpdate): void {
   tracking.kind = call.kind ?? tracking.kind;
-  const input = call.rawInput as
-    { description?: unknown; command_description?: unknown } | null | undefined;
-  const description =
-    tracking.kind === "execute"
-      ? (input?.description ?? input?.command_description)
-      : undefined;
-  if (typeof description === "string" && description) {
-    tracking.title = description;
+  const { intention } = toolMetaOf(call);
+  if (tracking.kind === "execute" && intention) {
+    tracking.title = intention;
     tracking.described = true;
   } else if (call.title && !tracking.described) {
     tracking.title = call.title;
@@ -271,17 +265,13 @@ function retitle(tracking: ToolCallTracking, call: ToolCallUpdate): void {
 }
 
 /** A shell call's text content as Chat's terminal card shows it: as output.
- *  Claude sends the description while the command runs (the card's title
- *  already has it), then the output fenced as Markdown. */
-function shellOutput(
+ *  Text repeating its intention, which the card's title already has, isn't
+ *  output. */
+const shellOutput = (
   tracking: ToolCallTracking,
   text: string,
-): string | undefined {
-  if (tracking.described && text === tracking.title) {
-    return undefined;
-  }
-  return /^```console\n([\s\S]*)\n```$/.exec(text)?.[1] ?? text;
-}
+): string | undefined =>
+  tracking.described && text === tracking.title ? undefined : text;
 
 /** `promise`, or a rejection once `ms` have passed without it settling. */
 function withTimeout<T>(
@@ -2663,7 +2653,7 @@ export class AcpAgentHost implements Disposable {
       type: ActionType.ChatToolCallStart,
       turnId,
       toolCallId: call.toolCallId,
-      toolName: toolNameOf(call) ?? call.kind ?? "other",
+      toolName: toolMetaOf(call).toolName ?? call.kind ?? "other",
       displayName: title,
     });
     this.server.dispatch(binding.chatUri, {

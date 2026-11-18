@@ -38,6 +38,7 @@ import type { AgentConfig } from "./agents/config.ts";
 import { KINDS, type AgentKind } from "./agents/kinds.ts";
 import { agentProcessEnv, bridgeEntryPoint } from "./bridges.ts";
 import { plainForm, type Form } from "./forms.ts";
+import type { ToolMeta } from "./toolMeta.ts";
 
 /** Pulls the AIR extension's session-failure title out of a response's
  *  `_meta`, but only when `severity` is "error" — see `prompt()`'s doc
@@ -89,7 +90,7 @@ function compactionAsToolCall(
     kind: "think",
     // VS Code Chat only shows a tool call's output when it has input.
     ...(!known && { rawInput: {} }),
-    _meta: { acpcode: { toolName: "compact" } },
+    _meta: { acpcode: { toolName: "compact" } satisfies ToolMeta },
   } as const;
   if (update.sessionUpdate === "compaction_summary_chunk") {
     if (update.content.type === "text") {
