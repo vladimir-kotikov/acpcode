@@ -56,6 +56,32 @@ export function fakeClaude(t: TestContext, failOn?: "stop" | "rm") {
   };
 }
 
+/** A stand-in `codex` CLI for tests: it logs each call's args and keeps
+ *  what came on stdin, then runs `body` (shell lines; `$*` has the args). */
+export function fakeCodex(t: TestContext, ...body: string[]) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const log = path.join(dir, "log");
+  const cli = path.join(dir, "codex");
+  fs.writeFileSync(
+    cli,
+    [
+      "#!/bin/sh",
+      `echo "$*" >> "${log}"`,
+      `cat > "${path.join(dir, "stdin")}"`,
+      ...body,
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return {
+    env: { CODEX_PATH: cli },
+    calls: (): string[] =>
+      fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n") : [],
+    /** What the last call read from stdin. */
+    stdin: () => fs.readFileSync(path.join(dir, "stdin"), "utf8"),
+  };
+}
+
 /** Polls `done` until it holds; for work spanning processes and fs calls. */
 export async function waitFor(done: () => boolean, ms = 5000): Promise<void> {
   const deadline = Date.now() + ms;

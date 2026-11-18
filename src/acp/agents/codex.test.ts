@@ -2,7 +2,13 @@
 import type { ElicitationSchema } from "@agentclientprotocol/sdk";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { UNANSWERED_QUESTION_NOTICE, codex } from "./codex.ts";
+import { fakeCodex } from "../fakeClaude.test-util.ts";
+import {
+  UNANSWERED_QUESTION_NOTICE,
+  codex,
+  titleModels,
+  titleOfReply,
+} from "./codex.ts";
 
 const formOf = (
   properties: Record<string, unknown>,
@@ -109,4 +115,65 @@ test("only a question Codex goes on without has a notice for going unanswered", 
     UNANSWERED_QUESTION_NOTICE,
   );
   assert.equal(formOf(question).unansweredNotice, undefined);
+});
+
+test("a title is made by the smallest families' newest models, then the default", () => {
+  assert.deepEqual(
+    titleModels([
+      "gpt-6.2-sol",
+      "gpt-5.6-terra",
+      "gpt-6-luna",
+      "gpt-6.1-terra",
+      "gpt-6-terra",
+    ]),
+    ["gpt-6-luna", "gpt-6.1-terra", undefined],
+  );
+  assert.deepEqual(titleModels(["gpt-6-luna-mini", "gpt-6-terra"]), [
+    "gpt-6-terra",
+    undefined,
+  ]);
+  assert.deepEqual(titleModels(["gpt-6.2-sol"]), [undefined]);
+});
+
+test("a title comes from the first model the account has, the prompt on stdin", async t => {
+  const cli = fakeCodex(
+    t,
+    `case "$*" in *gpt-6-luna*) echo "ERROR: The 'gpt-6-luna' model is not supported" >&2; exit 1;; esac`,
+    "echo 'Easing skills installation'",
+  );
+
+  const title = await codex.titleOf!(
+    { ...process.env, ...cli.env },
+    "How do we ease skills installation?",
+    ["gpt-6-luna", "gpt-6-terra"],
+  );
+
+  assert.equal(title, "Easing skills installation");
+  const flags =
+    "exec --ephemeral --skip-git-repo-check --sandbox read-only --config model_reasoning_effort=low";
+  assert.deepEqual(cli.calls(), [
+    `${flags} --model gpt-6-luna -`,
+    `${flags} --model gpt-6-terra -`,
+  ]);
+  assert.match(cli.stdin(), /\n\nHow do we ease skills installation\?$/);
+});
+
+test("when no model makes a title, the last one's error is told", async t => {
+  const cli = fakeCodex(t, 'echo "ERROR: $# args" >&2', "exit 1");
+
+  await assert.rejects(
+    codex.titleOf!({ ...process.env, ...cli.env }, "hi", ["gpt-6-luna"]),
+    { message: "default model: ERROR: 8 args" },
+  );
+  assert.equal(cli.calls().length, 2);
+});
+
+test("a title is a reply's first line without its wrapping", () => {
+  assert.equal(
+    titleOfReply('**"Fix login bug."**\nMore text'),
+    "Fix login bug",
+  );
+  assert.equal(titleOfReply("# Title"), "Title");
+  assert.equal(titleOfReply("x".repeat(100)).length, 80);
+  assert.equal(titleOfReply("\n"), "");
 });

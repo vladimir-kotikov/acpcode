@@ -34,8 +34,8 @@ import type {
 } from "../acp/agentClient.ts";
 import type { AgentConnectionPool } from "../acp/agentPool.ts";
 import type { AgentConfig } from "../acp/agents/config.ts";
-import { AcpAgentHost } from "./acpBridge.ts";
-import { fakeClaude, waitFor } from "../acp/fakeClaude.test-util.ts";
+import { AcpAgentHost, isPromptTitle } from "./acpBridge.ts";
+import { fakeClaude, fakeCodex, waitFor } from "../acp/fakeClaude.test-util.ts";
 import type { AhpServerHooks } from "./server.ts";
 
 const agent: AgentConfig = {
@@ -198,6 +198,10 @@ function setup(
     closeSession: (...args: unknown[]) => {
       calls.push({ method: "closeSession", args });
       return closing ?? Promise.resolve();
+    },
+    renameSession: (...args: unknown[]) => {
+      calls.push({ method: "renameSession", args });
+      return Promise.resolve();
     },
     deleteSession: (...args: unknown[]) => {
       calls.push({ method: "deleteSession", args });
@@ -934,10 +938,11 @@ test("a plain approve or deny picks the one-time option, never an always one", a
 /** A new session's chat with turn `t1` running. */
 async function withRunningTurn(options: Parameters<typeof setup>[1] = {}) {
   const t = setup({}, options);
-  const draft = "ahp-session:/acp-claude/draft";
+  const provider = `acp-${options.agentKind ?? "claude"}`;
+  const draft = `ahp-session:/${provider}/draft`;
   await (t.hooks.handlers.createSession as (p: unknown) => Promise<null>)({
     channel: draft,
-    provider: "acp-claude",
+    provider,
   });
   const chat = (t.host.server.stateOf(draft) as SessionState).defaultChat!;
   t.clientAction(chat, {
@@ -957,7 +962,7 @@ async function withRunningTurn(options: Parameters<typeof setup>[1] = {}) {
   const state = () => t.host.server.stateOf(chat) as ChatState;
   const prompted = () =>
     t.calls.filter(c => c.method === "prompt").map(c => c.args[1]);
-  return { ...t, chat, pend, state, prompted };
+  return { ...t, draft, chat, pend, state, prompted };
 }
 
 test("a queued message runs as the next turn once the running one completes", async () => {
@@ -2347,4 +2352,57 @@ test("a left chat stays loaded when the agent can't close sessions", async () =>
 
   assert.deepEqual(closed(calls), []);
   assert.ok(host.server.has(CHAT));
+});
+
+test("a title is the first prompt's while it's ours or the agent's cut of it", () => {
+  const prompt = "I'm exploring  the option\nto ease skills installation";
+
+  assert.ok(isPromptTitle("I'm exploring  the option", prompt));
+  assert.ok(isPromptTitle("I'm exploring the option to ease…", prompt));
+  assert.ok(!isPromptTitle("Easing skills installation", prompt));
+});
+
+const sessionTitle = (t: { host: AcpAgentHost; draft: string }) =>
+  (t.host.server.stateOf(t.draft) as SessionState).title;
+
+test("a new Codex session is titled by Codex after its first turn", async ctx => {
+  const cli = fakeCodex(ctx, "echo 'First steps'");
+  const t = await withRunningTurn({ agentKind: "codex", claudeEnv: cli.env });
+
+  t.endPrompt();
+  await waitFor(() => t.calls.some(c => c.method === "renameSession"));
+
+  assert.equal(sessionTitle(t), "First steps");
+  assert.deepEqual(
+    t.calls.filter(c => c.method === "renameSession").map(c => c.args),
+    [["draft", "First steps"]],
+  );
+});
+
+test("a session renamed while its title is made keeps the new name", async ctx => {
+  const cli = fakeCodex(ctx, "sleep 0.2", "echo 'First steps'");
+  const t = await withRunningTurn({ agentKind: "codex", claudeEnv: cli.env });
+
+  t.endPrompt();
+  await settle();
+  t.replay("draft", { sessionUpdate: "session_info_update", title: "Mine" });
+  await waitFor(() => cli.calls().length > 0);
+  await new Promise(resolve => setTimeout(resolve, 400));
+
+  assert.equal(sessionTitle(t), "Mine");
+  assert.equal(
+    t.calls.some(c => c.method === "renameSession"),
+    false,
+  );
+});
+
+test("a title Codex can't make is only logged", async ctx => {
+  const cli = fakeCodex(ctx, "exit 1");
+  const t = await withRunningTurn({ agentKind: "codex", claudeEnv: cli.env });
+
+  t.endPrompt();
+  await waitFor(() => t.logged.some(line => line.startsWith("[title]")));
+
+  assert.equal(sessionTitle(t), "first");
+  assert.equal(t.state().activeTurn, undefined);
 });

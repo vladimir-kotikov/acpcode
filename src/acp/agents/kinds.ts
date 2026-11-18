@@ -43,6 +43,14 @@ export interface AgentKind {
   /** Removes what the agent keeps running for a deleted or archived session;
    *  answers what to log. */
   removeJob?: (env: NodeJS.ProcessEnv, sessionId: string) => Promise<string>;
+  /** A short title for a new session, from its first prompt, for an agent
+   *  that leaves the prompt as the title. `models` are the session's model
+   *  option's values. */
+  titleOf?: (
+    env: NodeJS.ProcessEnv,
+    prompt: string,
+    models: string[],
+  ) => Promise<string>;
 }
 
 export const KINDS: Readonly<Record<AgentConfig["kind"], AgentKind>> = {

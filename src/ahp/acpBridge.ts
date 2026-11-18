@@ -72,6 +72,7 @@ import {
 } from "./completions.ts";
 import {
   accepts,
+  choices,
   configSchema,
   configValues,
   modelOption,
@@ -85,6 +86,13 @@ import { AhpRequestError, AhpServer, ROOT_CHANNEL } from "./server.ts";
 
 const DEFAULT_CHAT_TITLE = "New chat";
 const TITLE_FROM_PROMPT_LENGTH = 60;
+
+const flat = (text: string) => text.replace(/\s+/g, " ").trim();
+
+/** Whether `title` is `prompt`'s start, ours or the agent's (whitespace
+ *  collapsed, maybe cut with "…"). */
+export const isPromptTitle = (title: string, prompt: string): boolean =>
+  flat(prompt).startsWith(flat(title).replace(/…$/, "").trimEnd());
 
 /** Where a tool call is in the AHP lifecycle — tracked separately from the
  *  reducer's state because ACP updates don't say which AHP transition they
@@ -1992,6 +2000,40 @@ export class AcpAgentHost implements Disposable {
     return null;
   }
 
+  /** Names a new session after its first turn, if its kind makes titles
+   *  and the chat is still open with the first prompt's title: a rename
+   *  meanwhile wins. */
+  private generateTitle(binding: Binding, prompt: string): Promise<void> {
+    const { titleOf } = KINDS[binding.agent.kind];
+    if (!titleOf) {
+      return Promise.resolve();
+    }
+    const models = modelOption(binding.configOptions ?? []);
+    return Promise.resolve()
+      .then(() =>
+        titleOf(
+          agentProcessEnv(binding.agent),
+          prompt,
+          models ? choices(models).map(choice => choice.value) : [],
+        ),
+      )
+      .then(title => {
+        if (
+          this.bindings.get(binding.chatUri) !== binding ||
+          !isPromptTitle(binding.title, prompt)
+        ) {
+          return;
+        }
+        this.setTitle(binding, title);
+        return this.withIndex(binding, client =>
+          client.renameSession(binding.sessionId!, title),
+        );
+      })
+      .catch((err: unknown) => {
+        this.output.appendLine(`[title] ${describeError(err)}`);
+      });
+  }
+
   private setTitle(binding: Binding, title: string): void {
     binding.title = title;
     if (binding.primary) {
@@ -2180,11 +2222,10 @@ export class AcpAgentHost implements Disposable {
     binding.run = run;
     let completed = false;
     binding.prompted = true;
-    if (binding.title === DEFAULT_CHAT_TITLE && message.text.trim()) {
-      this.setTitle(
-        binding,
-        message.text.trim().slice(0, TITLE_FROM_PROMPT_LENGTH),
-      );
+    const firstPrompt =
+      binding.title === DEFAULT_CHAT_TITLE ? message.text.trim() : "";
+    if (firstPrompt) {
+      this.setTitle(binding, firstPrompt.slice(0, TITLE_FROM_PROMPT_LENGTH));
     }
     try {
       // A cancelled prompt ends before the agent takes the next one.
@@ -2234,6 +2275,9 @@ export class AcpAgentHost implements Disposable {
         }
         this.endTurn(binding, ActionType.ChatTurnComplete, run.turnId);
         completed = true;
+        if (firstPrompt) {
+          void this.generateTitle(binding, firstPrompt);
+        }
       }
     } catch (err) {
       this.failTurn(binding, run.turnId, describeError(err));

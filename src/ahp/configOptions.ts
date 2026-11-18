@@ -71,7 +71,9 @@ const isModelConfig = (option: SessionConfigOption): boolean =>
 const isSessionConfig = (option: SessionConfigOption): boolean =>
   !isModel(option) && !isModelConfig(option);
 
-function choices(option: SessionConfigOption): SessionConfigSelectOption[] {
+export function choices(
+  option: SessionConfigOption,
+): SessionConfigSelectOption[] {
   if (option.type !== "select") {
     return [];
   }
