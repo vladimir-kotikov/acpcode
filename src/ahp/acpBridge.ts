@@ -378,12 +378,28 @@ function turnUsage(usage: Usage): UsageInfo {
 function toAttachments(message: Message): Attachment[] {
   return (message.attachments ?? []).flatMap((attachment): Attachment[] => {
     if (attachment.type === MessageAttachmentKind.Resource) {
+      const lines: Pick<Attachment, "line" | "endLine"> = {};
+      const range = attachment.selection?.range;
+      if (range) {
+        // 0-based → 1-based; a selection ending at column 0 doesn't take in
+        // that last line (a whole-line selection ends on the next line).
+        const { start, end } = range;
+        const last =
+          end.character === 0 && end.line > start.line
+            ? end.line
+            : end.line + 1;
+        lines.line = start.line + 1;
+        if (last > lines.line) {
+          lines.endLine = last;
+        }
+      }
       return [
         {
           id: randomUUID(),
           name: attachment.label,
           uri: attachment.uri,
           mimeType: attachment.contentType,
+          ...lines,
         },
       ];
     }

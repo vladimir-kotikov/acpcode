@@ -486,6 +486,23 @@ test("inline text attachments reach the agent embedded, or as text", async t => 
   ]);
 });
 
+test("a file attachment's line span rides on its link as a fragment", async t => {
+  const file = { id: "a3", name: "a.ts", uri: "file:///w/a.ts" };
+
+  assert.deepEqual(
+    await promptedWith(t, {}, [
+      file,
+      { ...file, line: 10 },
+      { ...file, line: 10, endLine: 12 },
+    ]),
+    ["", "#L10", "#L10-12"].map(fragment => ({
+      type: "resource_link",
+      uri: `file:///w/a.ts${fragment}`,
+      name: "a.ts",
+    })),
+  );
+});
+
 test("an inline image an agent can't take fails the prompt instead of vanishing", async t => {
   const image = {
     id: "a2",

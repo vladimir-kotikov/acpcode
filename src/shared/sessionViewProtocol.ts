@@ -53,8 +53,9 @@ export interface SessionViewMeta {
 // sessionViewProvider.ts); `data` (base64) when it's pasted bytes with no
 // path at all (a screenshot-tool clipboard image). Never both — `uri` is
 // preferred whenever available since it lets the agent read the file itself
-// instead of inlining it. `line`/`endLine` are only ever set on a
-// paste-matched-to-source attachment.
+// instead of inlining it. `line`/`endLine` (1-based, `endLine` only past
+// `line`) are set on a paste-matched-to-source attachment or a Chat
+// attachment carrying an editor selection.
 export interface Attachment {
   id: string;
   name: string;

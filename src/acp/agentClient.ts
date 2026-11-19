@@ -754,9 +754,14 @@ export class AgentClient implements Disposable {
         }));
     }
     if (attachment.uri) {
+      // A selection travels as a `#L10-20` fragment: resource_link has no
+      // range field, and agents render the uri as the mention text.
+      const fragment = attachment.line
+        ? `#L${attachment.line}${attachment.endLine ? `-${attachment.endLine}` : ""}`
+        : "";
       return Promise.resolve({
         type: "resource_link",
-        uri: attachment.uri,
+        uri: attachment.uri + fragment,
         name: attachment.name,
         mimeType: attachment.mimeType,
       });

@@ -1414,6 +1414,51 @@ test("a simple attachment reaches the agent as its model representation", async 
   ]);
 });
 
+test("an attached editor selection reaches the agent as its line span", async () => {
+  const t = setup();
+  const draft = "ahp-session:/acp-claude/draft";
+  await (t.hooks.handlers.createSession as (p: unknown) => Promise<null>)({
+    channel: draft,
+    provider: "acp-claude",
+  });
+  const chat = (t.host.server.stateOf(draft) as SessionState).defaultChat!;
+  const selected = (start: number, end: number, endCharacter: number) => ({
+    type: "resource",
+    label: "a.ts",
+    uri: "file:///w/a.ts",
+    selection: {
+      range: {
+        start: { line: start, character: 0 },
+        end: { line: end, character: endCharacter },
+      },
+    },
+  });
+
+  t.clientAction(chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId: "t1",
+    startedAt: new Date().toISOString(),
+    message: {
+      text: "look",
+      // Lines 10-12 to column 4; whole lines 10-12 (ends at 13:0); in line 10.
+      attachments: [selected(9, 11, 4), selected(9, 12, 0), selected(9, 9, 4)],
+    },
+  } as StateAction);
+  await settle();
+
+  const [prompt] = t.calls.filter(c => c.method === "prompt");
+  assert.deepEqual(
+    (prompt.args[2] as { line?: number; endLine?: number }[]).map(
+      ({ line, endLine }) => [line, endLine],
+    ),
+    [
+      [10, 12],
+      [10, 12],
+      [10, undefined],
+    ],
+  );
+});
+
 test("an edit shows as a file edit whose sides Chat reads from the host", async () => {
   const t = await withRunningTurn();
   const read = t.hooks.handlers.resourceRead as (p: unknown) => {
